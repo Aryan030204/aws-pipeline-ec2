@@ -1,0 +1,14 @@
+requests
+pandas
+mysql-connector-python
+SQLAlchemy
+numpy
+Flask
+APScheduler
+aiohttp
+gunicorn
+upstash-redis
+qstash
+pymysql
+dotenv
+cryptography
