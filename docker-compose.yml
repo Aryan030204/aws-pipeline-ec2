@@ -1,0 +1,11 @@
+version: "3.9"
+
+services:
+  shopify-pipeline:
+    build: .
+    container_name: aws-pipeline
+    env_file:
+      - .env
+    restart: always
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
