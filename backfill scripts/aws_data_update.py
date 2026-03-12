@@ -116,7 +116,9 @@ if BACKFILL_MODE:
 # --- TEST_MODE ---
 TEST_MODE = os.environ.get("TEST_MODE", "false").strip().lower() == "true"
 if TEST_MODE:
-    logger.info("⚠️ TEST_MODE enabled: QStash and DB SSL will be DISABLED, loading config from local env.")
+    from dotenv import load_dotenv
+    load_dotenv(".env.local", override=True)
+    logger.info("⚠️ TEST_MODE enabled: QStash and DB SSL will be DISABLED, loading config from local env (.env.local).")
 def now_ist() -> datetime:
     return datetime.now(IST)
 

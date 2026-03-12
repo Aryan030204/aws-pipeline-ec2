@@ -113,8 +113,9 @@ CPU_COUNT = multiprocessing.cpu_count()
 # --- TEST_MODE ---
 TEST_MODE = os.environ.get("TEST_MODE", "false").strip().lower() == "true"
 if TEST_MODE:
+    load_dotenv(".env.local", override=True)
     logger.info(
-        "⚠️ TEST_MODE enabled: QStash and DB SSL will be DISABLED, loading config from local env."
+        "⚠️ TEST_MODE enabled: QStash and DB SSL will be DISABLED, loading config from local env (.env.local)."
     )
 
 brand_tag_to_index_map: Dict[str, int] = {}
@@ -3791,6 +3792,10 @@ def process_and_upload_utm_summary(
     # Aggregation buckets
     # Key: (date_str, category) -> {sessions, atc, source_details: {src_name: {sessions, atc}}}
     agg = {}
+    
+    # New: Daily bucket for overall traffic split (all categories combined)
+    # Key: date_str -> {src_name: {sessions, atc}}
+    daily_traffic = {}
 
     for r in raw_rows:
         d_val = r.get("day")
@@ -3839,24 +3844,31 @@ def process_and_upload_utm_summary(
         agg[key]["source_details"][src_name_key]["sessions"] += sessions
         agg[key]["source_details"][src_name_key]["atc_sessions"] += atc
 
+        # New: Track for overall_traffic_split
+        if date_str not in daily_traffic:
+            daily_traffic[date_str] = {}
+        
+        if src_name_key not in daily_traffic[date_str]:
+            daily_traffic[date_str][src_name_key] = {
+                "utm_name": src_name_key,
+                "sessions": 0,
+                "atc_sessions": 0,
+            }
+        daily_traffic[date_str][src_name_key]["sessions"] += sessions
+        daily_traffic[date_str][src_name_key]["atc_sessions"] += atc
+
     # Convert to list for DB insert
     db_rows = []
-    # Ensure ALL 4 categories exist for each date found?
-    # The requirement says "each date will have 4 rows".
-    # So we must fill gaps with 0.
-
+    traffic_split_rows = []
+    
     all_dates = sorted(list(set(k[0] for k in agg.keys())))
     categories = ["Meta", "Google", "direct", "others"]
 
     for d in all_dates:
+        # Prepare category-wise rows
         for cat in categories:
             stats = agg.get((d, cat), {"sessions": 0, "atc": 0, "source_details": {}})
-
-            # Convert source_details map to list for JSON storage
             utm_names_list = list(stats.get("source_details", {}).values())
-            # If no details (filled gap), maybe just empty list? Or include default?
-            # Keeping it as a list of objects as requested.
-
             row_tuple = (
                 d,
                 cat,
@@ -3865,12 +3877,17 @@ def process_and_upload_utm_summary(
                 json.dumps(utm_names_list),
             )
             db_rows.append(row_tuple)
+        
+        # Prepare daily traffic split row
+        if d in daily_traffic:
+            total_utm_list = list(daily_traffic[d].values())
+            traffic_split_rows.append((d, json.dumps(total_utm_list)))
 
     if not db_rows:
         return
 
     with get_db_cursor(brand_index) as (cursor, connection):
-        # 1. Ensure table
+        # 1. Ensure tables
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS overall_utm_summary (
                 date DATE NOT NULL,
@@ -3881,6 +3898,13 @@ def process_and_upload_utm_summary(
                 PRIMARY KEY (date, utm_source)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS overall_traffic_split (
+                date DATE PRIMARY KEY,
+                utm_source JSON
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
 
         # 2. Delete existing for dates
         if all_dates:
@@ -3889,17 +3913,29 @@ def process_and_upload_utm_summary(
                 f"DELETE FROM overall_utm_summary WHERE date IN ({format_strings})",
                 tuple(all_dates),
             )
+            cursor.execute(
+                f"DELETE FROM overall_traffic_split WHERE date IN ({format_strings})",
+                tuple(all_dates),
+            )
 
         # 3. Insert new
-        sql = """
+        sql_summary = """
             INSERT INTO overall_utm_summary 
             (date, utm_source, utm_source_sessions, utm_source_atc_sessions, utm_names)
             VALUES (%s, %s, %s, %s, %s)
         """
-        cursor.executemany(sql, db_rows)
+        cursor.executemany(sql_summary, db_rows)
+        
+        if traffic_split_rows:
+            sql_split = """
+                INSERT INTO overall_traffic_split (date, utm_source)
+                VALUES (%s, %s)
+            """
+            cursor.executemany(sql_split, traffic_split_rows)
+
         connection.commit()
         logger.info(
-            f"✅ Updated overall_utm_summary for {brand_name} ({len(db_rows)} rows, {min_date}..{max_date})"
+            f"✅ Updated overall_utm_summary & overall_traffic_split for {brand_name} ({len(db_rows)} categories, {len(traffic_split_rows)} traffic split rows, {min_date}..{max_date})"
         )
 
 
