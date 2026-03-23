@@ -12,3 +12,4 @@ qstash
 pymysql
 dotenv
 cryptography
+python-dotenv
