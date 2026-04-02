@@ -13,3 +13,4 @@ pymysql
 dotenv
 cryptography
 python-dotenv
+kafka-python

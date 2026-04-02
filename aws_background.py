@@ -61,6 +61,8 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
 import base64
+import uuid
+from kafka import KafkaProducer
 
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -323,6 +325,79 @@ def trigger_pipeline_completion_webhook():
                 )
         except Exception as e:
             logger.error(f"❌ QStash Publish error for {destination_url}: {e}")
+
+
+# ---------------------------
+# Kafka Configuration & Producer (NEW)
+# ---------------------------
+KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "pipelines-topic")
+
+_kafka_producer: Optional[KafkaProducer] = None
+
+
+def get_kafka_producer() -> KafkaProducer:
+    """
+    Lazily initialize a shared Kafka producer with retry logic.
+    Exits the process (sys.exit(1)) if Kafka is unavailable after retries.
+    """
+    global _kafka_producer
+    if _kafka_producer is not None:
+        return _kafka_producer
+
+    max_retries = 5
+    retry_delay = 5  # seconds
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            _kafka_producer = KafkaProducer(
+                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(","),
+                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+                retries=5,
+                acks="all",
+                # Add a connection timeout to avoid hanging too long on each attempt
+                request_timeout_ms=5000,
+            )
+            logger.info(f"✅ Kafka Producer initialized for {KAFKA_BOOTSTRAP_SERVERS}")
+            return _kafka_producer
+        except Exception as e:
+            logger.error(f"⚠️ [Attempt {attempt}/{max_retries}] Failed to initialize Kafka Producer: {e}")
+            if attempt < max_retries:
+                logger.info(f"Retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+            else:
+                logger.error("❌ Kafka Producer initialization failed after all retries. Shutting down stack.")
+                import sys
+                sys.exit(1)
+
+    return _kafka_producer
+
+
+def publish_pipeline_event(event_type: str, job_id: str, recompute_days: int = 1):
+    """
+    Publishes a message to Kafka topic upon pipeline completion.
+    """
+    producer = get_kafka_producer()
+    if not producer:
+        logger.warning("Kafka producer not available. Skipping message publication.")
+        return
+
+    message = {
+        "eventType": event_type,
+        "jobId": job_id,
+        "completedAt": now_ist().isoformat(),
+        "recomputeDays": recompute_days,
+    }
+
+    try:
+        future = producer.send(KAFKA_TOPIC, value=message)
+        # Block for 'synchronous' sends, or at least ensure it's sent
+        record_metadata = future.get(timeout=10)
+        logger.info(
+            f"✅ Message published to Kafka topic '{KAFKA_TOPIC}' at partition {record_metadata.partition} offset {record_metadata.offset}"
+        )
+    except Exception as e:
+        logger.error(f"❌ Failed to publish message to Kafka: {e}")
 
 
 # ---------------------------
@@ -4452,8 +4527,9 @@ def process_single_brand(brand_index: int):
 # ---------------------------
 def run_data_pipeline():
     job_start_time = now_ist()
+    job_id = f"job-{uuid.uuid4().hex[:8]}"
     logger.info(
-        f"\n{'=' * 60}\nJOB TRIGGERED AT: {job_start_time.strftime('%Y-%m-%d %I:%M:%S %p')}\n{'=' * 60}"
+        f"\n{'=' * 60}\nJOB TRIGGERED AT: {job_start_time.strftime('%Y-%m-%d %I:%M:%S %p')}\nJOB ID: {job_id}\n{'=' * 60}"
     )
 
     try:
@@ -4506,6 +4582,9 @@ def run_data_pipeline():
 
         # Trigger completion webhook
         trigger_pipeline_completion_webhook()
+
+        # --- NEW: Kafka Publish ---
+        publish_pipeline_event("ETL_COMPLETED", job_id)
 
     except Exception as e:
         logger.error(f"❌ PIPELINE FAILED with error: {e}")
