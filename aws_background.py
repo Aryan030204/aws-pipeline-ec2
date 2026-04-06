@@ -62,7 +62,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
 import base64
 import uuid
-from kafka import KafkaProducer
+# from kafka import KafkaProducer (REMOVED)
 
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -328,59 +328,25 @@ def trigger_pipeline_completion_webhook():
 
 
 # ---------------------------
-# Kafka Configuration & Producer (NEW)
+# UTM Pipeline Trigger (NEW: Replacing Kafka)
 # ---------------------------
-KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "pipelines-topic")
+UTM_PIPELINE_TRIGGER_API = os.environ.get("UTM_PIPELINE_TRIGGER_API")
 
-_kafka_producer: Optional[KafkaProducer] = None
-
-
-def get_kafka_producer() -> KafkaProducer:
+def trigger_utm_pipeline(event_type: str, job_id: str, recompute_days: int = 1):
     """
-    Lazily initialize a shared Kafka producer with retry logic.
-    Exits the process (sys.exit(1)) if Kafka is unavailable after retries.
+    Triggers the UTM aggregation pipeline via a POST API call.
+    Body is identical to the previous Kafka message schema.
     """
-    global _kafka_producer
-    if _kafka_producer is not None:
-        return _kafka_producer
-
-    max_retries = 5
-    retry_delay = 5  # seconds
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            _kafka_producer = KafkaProducer(
-                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(","),
-                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-                retries=5,
-                acks="all",
-                # Add a connection timeout to avoid hanging too long on each attempt
-                request_timeout_ms=5000,
-            )
-            logger.info(f"✅ Kafka Producer initialized for {KAFKA_BOOTSTRAP_SERVERS}")
-            return _kafka_producer
-        except Exception as e:
-            logger.error(f"⚠️ [Attempt {attempt}/{max_retries}] Failed to initialize Kafka Producer: {e}")
-            if attempt < max_retries:
-                logger.info(f"Retrying in {retry_delay}s...")
-                time.sleep(retry_delay)
-            else:
-                logger.error("❌ Kafka Producer initialization failed after all retries. Shutting down stack.")
-                import sys
-                sys.exit(1)
-
-    return _kafka_producer
-
-
-def publish_pipeline_event(event_type: str, job_id: str, recompute_days: int = 1):
-    """
-    Publishes a message to Kafka topic upon pipeline completion.
-    """
-    producer = get_kafka_producer()
-    if not producer:
-        logger.warning("Kafka producer not available. Skipping message publication.")
+    if not UTM_PIPELINE_TRIGGER_API:
+        logger.warning("UTM_PIPELINE_TRIGGER_API not set. Skipping trigger.")
         return
+
+    # Use the same auth header as other pipeline APIs
+    auth_header = os.environ.get("PIPELINE_AUTH_HEADER")
+    headers = {
+        "Content-Type": "application/json",
+        "x-pipeline-key": auth_header if auth_header else ""
+    }
 
     message = {
         "eventType": event_type,
@@ -389,15 +355,23 @@ def publish_pipeline_event(event_type: str, job_id: str, recompute_days: int = 1
         "recomputeDays": recompute_days,
     }
 
+    logger.info(f"🚀 Triggering UTM pipeline API: {UTM_PIPELINE_TRIGGER_API}")
+    
     try:
-        future = producer.send(KAFKA_TOPIC, value=message)
-        # Block for 'synchronous' sends, or at least ensure it's sent
-        record_metadata = future.get(timeout=10)
-        logger.info(
-            f"✅ Message published to Kafka topic '{KAFKA_TOPIC}' at partition {record_metadata.partition} offset {record_metadata.offset}"
+        # We reuse the global http_session for connection pooling
+        resp = http_session.post(
+            UTM_PIPELINE_TRIGGER_API, 
+            json=message, 
+            headers=headers, 
+            timeout=30
         )
+        
+        if resp.status_code in (200, 201, 202):
+            logger.info(f"✅ UTM pipeline trigger successful: {resp.status_code}")
+        else:
+            logger.error(f"❌ UTM pipeline trigger failed: {resp.status_code} - {resp.text}")
     except Exception as e:
-        logger.error(f"❌ Failed to publish message to Kafka: {e}")
+        logger.error(f"❌ Error triggering UTM pipeline: {e}")
 
 
 # ---------------------------
@@ -4583,8 +4557,8 @@ def run_data_pipeline():
         # Trigger completion webhook
         trigger_pipeline_completion_webhook()
 
-        # --- NEW: Kafka Publish ---
-        publish_pipeline_event("ETL_COMPLETED", job_id)
+        # --- NEW: UTM Pipeline API Trigger ---
+        trigger_utm_pipeline("ETL_COMPLETED", job_id)
 
     except Exception as e:
         logger.error(f"❌ PIPELINE FAILED with error: {e}")
