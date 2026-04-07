@@ -2415,10 +2415,11 @@ def update_order_summary_incremental(
 
                 -- COD created: includes NULL, empty, and COD keywords
                 COUNT(DISTINCT CASE 
-                    WHEN payment_gateway_names IS NULL 
+                    WHEN (payment_gateway_names IS NULL 
                       OR payment_gateway_names = '' 
                       OR payment_gateway_names LIKE '%Cash on Delivery (COD)%' 
-                      OR payment_gateway_names LIKE '%cash_on_delivery%' 
+                      OR payment_gateway_names LIKE '%cash_on_delivery%')
+                      AND (payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR payment_gateway_names IS NULL)
                     THEN order_id END) AS cod_created,
 
                 0 AS cod_returned,
@@ -2456,10 +2457,11 @@ def update_order_summary_incremental(
 
                 -- COD returned: includes NULL, empty, and COD keywords
                 COUNT(DISTINCT CASE 
-                    WHEN payment_gateway_names IS NULL 
+                    WHEN (payment_gateway_names IS NULL 
                       OR payment_gateway_names = '' 
                       OR payment_gateway_names LIKE '%Cash on Delivery (COD)%' 
-                      OR payment_gateway_names LIKE '%cash_on_delivery%' 
+                      OR payment_gateway_names LIKE '%cash_on_delivery%')
+                      AND (payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR payment_gateway_names IS NULL)
                     THEN order_id END) AS cod_returned,
 
                 0 AS prepaid_created,
@@ -2636,9 +2638,11 @@ def update_hour_wise_sales_incremental(
                 SUM(COALESCE(total_price, 0)) AS total_sales,
                 COUNT(DISTINCT CASE WHEN (payment_gateway_names IS NOT NULL AND payment_gateway_names != '') 
                     AND NOT (payment_gateway_names LIKE '%Cash on Delivery (COD)%' 
-                    OR payment_gateway_names LIKE '%cash_on_delivery%') THEN order_id END) AS number_of_prepaid_orders,
-                COUNT(DISTINCT CASE WHEN payment_gateway_names LIKE '%Cash on Delivery (COD)%' 
-                    OR payment_gateway_names LIKE '%cash_on_delivery%' THEN order_id END) AS number_of_cod_orders
+                    OR payment_gateway_names LIKE '%cash_on_delivery%'
+                    OR payment_gateway_names LIKE '%Gokwik PPCOD%') THEN order_id END) AS number_of_prepaid_orders,
+                COUNT(DISTINCT CASE WHEN (payment_gateway_names is NULL OR payment_gateway_names LIKE '%Cash on Delivery (COD)%' 
+                    OR payment_gateway_names LIKE '%cash_on_delivery%')
+                    AND (payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR payment_gateway_names is NULL) THEN order_id END) AS number_of_cod_orders
             FROM shopify_orders
             WHERE created_date BETWEEN %s AND %s 
                 AND created_time IS NOT NULL
