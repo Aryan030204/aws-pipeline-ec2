@@ -1816,26 +1816,18 @@ def ensure_user_agent_column(brand_index: int, table_name: str):
             # Check/Add user_agent column
             # We blindly attempt ADD COLUMN; if it exists, it fails safely or throws error we catch.
             try:
-                logger.info(
-                    f"🔍 Checking/Adding 'user_agent' column to {table_name}..."
-                )
                 conn.execute(
                     text(f"ALTER TABLE {table_name} ADD COLUMN user_agent TEXT")
                 )
                 conn.commit()
-                logger.info(
-                    f"✅ Successfully added 'user_agent' column to {table_name}"
-                )
             except Exception as e:
                 # If it fails, likely because it exists.
                 if "Duplicate column name" in str(e):
-                    logger.info(f"ℹ️ Column 'user_agent' already exists in {table_name}")
+                    pass
                 else:
-                    logger.warning(
-                        f"⚠️ Could not add 'user_agent' column to {table_name}: {e}"
-                    )
-    except Exception as e:
-        logger.error(f"❌ Error in ensure_user_agent_column for {table_name}: {e}")
+                    pass
+    except Exception:
+        pass
 
 
 def ensure_device_summary_columns(brand_index: int, table_name: str):
@@ -1861,21 +1853,17 @@ def ensure_device_summary_columns(brand_index: int, table_name: str):
         with engine.connect() as conn:
             for col in columns:
                 try:
-                    logger.info(f"🔍 Checking/Adding '{col}' column to {table_name}...")
                     conn.execute(
                         text(f"ALTER TABLE {table_name} ADD COLUMN {col} INT DEFAULT 0")
                     )
                     conn.commit()
-                    logger.info(f"✅ Successfully added '{col}' column to {table_name}")
                 except Exception as e:
                     if "Duplicate column name" in str(e):
-                        logger.info(f"ℹ️ Column '{col}' already exists in {table_name}")
+                        pass
                     else:
-                        logger.warning(
-                            f"⚠️ Could not add '{col}' column to {table_name}: {e}"
-                        )
-    except Exception as e:
-        logger.error(f"❌ Error in ensure_device_summary_columns for {table_name}: {e}")
+                        pass
+    except Exception:
+        pass
 
 
 def ensure_utm_names_column(brand_index: int, table_name: str = "overall_utm_summary"):
@@ -1889,21 +1877,17 @@ def ensure_utm_names_column(brand_index: int, table_name: str = "overall_utm_sum
     try:
         with engine.connect() as conn:
             try:
-                logger.info(f"🔍 Checking/Adding 'utm_names' column to {table_name}...")
                 conn.execute(
                     text(f"ALTER TABLE {table_name} ADD COLUMN utm_names JSON")
                 )
                 conn.commit()
-                logger.info(f"✅ Successfully added 'utm_names' column to {table_name}")
             except Exception as e:
                 if "Duplicate column name" in str(e):
-                    logger.info(f"ℹ️ Column 'utm_names' already exists in {table_name}")
+                    pass
                 else:
-                    logger.warning(
-                        f"⚠️ Could not add 'utm_names' column to {table_name}: {e}"
-                    )
-    except Exception as e:
-        logger.error(f"❌ Error in ensure_utm_names_column for {table_name}: {e}")
+                    pass
+    except Exception:
+        pass
 
 
 def load_data_to_sql_optimized(
@@ -1993,12 +1977,11 @@ def load_data_to_sql_optimized(
         columns.append(Column(f"_ITEM{n}_value", String(255)))
     Table(table_name, metadata, *columns)
 
-    with timed(f"DDL check/create for {table_name}"):
-        try:
-            metadata.create_all(engine, checkfirst=True)
-        except SQLAlchemyError as e:
-            logger.error(f"❌ Error creating table '{table_name}': {e}")
-            return
+    try:
+        metadata.create_all(engine, checkfirst=True)
+    except SQLAlchemyError as e:
+        logger.error(f"❌ Error creating table '{table_name}': {e}")
+        return
 
     try:
         optimal_batch = max(500, min(batch_size, 2000))
@@ -2024,7 +2007,8 @@ def load_data_to_sql_optimized(
 # ---------------------------
 def ensure_summary_tables(cursor, connection):
     """Create all summary tables if they don't exist."""
-    with timed("Ensure summary tables exist"):
+    # Keep summary schema setup silent (no console timing log).
+    if True:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS sales_summary (
                 date DATE PRIMARY KEY,
@@ -2084,9 +2068,6 @@ def ensure_summary_tables(cursor, connection):
 
             for col, definition in migrations.items():
                 if col not in existing_cols:
-                    logger.info(
-                        f"🛠️ Migrating sales_summary: Adding missing column {col}"
-                    )
                     cursor.execute(
                         f"ALTER TABLE sales_summary ADD COLUMN {col} {definition}"
                     )
