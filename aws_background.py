@@ -655,7 +655,7 @@ def initialize_brand_configs():
             effective_verify_identity = False
         else:
             effective_verify_identity = verify_identity
-
+ 
         db_config = {
             "host": db_host,
             "port": db_port,
@@ -1660,6 +1660,367 @@ def upsert_returns_fact_from_orders(
         )
         return changed_dates
 
+    finally:
+        if close_after:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+
+def _ensure_products_sold_units_daily(cursor, connection):
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS products_sold_units_daily (
+            product_id BIGINT NOT NULL,
+            variant_id BIGINT NOT NULL,
+            sold_units_7d INT NOT NULL DEFAULT 0,
+            sold_units_30d INT NOT NULL DEFAULT 0,
+            sold_units_90d INT NOT NULL DEFAULT 0,
+            last_processed_at DATETIME NOT NULL,
+            PRIMARY KEY (product_id, variant_id),
+            KEY idx_product_id (product_id),
+            KEY idx_last_processed_at (last_processed_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """
+    )
+    connection.commit()
+
+
+def _collect_product_variant_window_units(
+    orders_list: List[Dict],
+) -> Tuple[Dict[Tuple[int, int], Dict[str, int]], Dict[int, Dict[str, int]]]:
+    """
+    Build sold-unit deltas from fetched orders (today-inclusive windows).
+
+    Returns:
+      pair_window_qty: {(product_id, variant_id): {"7d": x, "30d": y, "90d": z}}
+      product_window_qty: {product_id: {"7d": x, "30d": y, "90d": z}}
+    """
+    pair_window_qty: Dict[Tuple[int, int], Dict[str, int]] = {}
+    product_window_qty: Dict[int, Dict[str, int]] = {}
+
+    today_ist = now_ist().date()
+
+    for order in orders_list:
+        created_ist = _parse_iso_to_ist_date(order.get("created_at"))
+        if not created_ist:
+            continue
+
+        try:
+            created_date = datetime.strptime(created_ist, "%Y-%m-%d").date()
+        except Exception:
+            continue
+
+        age_days = (today_ist - created_date).days
+        if age_days < 0:
+            continue
+
+        in_7d = age_days <= 6
+        in_30d = age_days <= 29
+        in_90d = age_days <= 89
+
+        if not (in_7d or in_30d or in_90d):
+            continue
+
+        for item in order.get("line_items") or []:
+            if not item:
+                continue
+
+            try:
+                pid = int(item.get("product_id") or 0)
+                vid = int(item.get("variant_id") or 0)
+                qty = int(item.get("quantity") or 0)
+            except Exception:
+                continue
+
+            if pid <= 0 or vid <= 0 or qty <= 0:
+                continue
+
+            pair_key = (pid, vid)
+            if pair_key not in pair_window_qty:
+                pair_window_qty[pair_key] = {"7d": 0, "30d": 0, "90d": 0}
+            if pid not in product_window_qty:
+                product_window_qty[pid] = {"7d": 0, "30d": 0, "90d": 0}
+
+            if in_7d:
+                pair_window_qty[pair_key]["7d"] += qty
+                product_window_qty[pid]["7d"] += qty
+            if in_30d:
+                pair_window_qty[pair_key]["30d"] += qty
+                product_window_qty[pid]["30d"] += qty
+            if in_90d:
+                pair_window_qty[pair_key]["90d"] += qty
+                product_window_qty[pid]["90d"] += qty
+
+    return pair_window_qty, product_window_qty
+
+
+def _extract_inventory_units_sold(table_data: Dict[str, Any]) -> int:
+    rows = _format_shopifyql_table(table_data)
+    if not rows:
+        return 0
+
+    total = 0
+    found_named_col = False
+    for row in rows:
+        if "inventory_units_sold" in row:
+            try:
+                total += int(float(row.get("inventory_units_sold") or 0))
+                found_named_col = True
+            except Exception:
+                pass
+
+    if found_named_col:
+        return max(0, total)
+
+    # Fallback: pick first numeric cell from each row if schema naming differs.
+    for row in rows:
+        for value in row.values():
+            try:
+                total += int(float(value))
+                break
+            except Exception:
+                continue
+
+    return max(0, total)
+
+
+def _fetch_product_sold_units_from_shopifyql(
+    shop_name: str,
+    access_token: str,
+    product_id: int,
+    days: int,
+    session: requests.Session,
+) -> int:
+    shopify_ql = (
+        "FROM inventory "
+        "SHOW inventory_units_sold "
+        f"WHERE product_id = {product_id} "
+        "WITH PERCENT_CHANGE "
+        f"SINCE startOfDay(-{days}d) UNTIL today "
+        "COMPARE TO previous_period "
+        "ORDER BY inventory_units_sold DESC "
+        "LIMIT 1000 "
+        "VISUALIZE inventory_units_sold"
+    )
+
+    ql_flat = shopify_ql.replace("\n", " ").strip().replace('"', '\\"')
+    graphql_query = f'''query InventoryUnitsSoldPercentChangeQuery {{ shopifyqlQuery(query: "{ql_flat}") {{ tableData {{ rows columns {{ name dataType displayName }} }} parseErrors }} }}'''
+
+    payload = {"query": graphql_query}
+    shopifyql_api_version = "2025-10"
+    url = f"https://{shop_name}.myshopify.com/admin/api/{shopifyql_api_version}/graphql.json"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": access_token,
+    }
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, 4):
+        try:
+            resp = session.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+            if resp.status_code != 200:
+                logger.warning(
+                    f"⚠️ Product sold-units ShopifyQL HTTP {resp.status_code} for product {product_id}, {days}d"
+                )
+                continue
+
+            body = resp.json()
+            if body.get("errors"):
+                logger.warning(
+                    f"⚠️ Product sold-units GraphQL errors for product {product_id}, {days}d: {body.get('errors')}"
+                )
+                continue
+
+            ql_result = (body.get("data") or {}).get("shopifyqlQuery") or {}
+            parse_errors = ql_result.get("parseErrors") or []
+            if parse_errors:
+                logger.warning(
+                    f"⚠️ Product sold-units parse errors for product {product_id}, {days}d: {parse_errors}"
+                )
+                continue
+
+            table_data = ql_result.get("tableData")
+            if not table_data:
+                return 0
+
+            return _extract_inventory_units_sold(table_data)
+        except Exception as e:
+            last_exc = e
+            logger.warning(
+                f"⚠️ Product sold-units fetch failed for product {product_id}, {days}d, attempt {attempt}/3: {e}"
+            )
+            time.sleep(2**attempt)
+
+    if last_exc:
+        logger.error(
+            f"❌ Product sold-units fetch failed after retries for product {product_id}, {days}d: {last_exc}"
+        )
+    return 0
+
+
+def upsert_products_sold_units_daily_from_orders(
+    brand_index: int,
+    orders_list: List[Dict],
+    brand_name: str,
+    shop_name: str,
+    access_token: str,
+    cursor=None,
+    connection=None,
+):
+    """
+    Maintain products_sold_units_daily from fetched orders.
+
+    Rules:
+    - First time product_id: fetch 7d/30d/90d sold units via ShopifyQL and upsert.
+    - Existing product_id: update sold units using new-order deltas from this run.
+    """
+    if not orders_list:
+        return
+
+    close_after = False
+    if cursor is None or connection is None:
+        close_after = True
+        (cursor, connection) = next(get_db_cursor(brand_index))
+
+    try:
+        try:
+            connection.ping(reconnect=True, attempts=3, delay=2)
+        except Exception as e:
+            logger.warning(f"⚠️ products_sold_units_daily ping/reconnect failed: {e}")
+
+        _ensure_products_sold_units_daily(cursor, connection)
+
+        pair_window_qty, product_window_qty = _collect_product_variant_window_units(
+            orders_list
+        )
+        if not pair_window_qty:
+            logger.info(
+                f"[{brand_name}] No valid product/variant quantities found for products_sold_units_daily update"
+            )
+            return
+
+        product_ids = sorted(product_window_qty.keys())
+        placeholders = ",".join(["%s"] * len(product_ids))
+
+        existing_product_ids: Set[int] = set()
+        cursor.execute(
+            f"SELECT DISTINCT product_id FROM products_sold_units_daily WHERE product_id IN ({placeholders})",
+            tuple(product_ids),
+        )
+        for row in cursor.fetchall():
+            existing_product_ids.add(
+                int(row["product_id"] if isinstance(row, dict) else row[0])
+            )
+
+        new_product_ids = [pid for pid in product_ids if pid not in existing_product_ids]
+
+        baseline_by_product: Dict[int, Dict[str, int]] = {}
+        if new_product_ids:
+            session = _make_shopifyql_session()
+            try:
+                for pid in new_product_ids:
+                    sold_7d = _fetch_product_sold_units_from_shopifyql(
+                        shop_name, access_token, pid, 7, session
+                    )
+                    sold_30d = _fetch_product_sold_units_from_shopifyql(
+                        shop_name, access_token, pid, 30, session
+                    )
+                    sold_90d = _fetch_product_sold_units_from_shopifyql(
+                        shop_name, access_token, pid, 90, session
+                    )
+                    baseline_by_product[pid] = {
+                        "7d": sold_7d,
+                        "30d": sold_30d,
+                        "90d": sold_90d,
+                    }
+            finally:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+
+        existing_pair_values: Dict[Tuple[int, int], Dict[str, int]] = {}
+        if existing_product_ids:
+            placeholders_existing = ",".join(["%s"] * len(existing_product_ids))
+            cursor.execute(
+                f"""
+                SELECT product_id, variant_id, sold_units_7d, sold_units_30d, sold_units_90d
+                FROM products_sold_units_daily
+                WHERE product_id IN ({placeholders_existing})
+                """,
+                tuple(sorted(existing_product_ids)),
+            )
+            for row in cursor.fetchall():
+                if isinstance(row, dict):
+                    pid = int(row["product_id"])
+                    vid = int(row["variant_id"])
+                    s7 = int(row.get("sold_units_7d") or 0)
+                    s30 = int(row.get("sold_units_30d") or 0)
+                    s90 = int(row.get("sold_units_90d") or 0)
+                else:
+                    pid = int(row[0])
+                    vid = int(row[1])
+                    s7 = int(row[2] or 0)
+                    s30 = int(row[3] or 0)
+                    s90 = int(row[4] or 0)
+
+                existing_pair_values[(pid, vid)] = {"7d": s7, "30d": s30, "90d": s90}
+
+        now_dt = now_ist().strftime("%Y-%m-%d %H:%M:%S")
+        upsert_rows = []
+
+        for (pid, vid), delta in pair_window_qty.items():
+            if pid in baseline_by_product:
+                # First-time product: use ShopifyQL baseline windows.
+                target_7d = baseline_by_product[pid]["7d"]
+                target_30d = baseline_by_product[pid]["30d"]
+                target_90d = baseline_by_product[pid]["90d"]
+            else:
+                # Existing product: increment from new-order deltas.
+                old_vals = existing_pair_values.get((pid, vid), {"7d": 0, "30d": 0, "90d": 0})
+                target_7d = int(old_vals["7d"]) + int(delta["7d"])
+                target_30d = int(old_vals["30d"]) + int(delta["30d"])
+                target_90d = int(old_vals["90d"]) + int(delta["90d"])
+
+            upsert_rows.append((pid, vid, target_7d, target_30d, target_90d, now_dt))
+
+        if not upsert_rows:
+            logger.info(f"[{brand_name}] No rows to upsert in products_sold_units_daily")
+            return
+
+        cursor.executemany(
+            """
+            INSERT INTO products_sold_units_daily (
+                product_id,
+                variant_id,
+                sold_units_7d,
+                sold_units_30d,
+                sold_units_90d,
+                last_processed_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                sold_units_7d = VALUES(sold_units_7d),
+                sold_units_30d = VALUES(sold_units_30d),
+                sold_units_90d = VALUES(sold_units_90d),
+                last_processed_at = VALUES(last_processed_at)
+            """,
+            upsert_rows,
+        )
+        connection.commit()
+
+        logger.info(
+            f"✅ [{brand_name}] Upserted {len(upsert_rows)} rows into products_sold_units_daily "
+            f"(new products fetched via ShopifyQL: {len(new_product_ids)})"
+        )
+
+    except Exception as e:
+        logger.error(
+            f"❌ [{brand_name}] Error updating products_sold_units_daily: {e}"
+        )
+        traceback.print_exc()
     finally:
         if close_after:
             try:
@@ -4390,6 +4751,17 @@ def process_single_brand(brand_index: int):
             changed_return_dates = upsert_returns_fact_from_orders(
                 brand_index, filtered, cursor=cursor, connection=connection
             )
+
+            if process["type"] == "NEW":
+                upsert_products_sold_units_daily_from_orders(
+                    brand_index=brand_index,
+                    orders_list=filtered,
+                    brand_name=brand_name,
+                    shop_name=shop_name,
+                    access_token=access_token,
+                    cursor=cursor,
+                    connection=connection,
+                )
 
             # UPDATED orders: build affected range from updated_at + returns_fact deltas.
             if process["type"] == "UPDATED":
