@@ -331,6 +331,7 @@ def trigger_pipeline_completion_webhook():
 # UTM Pipeline Trigger (NEW: Replacing Kafka)
 # ---------------------------
 UTM_PIPELINE_TRIGGER_API = os.environ.get("UTM_PIPELINE_TRIGGER_API")
+INVENTORY_PIPELINE_WEBHOOK = os.environ.get("INVENTORY_PIPELINE_WEBHOOK")
 
 def trigger_utm_pipeline(event_type: str, job_id: str, recompute_days: int = 1):
     """
@@ -372,6 +373,269 @@ def trigger_utm_pipeline(event_type: str, job_id: str, recompute_days: int = 1):
             logger.error(f"❌ UTM pipeline trigger failed: {resp.status_code} - {resp.text}")
     except Exception as e:
         logger.error(f"❌ Error triggering UTM pipeline: {e}")
+
+
+def _extract_numeric_id_from_gid(gid: Optional[str]) -> Optional[int]:
+    if not gid:
+        return None
+    try:
+        return int(str(gid).rstrip("/").split("/")[-1])
+    except Exception:
+        return None
+
+
+def _collect_new_order_item_pairs(orders_list: List[Dict]) -> Set[Tuple[int, int]]:
+    pairs: Set[Tuple[int, int]] = set()
+    for order in orders_list:
+        for item in order.get("line_items") or []:
+            if not item:
+                continue
+            try:
+                pid = int(item.get("product_id") or 0)
+                vid = int(item.get("variant_id") or 0)
+            except Exception:
+                continue
+            if pid > 0 and vid > 0:
+                pairs.add((pid, vid))
+    return pairs
+
+
+def _fetch_inventory_for_product_variants(
+    shop_name: str,
+    api_version: str,
+    access_token: str,
+    product_id: int,
+    target_variant_ids: Set[int],
+) -> Dict[int, int]:
+    """
+    Fetch variant inventoryQuantity for a Shopify product via Admin GraphQL.
+
+    Returns map: {variant_id: inventoryQuantity}
+    """
+    if not shop_name or not access_token or not api_version or product_id <= 0:
+        return {}
+
+    query = """
+    query ProductVariantsInventory($id: ID!, $after: String) {
+      product(id: $id) {
+        id
+        variants(first: 250, after: $after) {
+          edges {
+            cursor
+            node {
+              id
+              inventoryQuantity
+            }
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+      }
+    }
+    """
+
+    url = f"https://{shop_name}.myshopify.com/admin/api/{api_version}/graphql.json"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": access_token,
+    }
+
+    found: Dict[int, int] = {}
+    remaining = set(target_variant_ids)
+    after: Optional[str] = None
+
+    session = _make_shopifyql_session()
+    try:
+        while True:
+            payload = {
+                "query": query,
+                "variables": {
+                    "id": f"gid://shopify/Product/{product_id}",
+                    "after": after,
+                },
+            }
+
+            resp = None
+            last_exc: Optional[Exception] = None
+            for attempt in range(1, 4):
+                try:
+                    resp = session.post(
+                        url, headers=headers, data=json.dumps(payload), timeout=60
+                    )
+                    last_exc = None
+                    break
+                except Exception as e:
+                    last_exc = e
+                    logger.warning(
+                        f"⚠️ inventory fetch failed for product {product_id}, attempt {attempt}/3: {e}"
+                    )
+                    time.sleep(2**attempt)
+
+            if last_exc is not None or resp is None:
+                logger.error(
+                    f"❌ inventory fetch failed after retries for product {product_id}: {last_exc}"
+                )
+                return found
+
+            if resp.status_code != 200:
+                logger.error(
+                    f"❌ inventory GraphQL HTTP {resp.status_code} for product {product_id}: {resp.text[:300]}"
+                )
+                return found
+
+            body = resp.json()
+            if body.get("errors"):
+                logger.error(
+                    f"❌ inventory GraphQL errors for product {product_id}: {body.get('errors')}"
+                )
+                return found
+
+            product = ((body.get("data") or {}).get("product") or {})
+            variants = product.get("variants") or {}
+            edges = variants.get("edges") or []
+
+            for edge in edges:
+                node = (edge or {}).get("node") or {}
+                variant_gid = node.get("id")
+                variant_id = _extract_numeric_id_from_gid(variant_gid)
+                if not variant_id:
+                    continue
+                if variant_id not in remaining:
+                    continue
+                qty = node.get("inventoryQuantity")
+                try:
+                    found[variant_id] = int(qty if qty is not None else 0)
+                except Exception:
+                    found[variant_id] = 0
+
+            remaining -= set(found.keys())
+            if not remaining:
+                break
+
+            page_info = variants.get("pageInfo") or {}
+            has_next_page = bool(page_info.get("hasNextPage"))
+            end_cursor = page_info.get("endCursor")
+            if not has_next_page or not end_cursor:
+                break
+
+            after = end_cursor
+
+    except Exception as e:
+        logger.error(f"❌ Error fetching inventory for product {product_id}: {e}")
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+    return found
+
+
+def build_inventory_webhook_items_for_brand(
+    brand_index: int,
+    item_pairs: Set[Tuple[int, int]],
+) -> List[Dict[str, int]]:
+    """
+    Build webhook `items` payload for one brand:
+      [{product_id, variant_id, inventory_available}, ...]
+    """
+    if not item_pairs:
+        return []
+
+    shop_name = os.environ.get(f"SHOP_NAME_{brand_index}")
+    api_version = os.environ.get(f"API_VERSION_{brand_index}")
+    access_token = os.environ.get(f"ACCESS_TOKEN_{brand_index}")
+    brand_name = os.environ.get(f"BRAND_NAME_{brand_index}", f"Brand_{brand_index}")
+
+    if not shop_name or not api_version or not access_token:
+        logger.warning(
+            f"[{brand_name}] Missing Shopify credentials. Skipping inventory webhook build for this brand."
+        )
+        return []
+
+    variants_by_product: Dict[int, Set[int]] = {}
+    for pid, vid in item_pairs:
+        variants_by_product.setdefault(pid, set()).add(vid)
+
+    out_items: List[Dict[str, int]] = []
+    for pid in sorted(variants_by_product.keys()):
+        wanted_variants = variants_by_product[pid]
+        inventory_map = _fetch_inventory_for_product_variants(
+            shop_name=shop_name,
+            api_version=api_version,
+            access_token=access_token,
+            product_id=pid,
+            target_variant_ids=wanted_variants,
+        )
+
+        for vid in sorted(wanted_variants):
+            if vid not in inventory_map:
+                logger.warning(
+                    f"[{brand_name}] No inventoryQuantity found for product_id={pid}, variant_id={vid}; skipping item in webhook payload"
+                )
+                continue
+            out_items.append(
+                {
+                    "product_id": pid,
+                    "variant_id": vid,
+                    "inventory_available": int(inventory_map[vid]),
+                }
+            )
+
+    return out_items
+
+
+def trigger_inventory_pipeline_webhook(payload: List[Dict[str, Any]]) -> None:
+    """
+    Send consolidated inventory payload to downstream inventory pipeline.
+    """
+    if not payload:
+        logger.info("Inventory webhook skipped: no items to send.")
+        return
+
+    webhook_url = INVENTORY_PIPELINE_WEBHOOK
+    auth_header = PIPELINE_AUTH_HEADER
+
+    if not webhook_url:
+        logger.warning("INVENTORY_PIPELINE_WEBHOOK not set. Skipping inventory webhook.")
+        return
+
+    if not auth_header:
+        logger.warning("PIPELINE_AUTH_HEADER not set. Skipping inventory webhook.")
+        return
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-pipeline-key": auth_header,
+    }
+
+    for attempt in range(1, 4):
+        try:
+            resp = http_session.post(
+                webhook_url,
+                json=payload,
+                headers=headers,
+                timeout=30,
+            )
+            if resp.status_code in (200, 201, 202):
+                logger.info(
+                    f"✅ Inventory webhook sent successfully (brands={len(payload)}): HTTP {resp.status_code}"
+                )
+                return
+
+            logger.warning(
+                f"⚠️ Inventory webhook attempt {attempt}/3 failed: HTTP {resp.status_code} - {resp.text[:300]}"
+            )
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Inventory webhook attempt {attempt}/3 errored: {e}"
+            )
+
+        time.sleep(2**attempt)
+
+    logger.error("❌ Inventory webhook failed after 3 attempts.")
 
 
 # ---------------------------
@@ -4593,7 +4857,11 @@ def update_sessions_summary(
 def process_single_brand(brand_index: int):
     if brand_index not in db_connection_pools:
         logger.error(f"❌ Skipping brand {brand_index}: no connection pool")
-        return
+        return {
+            "brand_index": brand_index,
+            "brand_id": brand_id_from_config.get(brand_index, brand_index),
+            "item_pairs": set(),
+        }
     brand_name = os.environ.get(f"BRAND_NAME_{brand_index}", f"Brand_{brand_index}")
     brand_key = os.environ.get(
         f"BRAND_TAG_{brand_index}"
@@ -4647,6 +4915,7 @@ def process_single_brand(brand_index: int):
 
     # Track affected dates across all order processing
     affected_dates = {"min": None, "max": None}
+    new_order_item_pairs: Set[Tuple[int, int]] = set()
 
     # Orders (NEW + UPDATED) with single connection/cursor reused
     process_types = [
@@ -4728,6 +4997,9 @@ def process_single_brand(brand_index: int):
             logger.info(
                 f"Fetched {original_count}, removed {original_count - len(filtered)} duplicates. Processing {len(filtered)} orders."
             )
+
+            if process["type"] == "NEW":
+                new_order_item_pairs.update(_collect_new_order_item_pairs(filtered))
 
             # Track affected date range for NEW orders before load
             if process["type"] == "NEW":
@@ -4851,6 +5123,11 @@ def process_single_brand(brand_index: int):
         traceback.print_exc()
 
     logger.info(f"✅ COMPLETED PROCESSING FOR {brand_name}")
+    return {
+        "brand_index": brand_index,
+        "brand_id": brand_id_from_config.get(brand_index, brand_index),
+        "item_pairs": new_order_item_pairs,
+    }
 
 
 # ---------------------------
@@ -4892,17 +5169,46 @@ def run_data_pipeline():
             futures = {
                 executor.submit(process_single_brand, i): i for i in target_indices
             }
+            inventory_candidates: List[Dict[str, Any]] = []
             for fut in as_completed(futures):
                 idx = futures[fut]
                 name = os.environ.get(f"BRAND_NAME_{idx}", f"Brand_{idx}")
                 try:
-                    fut.result()
+                    result = fut.result()
+                    if isinstance(result, dict) and result.get("item_pairs"):
+                        inventory_candidates.append(result)
                     logger.info(f"✅ Successfully completed brand: {name}")
                 except Exception as e:
                     logger.error(f"❌ Failed processing brand {name}: {e}")
                     traceback.print_exc()
 
         logger.info("🏁 All brand worker threads have returned.")
+
+        consolidated_inventory_payload: List[Dict[str, Any]] = []
+        for candidate in inventory_candidates:
+            b_idx = int(candidate.get("brand_index"))
+            b_id = int(candidate.get("brand_id"))
+            pairs = candidate.get("item_pairs") or set()
+
+            items = build_inventory_webhook_items_for_brand(b_idx, pairs)
+            if not items:
+                continue
+
+            consolidated_inventory_payload.append(
+                {
+                    "brand_id": b_id,
+                    "items": items,
+                }
+            )
+
+        if consolidated_inventory_payload:
+            total_items = sum(
+                len(entry.get("items") or []) for entry in consolidated_inventory_payload
+            )
+            logger.info(
+                f"📦 Sending inventory webhook payload for {len(consolidated_inventory_payload)} brands, {total_items} items"
+            )
+        trigger_inventory_pipeline_webhook(consolidated_inventory_payload)
 
         end = now_ist()
         dur = (end - job_start_time).total_seconds()
