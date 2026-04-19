@@ -332,6 +332,44 @@ def trigger_pipeline_completion_webhook():
 # ---------------------------
 UTM_PIPELINE_TRIGGER_API = os.environ.get("UTM_PIPELINE_TRIGGER_API")
 INVENTORY_PIPELINE_WEBHOOK = os.environ.get("INVENTORY_PIPELINE_WEBHOOK")
+INVENTORY_PIPELINE_SERVICE_HOST = os.environ.get(
+    "INVENTORY_PIPELINE_SERVICE_HOST", "inventory-trigger-pipeline"
+).strip()
+INVENTORY_PIPELINE_SWITCH = (
+    os.environ.get("INVENTORY_PIPELINE_SWITCH", "false").strip().lower() == "true"
+)
+
+
+def _resolve_inventory_webhook_url(webhook_url: str) -> str:
+    """
+    Normalize inventory webhook URL for container networking edge cases.
+
+    If this process is running in Docker, localhost points to the container itself.
+    Prefer Docker DNS service host for container-to-container calls.
+    """
+    parsed = urlparse(webhook_url)
+    host = (parsed.hostname or "").lower()
+    running_in_docker = Path("/.dockerenv").exists() or (
+        os.environ.get("RUNNING_IN_DOCKER", "").strip().lower() == "true"
+    )
+
+    if host in {"localhost", "127.0.0.1", "host.docker.internal"} and running_in_docker:
+        target_host = INVENTORY_PIPELINE_SERVICE_HOST or "inventory-trigger-pipeline"
+        new_netloc = target_host
+        if parsed.port:
+            new_netloc = f"{new_netloc}:{parsed.port}"
+        remapped = parsed._replace(netloc=new_netloc).geturl()
+        logger.warning(
+            f"INVENTORY_PIPELINE_WEBHOOK points to local host alias inside Docker. Remapping to {remapped}"
+        )
+        return remapped
+
+    if host in {"localhost", "127.0.0.1"} and not running_in_docker:
+        logger.warning(
+            "INVENTORY_PIPELINE_WEBHOOK points to localhost. Ensure the inventory API is running and listening on the configured port."
+        )
+
+    return webhook_url
 
 def trigger_utm_pipeline(event_type: str, job_id: str, recompute_days: int = 1):
     """
@@ -591,6 +629,12 @@ def trigger_inventory_pipeline_webhook(payload: List[Dict[str, Any]]) -> None:
     """
     Send consolidated inventory payload to downstream inventory pipeline.
     """
+    if not INVENTORY_PIPELINE_SWITCH:
+        logger.info(
+            "Inventory pipeline switch is OFF (INVENTORY_PIPELINE_SWITCH=false). Skipping inventory webhook."
+        )
+        return
+
     if not payload:
         logger.info("Inventory webhook skipped: no items to send.")
         return
@@ -605,6 +649,8 @@ def trigger_inventory_pipeline_webhook(payload: List[Dict[str, Any]]) -> None:
     if not auth_header:
         logger.warning("PIPELINE_AUTH_HEADER not set. Skipping inventory webhook.")
         return
+
+    webhook_url = _resolve_inventory_webhook_url(webhook_url)
 
     headers = {
         "Content-Type": "application/json",
@@ -4998,7 +5044,7 @@ def process_single_brand(brand_index: int):
                 f"Fetched {original_count}, removed {original_count - len(filtered)} duplicates. Processing {len(filtered)} orders."
             )
 
-            if process["type"] == "NEW":
+            if process["type"] == "NEW" and INVENTORY_PIPELINE_SWITCH:
                 new_order_item_pairs.update(_collect_new_order_item_pairs(filtered))
 
             # Track affected date range for NEW orders before load
@@ -5024,7 +5070,7 @@ def process_single_brand(brand_index: int):
                 brand_index, filtered, cursor=cursor, connection=connection
             )
 
-            if process["type"] == "NEW":
+            if process["type"] == "NEW" and INVENTORY_PIPELINE_SWITCH:
                 upsert_products_sold_units_daily_from_orders(
                     brand_index=brand_index,
                     orders_list=filtered,
@@ -5184,31 +5230,37 @@ def run_data_pipeline():
 
         logger.info("🏁 All brand worker threads have returned.")
 
-        consolidated_inventory_payload: List[Dict[str, Any]] = []
-        for candidate in inventory_candidates:
-            b_idx = int(candidate.get("brand_index"))
-            b_id = int(candidate.get("brand_id"))
-            pairs = candidate.get("item_pairs") or set()
+        if INVENTORY_PIPELINE_SWITCH:
+            consolidated_inventory_payload: List[Dict[str, Any]] = []
+            for candidate in inventory_candidates:
+                b_idx = int(candidate.get("brand_index"))
+                b_id = int(candidate.get("brand_id"))
+                pairs = candidate.get("item_pairs") or set()
 
-            items = build_inventory_webhook_items_for_brand(b_idx, pairs)
-            if not items:
-                continue
+                items = build_inventory_webhook_items_for_brand(b_idx, pairs)
+                if not items:
+                    continue
 
-            consolidated_inventory_payload.append(
-                {
-                    "brand_id": b_id,
-                    "items": items,
-                }
-            )
+                consolidated_inventory_payload.append(
+                    {
+                        "brand_id": b_id,
+                        "items": items,
+                    }
+                )
 
-        if consolidated_inventory_payload:
-            total_items = sum(
-                len(entry.get("items") or []) for entry in consolidated_inventory_payload
-            )
+            if consolidated_inventory_payload:
+                total_items = sum(
+                    len(entry.get("items") or [])
+                    for entry in consolidated_inventory_payload
+                )
+                logger.info(
+                    f"📦 Sending inventory webhook payload for {len(consolidated_inventory_payload)} brands, {total_items} items"
+                )
+            trigger_inventory_pipeline_webhook(consolidated_inventory_payload)
+        else:
             logger.info(
-                f"📦 Sending inventory webhook payload for {len(consolidated_inventory_payload)} brands, {total_items} items"
+                "Inventory pipeline switch is OFF (INVENTORY_PIPELINE_SWITCH=false). Skipping sold-units + inventory webhook flow."
             )
-        trigger_inventory_pipeline_webhook(consolidated_inventory_payload)
 
         end = now_ist()
         dur = (end - job_start_time).total_seconds()
