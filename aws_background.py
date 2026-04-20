@@ -3469,7 +3469,7 @@ def update_shopify_orders_utm_daily_incremental(
                 0 AS number_of_sessions,
                 0 AS number_of_atc_sessions
             FROM shopify_orders
-            WHERE DATE(created_at) BETWEEN %s AND %s
+            WHERE created_at >= %s AND created_at < DATE_ADD(%s, INTERVAL 1 DAY)
             GROUP BY 1, 2, 3, 4, 5, 6
         ),
         SessionAgg AS (
