@@ -766,6 +766,39 @@ def timed(label: str):
         logger.info(f"⏱️ {label} took {dt:.2f}s")
 
 
+# Chunk size for bulk INSERT ... ON DUPLICATE KEY UPDATE and plain bulk inserts.
+# One executemany over a huge list becomes one transaction + one redo-log blob,
+# which holds row locks for the entire duration and pushes EBS hard. Keeping
+# chunks in the low thousands gives MySQL room to flush between commits.
+EXECUTEMANY_CHUNK_SIZE = int(os.environ.get("EXECUTEMANY_CHUNK_SIZE", "1000"))
+
+
+def executemany_chunked(
+    cursor,
+    connection,
+    sql: str,
+    rows: List[Tuple],
+    chunk_size: int = EXECUTEMANY_CHUNK_SIZE,
+    commit_between_chunks: bool = True,
+) -> int:
+    """Run executemany in bounded chunks. Commits between chunks by default so
+    a single slow chunk does not hold locks across the whole batch.
+
+    Returns total row count passed in (mysql-connector's rowcount sums affected
+    rows across chunks in a way that isn't portable, so we return len(rows)).
+    """
+    if not rows:
+        return 0
+    total = len(rows)
+    for i in range(0, total, chunk_size):
+        cursor.executemany(sql, rows[i : i + chunk_size])
+        if commit_between_chunks:
+            connection.commit()
+    if not commit_between_chunks:
+        connection.commit()
+    return total
+
+
 def enable_session_profiling(cursor) -> bool:
     try:
         cursor.execute("SET SESSION profiling = 1")
@@ -1949,8 +1982,7 @@ def upsert_returns_fact_from_orders(
             ON DUPLICATE KEY UPDATE amount = VALUES(amount);
         """
         try:
-            cursor.executemany(insert_sql, rows)
-            connection.commit()
+            executemany_chunked(cursor, connection, insert_sql, rows)
         except mysql.connector.errors.OperationalError as e:
             if getattr(e, "errno", None) == 2013:
                 logger.warning(
@@ -1960,8 +1992,7 @@ def upsert_returns_fact_from_orders(
                     connection.ping(reconnect=True, attempts=3, delay=2)
                 except Exception as ee:
                     logger.warning(f"⚠️ returns_fact reconnect retry failed: {ee}")
-                cursor.executemany(insert_sql, rows)
-                connection.commit()
+                executemany_chunked(cursor, connection, insert_sql, rows)
             else:
                 raise
 
@@ -2300,7 +2331,9 @@ def upsert_products_sold_units_daily_from_orders(
             logger.info(f"[{brand_name}] No rows to upsert in products_sold_units_daily")
             return
 
-        cursor.executemany(
+        executemany_chunked(
+            cursor,
+            connection,
             """
             INSERT INTO products_sold_units_daily (
                 product_id,
@@ -2319,7 +2352,6 @@ def upsert_products_sold_units_daily_from_orders(
             """,
             upsert_rows,
         )
-        connection.commit()
 
         logger.info(
             f"✅ [{brand_name}] Upserted {len(upsert_rows)} rows into products_sold_units_daily "
@@ -2836,19 +2868,20 @@ def ensure_summary_tables(cursor, connection):
 def merge_staging_to_main_by_date(
     cursor, connection, table_name, staging_table_name, brand_name, batch_size=5
 ):
-    """
-    Safely merges data from staging_table_name into table_name by date chunks.
-    Main table is locked only for small DELETE+INSERT per date.
+    """Merge staging into main using range DELETE + range INSERT per chunk.
+
+    Previously this did per-date DELETE + per-date INSERT in a tight loop, which
+    means 2N round-trips and N index-scan deletes for N dates. With a PK on
+    `date` (see migrations/001_rds_perf_pass.sql) the DELETE is a key lookup
+    and the INSERT can be done in one pass per chunk.
     """
     logger.debug(
         f"🔍 [{brand_name}] Starting staging merge from {staging_table_name} to {table_name}"
     )
 
-    # 1. Fetch distinct dates
     cursor.execute(f"SELECT DISTINCT date FROM {staging_table_name} ORDER BY date")
     rows = cursor.fetchall()
 
-    # Extract dates safely (handles both dictionary and tuple cursors)
     affected_dates = []
     for r in rows:
         val = r["date"] if isinstance(r, dict) else r[0]
@@ -2860,34 +2893,31 @@ def merge_staging_to_main_by_date(
         return
 
     logger.info(
-        f"🔄 [{brand_name}] Found {len(affected_dates)} dates to merge into {table_name}: {affected_dates}"
+        f"🔄 [{brand_name}] Found {len(affected_dates)} dates to merge into {table_name}"
     )
 
-    # 2. Merge in chunks
     for i in range(0, len(affected_dates), batch_size):
         chunk = affected_dates[i : i + batch_size]
-        chunk_str = ", ".join(str(d) for d in chunk)
-        logger.debug(f"   ⏳ [{brand_name}] Processing batch: {chunk_str}")
+        placeholders = ",".join(["%s"] * len(chunk))
+        chunk_params = [str(d) for d in chunk]
 
-        for d in chunk:
-            date_str = str(d)
-            # Delete and Re-insert for the specific date
-            cursor.execute(f"DELETE FROM {table_name} WHERE date = %s", (date_str,))
-            deleted_count = cursor.rowcount
+        cursor.execute(
+            f"DELETE FROM {table_name} WHERE date IN ({placeholders})",
+            chunk_params,
+        )
+        deleted_count = cursor.rowcount
 
-            cursor.execute(
-                f"INSERT INTO {table_name} SELECT * FROM {staging_table_name} WHERE date = %s",
-                (date_str,),
-            )
-            inserted_count = cursor.rowcount
-
-            logger.debug(
-                f"      ✅ [{brand_name}] Date {date_str}: Deleted {deleted_count} rows, Inserted {inserted_count} rows"
-            )
+        cursor.execute(
+            f"INSERT INTO {table_name} "
+            f"SELECT * FROM {staging_table_name} WHERE date IN ({placeholders})",
+            chunk_params,
+        )
+        inserted_count = cursor.rowcount
 
         connection.commit()
         logger.info(
-            f"   🚀 [{brand_name}] Merged {min(i + batch_size, len(affected_dates))}/{len(affected_dates)} dates into {table_name}"
+            f"   🚀 [{brand_name}] Merged {min(i + batch_size, len(affected_dates))}/{len(affected_dates)} "
+            f"dates into {table_name} (-{deleted_count} +{inserted_count})"
         )
 
     logger.info(f"🏁 [{brand_name}] Completed merge into {table_name}")
@@ -4625,20 +4655,18 @@ def process_and_upload_utm_summary(
 
         # 3. Insert new
         sql_summary = """
-            INSERT INTO overall_utm_summary 
+            INSERT INTO overall_utm_summary
             (date, utm_source, utm_source_sessions, utm_source_atc_sessions, utm_names)
             VALUES (%s, %s, %s, %s, %s)
         """
-        cursor.executemany(sql_summary, db_rows)
-        
+        executemany_chunked(cursor, connection, sql_summary, db_rows)
+
         if traffic_split_rows:
             sql_split = """
                 INSERT INTO overall_traffic_split (date, utm_source)
                 VALUES (%s, %s)
             """
-            cursor.executemany(sql_split, traffic_split_rows)
-
-        connection.commit()
+            executemany_chunked(cursor, connection, sql_split, traffic_split_rows)
         logger.info(
             f"✅ Updated overall_utm_summary & overall_traffic_split for {brand_name} ({len(db_rows)} categories, {len(traffic_split_rows)} traffic split rows, {min_date}..{max_date})"
         )
@@ -4806,12 +4834,11 @@ def process_and_upload_referrer_summary(
 
         # 3. Insert new
         sql = """
-            INSERT INTO overall_referrer_summary 
+            INSERT INTO overall_referrer_summary
             (date, referrer_name, referrer_sessions, referrer_atc_sessions, referrer_names)
             VALUES (%s, %s, %s, %s, %s)
         """
-        cursor.executemany(sql, db_rows)
-        connection.commit()
+        executemany_chunked(cursor, connection, sql, db_rows)
         logger.info(
             f"✅ Updated overall_referrer_summary for {brand_name} ({len(db_rows)} rows, {min_date}..{max_date})"
         )
@@ -5205,9 +5232,15 @@ def run_data_pipeline():
             logger.warning("No active brands match the current filters. Nothing to do.")
             return
 
-        max_workers = min(len(target_indices), max(2, CPU_COUNT // 2))
+        # Cap per-run concurrency to protect RDS I/O. The per-brand pipeline is
+        # heavy (multi-table JOINs, summary rebuilds, session upserts); running
+        # all brands at once drives EBSByteBalance% to 0. Override with env
+        # MAX_CONCURRENT_BRANDS when scaling up the RDS instance.
+        max_concurrent_brands = int(os.environ.get("MAX_CONCURRENT_BRANDS", "2"))
+        max_workers = max(1, min(len(target_indices), max_concurrent_brands))
         logger.info(
             f"Processing {len(target_indices)} brands with {max_workers} parallel workers"
+            f" (MAX_CONCURRENT_BRANDS={max_concurrent_brands})"
         )
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
