@@ -5320,17 +5320,22 @@ if __name__ == "__main__":
     initialize_brand_configs()
 
     scheduler = BackgroundScheduler(timezone=IST)
+    # Schedule at fixed 10-minute wall-clock slots (:00, :10, :20, :30, :40, :50)
+    # so runs are predictable and do NOT fire immediately on boot. This gives
+    # operators a stable cadence and a baseline for future collision avoidance.
     scheduler.add_job(
         run_data_pipeline,
-        "interval",
-        minutes=10,
-        next_run_time=now_ist(),  # fire immediately on boot
+        "cron",
+        minute="0,10,20,30,40,50",
+        second=0,
         coalesce=True,
         max_instances=1,
         misfire_grace_time=120,
         replace_existing=True,
     )
     scheduler.start()
+
+    first_run = scheduler.get_jobs()[0].next_run_time
 
     logger.info("✅ Optimized Shopify ETL worker started (INCREMENTAL SUMMARIES)")
     if BACKFILL_MODE:
@@ -5341,8 +5346,10 @@ if __name__ == "__main__":
     else:
         logger.info("   - Mode: Regular incremental")
 
-    logger.info("   - First run: Immediate")
-    logger.info("   - Interval: Every 10 minutes")
+    logger.info(
+        f"   - First run: {first_run.strftime('%Y-%m-%d %I:%M:%S %p %Z')} (next :00/:10/:20/:30/:40/:50 slot)"
+    )
+    logger.info("   - Schedule: Every 10 minutes on fixed wall-clock slots")
     logger.info(
         f"   - Parallel workers: {min(len(active_brand_indices), max(2, CPU_COUNT // 2))}"
     )
