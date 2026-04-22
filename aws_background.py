@@ -55,7 +55,7 @@ import json
 import time
 import logging
 import traceback
-from typing import Dict, List, Optional, Tuple, Any, Set
+from typing import Dict, Iterable, List, Optional, Tuple, Any, Set
 from functools import lru_cache
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -64,7 +64,7 @@ import base64
 import uuid
 # from kafka import KafkaProducer (REMOVED)
 
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import mysql.connector
@@ -2393,89 +2393,51 @@ def upsert_products_sold_units_daily_from_orders(
 
 
 # ---------------------------
-# Date range tracking
+# Affected date tracking
 # ---------------------------
-def get_affected_date_range_new_orders(
-    orders_list: List[Dict],
-) -> Tuple[Optional[str], Optional[str]]:
-    """
-    For NEW orders (shopify_orders):
-    - summaries depend only on created_date
-    - so we only look at created_at timestamps.
-    """
-    if not orders_list:
-        return None, None
+def _dates_in_clause(dates: Iterable[str]) -> Tuple[str, Tuple[str, ...]]:
+    """Build the body of a SQL IN-clause for a set of dates.
 
+    Returns (placeholders_string, params_tuple). Callers splice the
+    placeholders into an f-string SQL fragment and pass the params tuple
+    to cursor.execute (repeated per BETWEEN-replaced clause).
+    """
+    ordered = sorted({d for d in dates if d})
+    placeholders = ", ".join(["%s"] * len(ordered))
+    return placeholders, tuple(ordered)
+
+
+def get_affected_dates_new_orders(orders_list: List[Dict]) -> Set[str]:
+    """Return the set of IST dates whose summaries are affected by NEW orders.
+    Summaries for NEW orders depend only on created_date.
+    """
     dates: Set[str] = set()
-    for o in orders_list:
+    for o in orders_list or []:
         if o.get("created_at"):
             d = _parse_iso_to_ist_date(o["created_at"])
             if d:
                 dates.add(d)
-
-    if not dates:
-        return None, None
-
-    return min(dates), max(dates)
+    return dates
 
 
-def get_affected_date_range_updates(
+def get_affected_dates_updates(
     orders_list: List[Dict],
     extra_event_dates: Optional[Set[str]] = None,
-) -> Tuple[Optional[str], Optional[str]]:
-    # Developer validation scenarios:
-    # A) Historical refund exists; order updated today for unrelated field:
-    #    extra_event_dates stays empty, range includes only updated_at day (not old refund day).
-    # B) New refund created today on old order:
-    #    returns_fact delta adds today's date to extra_event_dates, range includes today.
-    # C) Cancel set today on old order:
-    #    returns_fact delta adds today's cancel date, range includes today.
+) -> Set[str]:
+    """Return the set of IST dates whose summaries are affected by UPDATED orders.
+
+    Sources:
+      - updated_at date for orders that can affect summaries
+        (not-paid/pending, or cancelled, or has refunds).
+      - extra_event_dates from returns_fact upsert deltas (only event_dates
+        whose amount actually changed or were newly inserted).
+
+    Passing a *set* (not a min/max range) downstream is what keeps the
+    summary rebuild sparse: a 2016 refund correction only rebuilds the
+    2016-04-08 summary row, not the entire 2016→today span.
     """
-    For UPDATED orders (shopify_orders_update):
-    Only consider orders that can affect summary tables.
-
-    IMPORTANT:
-    Do NOT use historical refunds/cancel dates from the order snapshot for range
-    expansion. Shopify returns full historical refunds on every fetch.
-    Instead, use:
-      - updated_at date (drives updated_date-based summary changes)
-      - extra_event_dates from returns_fact upsert deltas (new/changed events only)
-
-      - financial_status NOT IN ('paid','pending')
-      - OR cancelled_at is set
-      - OR refunds list is non-empty
-    """
-    if not orders_list and not extra_event_dates:
-        return None, None
-
-    # Clamp extra_event_dates (from returns_fact deltas) to the recent window.
-    # Shopify returns full historical refunds on every fetch; an amount
-    # correction on a 2016 refund arrives here with event_date=2016, which
-    # otherwise expands the affected range across years and forces every
-    # summary table to rebuild hundreds of historical dates on each 10-min
-    # tick. Historical corrections are handled by the backfill scripts;
-    # the incremental path should stay incremental.
-    max_days_back = int(os.environ.get("MAX_AFFECTED_DAYS_BACK", "30"))
-    cutoff = now_ist().date() - timedelta(days=max_days_back)
-    dates: Set[str] = set()
-    dropped: Set[str] = set()
-    for d in extra_event_dates or set():
-        try:
-            if date.fromisoformat(d) >= cutoff:
-                dates.add(d)
-            else:
-                dropped.add(d)
-        except Exception:
-            dates.add(d)
-    if dropped:
-        logger.warning(
-            f"⚠️ Dropped {len(dropped)} historical event_date(s) older than "
-            f"{cutoff.isoformat()} from affected range (MAX_AFFECTED_DAYS_BACK="
-            f"{max_days_back}). Oldest dropped: {min(dropped)}. Use backfill "
-            f"scripts to reconcile historical summaries."
-        )
-
-    for o in orders_list:
+    dates: Set[str] = set(extra_event_dates or set())
+    for o in orders_list or []:
         financial_status = (o.get("financial_status") or "").lower()
         refunds = o.get("refunds") or []
         cancelled_at = o.get("cancelled_at")
@@ -2494,10 +2456,7 @@ def get_affected_date_range_updates(
             if d:
                 dates.add(d)
 
-    if not dates:
-        return None, None
-
-    return min(dates), max(dates)
+    return dates
 
 
 # ---------------------------
@@ -2971,12 +2930,16 @@ def merge_staging_to_main_by_date(
 
 
 def update_sales_summary_incremental(
-    cursor, connection, brand_name: str, min_date: str, max_date: str
+    cursor, connection, brand_name: str, target_dates: Iterable[str]
 ):
-    """Update sales_summary for affected date range only.
-    Refactored to use STAGING table for chunked merge.
-    """
-    with timed(f"[{brand_name}] sales_summary incremental ({min_date} to {max_date})"):
+    """Update sales_summary for only the specific affected dates."""
+    placeholders, params = _dates_in_clause(target_dates)
+    if not params:
+        logger.debug(f"[{brand_name}] sales_summary: no dates to rebuild")
+        return
+    with timed(
+        f"[{brand_name}] sales_summary incremental ({len(params)} date(s))"
+    ):
         # STEP 1: Create staging table
         cursor.execute(
             "CREATE TABLE IF NOT EXISTS sales_summary_stage LIKE sales_summary"
@@ -2985,7 +2948,7 @@ def update_sales_summary_incremental(
         cursor.execute("TRUNCATE TABLE sales_summary_stage")
 
         # STEP 3: Populate staging table
-        sql = """
+        sql = f"""
         INSERT INTO sales_summary_stage (
             date, gokwik_sales, gokwik_returns, actual_gokwik_sale,
             KwikEngageSales, KwikEngageReturns, actual_KwikEngage_sale,
@@ -3016,7 +2979,7 @@ def update_sales_summary_incremental(
                 SUM(total_price) AS global_overall_sales,
                 SUM(CASE WHEN order_app_name != 'HYPD_store' THEN total_price ELSE 0 END) AS global_sales_WO_hypd
             FROM shopify_orders
-            WHERE created_date BETWEEN %s AND %s
+            WHERE created_date IN ({placeholders})
             GROUP BY date
         ),
         ReturnsData AS (
@@ -3034,13 +2997,13 @@ def update_sales_summary_incremental(
                 SUM(CASE WHEN order_app_name = 'Shopflo' THEN total_price ELSE 0 END) AS shopflo_returns,
                 SUM(CASE WHEN order_app_name != 'HYPD_store' THEN total_price ELSE 0 END) AS global_returns_WO_hypd
             FROM shopify_orders_update
-            WHERE financial_status NOT IN ('paid', 'pending') AND updated_date BETWEEN %s AND %s
+            WHERE financial_status NOT IN ('paid', 'pending') AND updated_date IN ({placeholders})
             GROUP BY date
         ),
         RefundsByDate AS (
             SELECT event_date AS date, SUM(amount) AS overall_returns
             FROM returns_fact
-            WHERE event_type = 'REFUND' AND event_date BETWEEN %s AND %s
+            WHERE event_type = 'REFUND' AND event_date IN ({placeholders})
             GROUP BY event_date
         ),
         AllDates AS (
@@ -3093,9 +3056,7 @@ def update_sales_summary_incremental(
         LEFT JOIN ReturnsData r ON d.date = r.date
         LEFT JOIN RefundsByDate rfd ON d.date = rfd.date
         """
-        cursor.execute(
-            sql, (min_date, max_date, min_date, max_date, min_date, max_date)
-        )
+        cursor.execute(sql, params + params + params)
         connection.commit()
 
         # STEP 4 & 5: Fetch affected dates and merge
@@ -3105,12 +3066,14 @@ def update_sales_summary_incremental(
 
 
 def update_order_summary_incremental(
-    cursor, connection, brand_name: str, min_date: str, max_date: str
+    cursor, connection, brand_name: str, target_dates: Iterable[str]
 ):
-    """Update order_summary for affected date range only (with partially paid tracking).
-    Refactored to use STAGING table for chunked merge.
-    """
-    with timed(f"[{brand_name}] order_summary incremental ({min_date} to {max_date})"):
+    """Update order_summary for only the specific affected dates."""
+    placeholders, params = _dates_in_clause(target_dates)
+    if not params:
+        logger.debug(f"[{brand_name}] order_summary: no dates to rebuild")
+        return
+    with timed(f"[{brand_name}] order_summary incremental ({len(params)} date(s))"):
         # STEP 1: Create staging table
         cursor.execute(
             "CREATE TABLE IF NOT EXISTS order_summary_stage LIKE order_summary"
@@ -3119,7 +3082,7 @@ def update_order_summary_incremental(
         cursor.execute("TRUNCATE TABLE order_summary_stage")
 
         # STEP 3: Populate staging table
-        sql = """
+        sql = f"""
         INSERT INTO order_summary_stage (
             date, number_of_orders_created, number_of_orders_returned, actual_number_of_orders,
             cod_orders, prepaid_orders, partially_paid_orders,
@@ -3172,7 +3135,7 @@ def update_order_summary_incremental(
                 0 AS partially_paid_returned
 
             FROM shopify_orders
-            WHERE created_date BETWEEN %s AND %s
+            WHERE created_date IN ({placeholders})
             GROUP BY created_date
 
             UNION ALL
@@ -3213,13 +3176,13 @@ def update_order_summary_incremental(
 
             FROM shopify_orders_update
             WHERE financial_status NOT IN ('paid', 'pending')
-              AND updated_date BETWEEN %s AND %s
+              AND updated_date IN ({placeholders})
             GROUP BY updated_date
         ) AS combined
         WHERE date IS NOT NULL
         GROUP BY date
         """
-        cursor.execute(sql, (min_date, max_date, min_date, max_date))
+        cursor.execute(sql, params + params)
         connection.commit()
 
         # STEP 4 & 5: Fetch affected dates and merge
@@ -3229,13 +3192,15 @@ def update_order_summary_incremental(
 
 
 def update_discount_summary_incremental(
-    cursor, connection, brand_name: str, min_date: str, max_date: str
+    cursor, connection, brand_name: str, target_dates: Iterable[str]
 ):
-    """Update discount_summary for affected date range only.
-    Refactored to use STAGING table for chunked merge.
-    """
+    """Update discount_summary for only the specific affected dates."""
+    placeholders, params = _dates_in_clause(target_dates)
+    if not params:
+        logger.debug(f"[{brand_name}] discount_summary: no dates to rebuild")
+        return
     with timed(
-        f"[{brand_name}] discount_summary incremental ({min_date} to {max_date})"
+        f"[{brand_name}] discount_summary incremental ({len(params)} date(s))"
     ):
         # STEP 1: Create staging table
         cursor.execute(
@@ -3245,22 +3210,22 @@ def update_discount_summary_incremental(
         cursor.execute("TRUNCATE TABLE discount_summary_stage")
 
         # STEP 3: Populate staging table
-        sql = """
+        sql = f"""
         INSERT INTO discount_summary_stage (date, total_discounts_given, total_discount_on_returns, actual_discounts)
         WITH DiscountsGiven AS (
-            SELECT 
-                STR_TO_DATE(created_date, '%Y-%m-%d') AS date, 
+            SELECT
+                STR_TO_DATE(created_date, '%Y-%m-%d') AS date,
                 SUM(COALESCE(discount_amount, 0)) AS total_discounts_given
-            FROM shopify_orders 
-            WHERE created_date BETWEEN %s AND %s
+            FROM shopify_orders
+            WHERE created_date IN ({placeholders})
             GROUP BY date
         ),
         DiscountsReturned AS (
-            SELECT 
-                STR_TO_DATE(updated_date, '%Y-%m-%d') AS date, 
+            SELECT
+                STR_TO_DATE(updated_date, '%Y-%m-%d') AS date,
                 SUM(COALESCE(discount_amount, 0)) AS total_discount_on_returns
-            FROM shopify_orders_update 
-            WHERE financial_status NOT IN ('paid', 'pending') AND updated_date BETWEEN %s AND %s
+            FROM shopify_orders_update
+            WHERE financial_status NOT IN ('paid', 'pending') AND updated_date IN ({placeholders})
             GROUP BY date
         ),
         AllDates AS (
@@ -3277,7 +3242,7 @@ def update_discount_summary_incremental(
         LEFT JOIN DiscountsGiven dg ON d.date = dg.date
         LEFT JOIN DiscountsReturned dr ON d.date = dr.date
         """
-        cursor.execute(sql, (min_date, max_date, min_date, max_date))
+        cursor.execute(sql, params + params)
         connection.commit()
 
         # STEP 4 & 5: Fetch affected dates and merge
@@ -3287,12 +3252,14 @@ def update_discount_summary_incremental(
 
 
 def update_gross_summary_incremental(
-    cursor, connection, brand_name: str, min_date: str, max_date: str
+    cursor, connection, brand_name: str, target_dates: Iterable[str]
 ):
-    """Update gross_summary for affected date range only.
-    Refactored to use STAGING table for chunked merge.
-    """
-    with timed(f"[{brand_name}] gross_summary incremental ({min_date} to {max_date})"):
+    """Update gross_summary for only the specific affected dates."""
+    placeholders, params = _dates_in_clause(target_dates)
+    if not params:
+        logger.debug(f"[{brand_name}] gross_summary: no dates to rebuild")
+        return
+    with timed(f"[{brand_name}] gross_summary incremental ({len(params)} date(s))"):
         # STEP 1: Create staging table
         cursor.execute(
             "CREATE TABLE IF NOT EXISTS gross_summary_stage LIKE gross_summary"
@@ -3301,7 +3268,7 @@ def update_gross_summary_incremental(
         cursor.execute("TRUNCATE TABLE gross_summary_stage")
 
         # STEP 3: Populate staging table
-        sql = """
+        sql = f"""
         INSERT INTO gross_summary_stage (
             date, overall_sale, shipping_total, discounts_total, tax_total, 
             gross_sales, actual_discounts, net_sales
@@ -3312,13 +3279,13 @@ def update_gross_summary_incremental(
                 SUM(COALESCE(line_item_quantity, 0) * COALESCE(line_item_price, 0)) AS overall_sale,
                 SUM(COALESCE(shipping_price, 0)) AS shipping_total,
                 SUM(COALESCE(total_tax, 0)) AS tax_total
-            FROM shopify_orders 
-            WHERE created_date BETWEEN %s AND %s
+            FROM shopify_orders
+            WHERE created_date IN ({placeholders})
             GROUP BY date
         )
         SELECT
-            sa.date, 
-            sa.overall_sale, 
+            sa.date,
+            sa.overall_sale,
             sa.shipping_total,
             COALESCE(ds.total_discounts_given, 0) AS discounts_total,
             sa.tax_total,
@@ -3328,7 +3295,7 @@ def update_gross_summary_incremental(
         FROM ShopifyAggregates sa
         LEFT JOIN discount_summary ds ON sa.date = ds.date
         """
-        cursor.execute(sql, (min_date, max_date))
+        cursor.execute(sql, params)
         connection.commit()
 
         # STEP 4 & 5: Fetch affected dates and merge
@@ -3338,13 +3305,15 @@ def update_gross_summary_incremental(
 
 
 def update_hour_wise_sales_incremental(
-    cursor, connection, brand_name: str, min_date: str, max_date: str
+    cursor, connection, brand_name: str, target_dates: Iterable[str]
 ):
-    """Update hour_wise_sales for affected date range only.
-    Refactored to use STAGING table for chunked merge.
-    """
+    """Update hour_wise_sales for only the specific affected dates."""
+    placeholders, params = _dates_in_clause(target_dates)
+    if not params:
+        logger.debug(f"[{brand_name}] hour_wise_sales: no dates to rebuild")
+        return
     with timed(
-        f"[{brand_name}] hour_wise_sales incremental ({min_date} to {max_date})"
+        f"[{brand_name}] hour_wise_sales incremental ({len(params)} date(s))"
     ):
         # STEP 1: Create staging table
         cursor.execute(
@@ -3354,7 +3323,7 @@ def update_hour_wise_sales_incremental(
         cursor.execute("TRUNCATE TABLE hour_wise_sales_stage")
 
         # STEP 3: Populate staging table
-        sql = """
+        sql = f"""
         INSERT INTO hour_wise_sales_stage (
             date, hour, number_of_orders, total_sales, number_of_prepaid_orders, 
             number_of_cod_orders, number_of_sessions, number_of_atc_sessions
@@ -3373,7 +3342,7 @@ def update_hour_wise_sales_incremental(
                     OR payment_gateway_names LIKE '%cash_on_delivery%')
                     AND (payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR payment_gateway_names is NULL) THEN order_id END) AS number_of_cod_orders
             FROM shopify_orders
-            WHERE created_date BETWEEN %s AND %s 
+            WHERE created_date IN ({placeholders})
                 AND created_time IS NOT NULL
             GROUP BY date, hour
         ),
@@ -3384,7 +3353,7 @@ def update_hour_wise_sales_incremental(
                 (mobile_sessions + desktop_sessions + tablet_sessions + other_sessions) AS number_of_sessions,
                 (mobile_atc_sessions + desktop_atc_sessions + tablet_atc_sessions + other_atc_sessions) AS number_of_atc_sessions
             FROM hourly_sessions_summary_shopify
-            WHERE date BETWEEN %s AND %s
+            WHERE date IN ({placeholders})
         ),
         AllKeys AS (
             SELECT date, hour FROM HourlySales
@@ -3404,7 +3373,7 @@ def update_hour_wise_sales_incremental(
         LEFT JOIN HourlySales hs ON ak.date = hs.date AND ak.hour = hs.hour
         LEFT JOIN HourlySessions ss ON ak.date = ss.date AND ak.hour = ss.hour
         """
-        cursor.execute(sql, (min_date, max_date, min_date, max_date))
+        cursor.execute(sql, params + params)
         connection.commit()
 
         # STEP 4 & 5: Fetch affected dates and merge
@@ -3418,14 +3387,15 @@ def update_overall_summary_incremental(
     connection,
     brand_key: Optional[str],
     brand_name: str,
-    min_date: str,
-    max_date: str,
+    target_dates: Iterable[str],
 ):
-    """Update overall_summary for affected date range only (with partial payments + adjusted sessions).
-    Refactored to use STAGING table for chunked merge.
-    """
+    """Update overall_summary for only the specific affected dates."""
+    placeholders, params = _dates_in_clause(target_dates)
+    if not params:
+        logger.debug(f"[{brand_name}] overall_summary: no dates to rebuild")
+        return
     with timed(
-        f"[{brand_name}] overall_summary incremental ({min_date} to {max_date})"
+        f"[{brand_name}] overall_summary incremental ({len(params)} date(s))"
     ):
         # STEP 1: Create staging table
         cursor.execute(
@@ -3435,7 +3405,7 @@ def update_overall_summary_incremental(
         cursor.execute("TRUNCATE TABLE overall_summary_stage")
 
         # STEP 3: Populate staging table
-        sql = """
+        sql = f"""
         INSERT INTO overall_summary_stage (
             date, gross_sales, total_discount_amount, total_sales, net_sales,
             total_orders, cod_orders, prepaid_orders, partially_paid_orders,
@@ -3476,9 +3446,9 @@ def update_overall_summary_incremental(
         LEFT JOIN sessions_summary   sess ON s.date = sess.date
         LEFT JOIN gross_summary      gs   ON s.date = gs.date
         LEFT JOIN discount_summary   ds   ON s.date = ds.date
-        WHERE s.date BETWEEN %s AND %s
+        WHERE s.date IN ({placeholders})
         """
-        cursor.execute(sql, (brand_key, min_date, max_date))
+        cursor.execute(sql, (brand_key,) + params)
         connection.commit()
 
         # STEP 4 & 5: Fetch affected dates and merge
@@ -3488,13 +3458,17 @@ def update_overall_summary_incremental(
 
 
 def update_shopify_orders_utm_daily_incremental(
-    cursor, connection, brand_name: str, min_date: str, max_date: str
+    cursor, connection, brand_name: str, target_dates: Iterable[str]
 ):
-    """Update shopify_orders_utm_daily for affected date range only."""
+    """Update shopify_orders_utm_daily for only the specific affected dates."""
+    placeholders, params = _dates_in_clause(target_dates)
+    if not params:
+        logger.debug(f"[{brand_name}] shopify_orders_utm_daily: no dates to rebuild")
+        return
     with timed(
-        f"[{brand_name}] shopify_orders_utm_daily incremental ({min_date} to {max_date})"
+        f"[{brand_name}] shopify_orders_utm_daily incremental ({len(params)} date(s))"
     ):
-        sql = """
+        sql = f"""
         INSERT INTO shopify_orders_utm_daily (
             date, utm_source, utm_medium, utm_campaign, utm_content, utm_term,
             total_orders, total_sales, total_discounts, shipping_total, tax_total, net_sales, aov,
@@ -3516,11 +3490,11 @@ def update_shopify_orders_utm_daily_incremental(
                 0 AS number_of_sessions,
                 0 AS number_of_atc_sessions
             FROM shopify_orders
-            WHERE created_at >= %s AND created_at < DATE_ADD(%s, INTERVAL 1 DAY)
+            WHERE created_date IN ({placeholders})
             GROUP BY 1, 2, 3, 4, 5, 6
         ),
         SessionAgg AS (
-            SELECT 
+            SELECT
                 `date`,
                 IF(IFNULL(utm_source, '')='', '(none)', utm_source) AS utm_source,
                 IF(IFNULL(utm_medium, '')='', '(none)', utm_medium) AS utm_medium,
@@ -3535,7 +3509,7 @@ def update_shopify_orders_utm_daily_incremental(
                 SUM(sessions) AS number_of_sessions,
                 SUM(sessions_with_cart_additions) AS number_of_atc_sessions
             FROM product_sessions_snapshot
-            WHERE `date` BETWEEN %s AND %s
+            WHERE `date` IN ({placeholders})
             GROUP BY 1, 2, 3, 4, 5, 6
         ),
         Combined AS (
@@ -3568,7 +3542,7 @@ def update_shopify_orders_utm_daily_incremental(
             number_of_sessions = VALUES(number_of_sessions),
             number_of_atc_sessions = VALUES(number_of_atc_sessions);
         """
-        cursor.execute(sql, (min_date, max_date, min_date, max_date))
+        cursor.execute(sql, params + params)
         connection.commit()
 
 
@@ -3579,8 +3553,6 @@ def push_overall_summary_events_to_qstash(
     brand_index: int,
     brand_name: str,
     brand_key: Optional[str],
-    min_date: str,
-    max_date: str,
 ) -> None:
     """
     Read hour_wise_sales for *today up to the current hour (inclusive)* and publish
@@ -3735,64 +3707,55 @@ def execute_summary_queries_incremental(
     brand_index: int,
     brand_name: str,
     brand_key: Optional[str],
-    min_date: Optional[str],
-    max_date: Optional[str],
+    target_dates: Iterable[str],
 ):
-    """
-    INCREMENTAL summary updates - Only recalculate affected dates.
-    This is the KEY OPTIMIZATION that reduces processing time by 90%+.
+    """Rebuild each summary table for only the dates in target_dates.
 
-    NEW: After updating summaries, publish overall_summary events via QStash for alerts.
+    Each summary function filters its source reads by `date IN (…)` rather
+    than `date BETWEEN min AND max`, so a sparse set (e.g. {today, 2016-04-08})
+    only touches those exact dates — not everything in between.
     """
-    if not min_date or not max_date:
-        logger.info(f"✔️ No date range to update for {brand_name}")
+    dates_set = {d for d in target_dates if d}
+    if not dates_set:
+        logger.info(f"✔️ No dates to update summaries for {brand_name}")
         return
+
+    ordered = sorted(dates_set)
+    range_label = (
+        f"{len(ordered)} date(s): {ordered[0]}..{ordered[-1]}"
+        if len(ordered) > 1
+        else f"1 date: {ordered[0]}"
+    )
 
     try:
         with get_db_cursor(brand_index, dictionary=False) as (cursor, connection):
             cursor.execute("SET SESSION autocommit=1")
-            logger.info(
-                f"📊 Updating summaries for {brand_name}: {min_date} to {max_date}"
-            )
+            logger.info(f"📊 Updating summaries for {brand_name}: {range_label}")
 
             # Ensure all tables exist
             ensure_summary_tables(cursor, connection)
 
             # Update each summary incrementally
-            update_sales_summary_incremental(
-                cursor, connection, brand_name, min_date, max_date
-            )
-            update_order_summary_incremental(
-                cursor, connection, brand_name, min_date, max_date
-            )
-            update_discount_summary_incremental(
-                cursor, connection, brand_name, min_date, max_date
-            )
-            update_gross_summary_incremental(
-                cursor, connection, brand_name, min_date, max_date
-            )
-            update_hour_wise_sales_incremental(
-                cursor, connection, brand_name, min_date, max_date
-            )
+            update_sales_summary_incremental(cursor, connection, brand_name, dates_set)
+            update_order_summary_incremental(cursor, connection, brand_name, dates_set)
+            update_discount_summary_incremental(cursor, connection, brand_name, dates_set)
+            update_gross_summary_incremental(cursor, connection, brand_name, dates_set)
+            update_hour_wise_sales_incremental(cursor, connection, brand_name, dates_set)
             update_overall_summary_incremental(
-                cursor, connection, brand_key, brand_name, min_date, max_date
+                cursor, connection, brand_key, brand_name, dates_set
             )
             update_shopify_orders_utm_daily_incremental(
-                cursor, connection, brand_name, min_date, max_date
+                cursor, connection, brand_name, dates_set
             )
 
             logger.info(
-                f"✅ Incremental summaries updated for {brand_name} ({min_date} to {max_date})"
+                f"✅ Incremental summaries updated for {brand_name} ({range_label})"
             )
 
         # Now that overall_summary is updated, publish events via QStash
         try:
             push_overall_summary_events_to_qstash(
-                brand_index,
-                brand_name,
-                brand_key,
-                min_date,
-                max_date,
+                brand_index, brand_name, brand_key
             )
         except Exception as e:
             logger.error(
@@ -4963,7 +4926,7 @@ def update_sessions_summary(
             # --- SYNC: Ensure hour_wise_sales picks up these latest sessions ---
             today_str = now_ist().date().isoformat()
             update_hour_wise_sales_incremental(
-                cursor, connection, brand_name, today_str, today_str
+                cursor, connection, brand_name, {today_str}
             )
 
     except Exception as e:
@@ -5033,8 +4996,8 @@ def process_single_brand(brand_index: int):
         access_token,
     )
 
-    # Track affected dates across all order processing
-    affected_dates = {"min": None, "max": None}
+    # Track affected dates across all order processing (sparse set, not a range)
+    affected_dates: Set[str] = set()
     new_order_item_pairs: Set[Tuple[int, int]] = set()
 
     # Orders (NEW + UPDATED) with single connection/cursor reused
@@ -5121,14 +5084,14 @@ def process_single_brand(brand_index: int):
             if process["type"] == "NEW" and INVENTORY_PIPELINE_SWITCH:
                 new_order_item_pairs.update(_collect_new_order_item_pairs(filtered))
 
-            # Track affected date range for NEW orders before load
+            # Track affected dates for NEW orders before load
             if process["type"] == "NEW":
-                min_d, max_d = get_affected_date_range_new_orders(filtered)
-                if min_d:
-                    affected_dates["min"] = min(affected_dates["min"] or min_d, min_d)
-                    affected_dates["max"] = max(affected_dates["max"] or max_d, max_d)
+                new_dates = get_affected_dates_new_orders(filtered)
+                if new_dates:
+                    affected_dates.update(new_dates)
                     logger.info(
-                        f"📅 Affected date range for {process['type']}: {min_d} to {max_d}"
+                        f"📅 Affected dates for {process['type']}: "
+                        f"{len(new_dates)} date(s) ({min(new_dates)}..{max(new_dates)})"
                     )
 
             df = transform_orders_to_df_optimized(filtered, app_id_mapping)
@@ -5155,17 +5118,17 @@ def process_single_brand(brand_index: int):
                     connection=connection,
                 )
 
-            # UPDATED orders: build affected range from updated_at + returns_fact deltas.
+            # UPDATED orders: build affected dates from updated_at + returns_fact deltas.
             if process["type"] == "UPDATED":
-                min_d, max_d = get_affected_date_range_updates(
+                upd_dates = get_affected_dates_updates(
                     filtered,
                     extra_event_dates=changed_return_dates,
                 )
-                if min_d:
-                    affected_dates["min"] = min(affected_dates["min"] or min_d, min_d)
-                    affected_dates["max"] = max(affected_dates["max"] or max_d, max_d)
+                if upd_dates:
+                    affected_dates.update(upd_dates)
                     logger.info(
-                        f"📅 Affected date range for {process['type']}: {min_d} to {max_d}"
+                        f"📅 Affected dates for {process['type']}: "
+                        f"{len(upd_dates)} date(s) ({min(upd_dates)}..{max(upd_dates)})"
                     )
                 else:
                     logger.info(
@@ -5186,17 +5149,15 @@ def process_single_brand(brand_index: int):
             connection.commit()
             logger.info(f"✅ Recorded pipeline completion for {brand_name}")
 
-    # Summaries (INCREMENTAL - only affected dates)
-    if affected_dates["min"] and affected_dates["max"]:
+    # Summaries (INCREMENTAL - only affected dates, sparse)
+    if affected_dates:
+        ordered = sorted(affected_dates)
         logger.info(
-            f"\n--- Updating summaries for {brand_name} (INCREMENTAL: {affected_dates['min']} to {affected_dates['max']}) ---"
+            f"\n--- Updating summaries for {brand_name} "
+            f"(INCREMENTAL: {len(ordered)} date(s), {ordered[0]}..{ordered[-1]}) ---"
         )
         execute_summary_queries_incremental(
-            brand_index,
-            brand_name,
-            brand_key,
-            affected_dates["min"],
-            affected_dates["max"],
+            brand_index, brand_name, brand_key, affected_dates
         )
     else:
         logger.info(
@@ -5205,8 +5166,9 @@ def process_single_brand(brand_index: int):
 
     # --- ShopifyQL Summaries (Always updated for 'today' or affected range) ---
     try:
-        u_min = affected_dates["min"] or now_ist().date().isoformat()
-        u_max = affected_dates["max"] or now_ist().date().isoformat()
+        today_iso = now_ist().date().isoformat()
+        u_min = min(affected_dates) if affected_dates else today_iso
+        u_max = max(affected_dates) if affected_dates else today_iso
 
         if (
             is_backfill_active_for(brand_index)
