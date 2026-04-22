@@ -3460,11 +3460,22 @@ def update_overall_summary_incremental(
 def update_shopify_orders_utm_daily_incremental(
     cursor, connection, brand_name: str, target_dates: Iterable[str]
 ):
-    """Update shopify_orders_utm_daily for only the specific affected dates."""
+    """Update shopify_orders_utm_daily for only the specific affected dates.
+
+    Note: the OrderAgg CTE buckets by DATE(created_at) (server tz). To keep
+    that bucketing consistent with the filter, the WHERE uses OR'd per-date
+    created_at ranges rather than created_date — this preserves the original
+    UTC-day semantics exactly and stays index-friendly on created_at.
+    """
     placeholders, params = _dates_in_clause(target_dates)
     if not params:
         logger.debug(f"[{brand_name}] shopify_orders_utm_daily: no dates to rebuild")
         return
+    # Per-date created_at ranges, OR'd together, to match DATE(created_at) bucketing.
+    order_range_clauses = " OR ".join(
+        ["(created_at >= %s AND created_at < DATE_ADD(%s, INTERVAL 1 DAY))"] * len(params)
+    )
+    order_range_params = tuple(p for d in params for p in (d, d))
     with timed(
         f"[{brand_name}] shopify_orders_utm_daily incremental ({len(params)} date(s))"
     ):
@@ -3490,7 +3501,7 @@ def update_shopify_orders_utm_daily_incremental(
                 0 AS number_of_sessions,
                 0 AS number_of_atc_sessions
             FROM shopify_orders
-            WHERE created_date IN ({placeholders})
+            WHERE {order_range_clauses}
             GROUP BY 1, 2, 3, 4, 5, 6
         ),
         SessionAgg AS (
@@ -3542,7 +3553,7 @@ def update_shopify_orders_utm_daily_incremental(
             number_of_sessions = VALUES(number_of_sessions),
             number_of_atc_sessions = VALUES(number_of_atc_sessions);
         """
-        cursor.execute(sql, params + params)
+        cursor.execute(sql, order_range_params + params)
         connection.commit()
 
 
