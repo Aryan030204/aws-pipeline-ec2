@@ -64,7 +64,7 @@ import base64
 import uuid
 # from kafka import KafkaProducer (REMOVED)
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import mysql.connector
@@ -2448,7 +2448,33 @@ def get_affected_date_range_updates(
     if not orders_list and not extra_event_dates:
         return None, None
 
-    dates: Set[str] = set(extra_event_dates or set())
+    # Clamp extra_event_dates (from returns_fact deltas) to the recent window.
+    # Shopify returns full historical refunds on every fetch; an amount
+    # correction on a 2016 refund arrives here with event_date=2016, which
+    # otherwise expands the affected range across years and forces every
+    # summary table to rebuild hundreds of historical dates on each 10-min
+    # tick. Historical corrections are handled by the backfill scripts;
+    # the incremental path should stay incremental.
+    max_days_back = int(os.environ.get("MAX_AFFECTED_DAYS_BACK", "30"))
+    cutoff = now_ist().date() - timedelta(days=max_days_back)
+    dates: Set[str] = set()
+    dropped: Set[str] = set()
+    for d in extra_event_dates or set():
+        try:
+            if date.fromisoformat(d) >= cutoff:
+                dates.add(d)
+            else:
+                dropped.add(d)
+        except Exception:
+            dates.add(d)
+    if dropped:
+        logger.warning(
+            f"⚠️ Dropped {len(dropped)} historical event_date(s) older than "
+            f"{cutoff.isoformat()} from affected range (MAX_AFFECTED_DAYS_BACK="
+            f"{max_days_back}). Oldest dropped: {min(dropped)}. Use backfill "
+            f"scripts to reconcile historical summaries."
+        )
+
     for o in orders_list:
         financial_status = (o.get("financial_status") or "").lower()
         refunds = o.get("refunds") or []
