@@ -131,6 +131,7 @@ active_brand_indices: List[int] = []  # only brands with valid pools/engines
 scheduler = BackgroundScheduler(timezone=IST)
 app = Flask(__name__)
 PIPELINE_AUTH_HEADER = os.environ.get("PIPELINE_AUTH_HEADER", "pipeline@nosecret123")
+SELF_RUN = os.environ.get("SELF_RUN", "true").strip().lower() == "true"
 
 # HTTP Session (requests) with pooling/retries (used for sessions API)
 http_session = requests.Session()
@@ -5386,25 +5387,47 @@ def health_check():
 if __name__ == "__main__":
     initialize_brand_configs()
 
-    # Schedule at fixed 10-minute wall-clock slots (:00, :10, :20, :30, :40, :50)
-    # so runs are predictable and do NOT fire immediately on boot. This gives
-    # operators a stable cadence and a baseline for future collision avoidance.
-    scheduler.add_job(
-        run_data_pipeline,
-        "cron",
-        minute="0,10,20,30,40,50",
-        second=0,
-        coalesce=True,
-        max_instances=1,
-        misfire_grace_time=120,
-        replace_existing=True,
-        id="pipeline_job",
-    )
+    # Conditionally schedule the pipeline
+    if SELF_RUN:
+        # Schedule at fixed 10-minute wall-clock slots (:00, :10, :20, :30, :40, :50)
+        scheduler.add_job(
+            run_data_pipeline,
+            "cron",
+            minute="0,10,20,30,40,50",
+            second=0,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=120,
+            replace_existing=True,
+            id="pipeline_job",
+        )
+    else:
+        # Add the job without a trigger so it ONLY runs via manual trigger
+        scheduler.add_job(
+            run_data_pipeline,
+            trigger=None,
+            next_run_time=None,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=120,
+            replace_existing=True,
+            id="pipeline_job",
+        )
+
     scheduler.start()
 
-    first_run = scheduler.get_jobs()[0].next_run_time
-
     logger.info("✅ Optimized Shopify ETL worker started (WITH MANUAL TRIGGER API)")
+    
+    if SELF_RUN:
+        job = scheduler.get_job("pipeline_job")
+        next_run = job.next_run_time if job else None
+        if next_run:
+            logger.info(f"   - Schedule: Every 10 mins (Next: {next_run.strftime('%Y-%m-%d %I:%M:%S %p %Z')})")
+        else:
+            logger.info("   - Schedule: Every 10 mins")
+    else:
+        logger.info("   - Schedule: MANUAL ONLY (SELF_RUN=false)")
+
     if BACKFILL_MODE:
         msg = "   - Mode: BACKFILL (orders window overridden by BACKFILL_* env)"
         if BACKFILL_BRAND_INDICES:
@@ -5413,10 +5436,6 @@ if __name__ == "__main__":
     else:
         logger.info("   - Mode: Regular incremental")
 
-    logger.info(
-        f"   - First run: {first_run.strftime('%Y-%m-%d %I:%M:%S %p %Z')} (next :00/:10/:20/:30/:40/:50 slot)"
-    )
-    logger.info("   - Schedule: Every 10 minutes on fixed wall-clock slots")
     logger.info(
         f"   - Parallel workers: {min(len(active_brand_indices), max(2, CPU_COUNT // 2))}"
     )
