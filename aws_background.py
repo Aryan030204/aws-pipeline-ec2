@@ -1319,9 +1319,25 @@ def get_db_connection(brand_index: int, attempts: int = 10, sleep_s: float = 0.2
     for _ in range(attempts):
         try:
             cnx = pool.get_connection()
-            break
         except mysql.connector.errors.PoolError as e:
             last_err = e
+            time.sleep(sleep_s)
+            continue
+        # Pool hands out connections without checking liveness. A socket that
+        # went stale while idle (NAT/firewall idle timeout, RDS failover) will
+        # hang on the first cursor.execute — mysql.connector has no socket
+        # read timeout — and the thread parks forever with nothing in
+        # processlist. ping(reconnect=True) bounds that failure mode: it
+        # either revives the connection or raises, so we retry cleanly.
+        try:
+            cnx.ping(reconnect=True, attempts=2, delay=0)
+            break
+        except mysql.connector.Error as e:
+            last_err = e
+            try:
+                cnx.close()
+            except Exception:
+                pass
             time.sleep(sleep_s)
     else:
         raise last_err or mysql.connector.errors.PoolError(
