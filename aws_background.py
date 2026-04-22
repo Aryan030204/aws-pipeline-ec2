@@ -86,6 +86,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import QueuePool
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from flask import Flask, request, jsonify
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import smtplib
@@ -127,6 +128,9 @@ brand_id_from_config: Dict[
 db_connection_pools: Dict[int, pooling.MySQLConnectionPool] = {}
 sqlalchemy_engines: Dict[int, Any] = {}
 active_brand_indices: List[int] = []  # only brands with valid pools/engines
+scheduler = BackgroundScheduler(timezone=IST)
+app = Flask(__name__)
+PIPELINE_AUTH_HEADER = os.environ.get("PIPELINE_AUTH_HEADER", "pipeline@nosecret123")
 
 # HTTP Session (requests) with pooling/retries (used for sessions API)
 http_session = requests.Session()
@@ -5330,12 +5334,58 @@ def run_data_pipeline():
 
 
 # ---------------------------
+# Flask API Endpoints
+# ---------------------------
+@app.route("/trigger", methods=["POST"])
+def manual_trigger():
+    """
+    Manual trigger endpoint to run the pipeline immediately.
+    Expects 'x-pipeline-key' header for authentication.
+    """
+    auth_key = request.headers.get("x-pipeline-key")
+    if not auth_key or auth_key != PIPELINE_AUTH_HEADER:
+        logger.warning(f"🚫 Unauthorized trigger attempt from {request.remote_addr}")
+        return jsonify({"error": "Unauthorized"}), 401
+
+    logger.info("🚀 Manual trigger received via /trigger endpoint")
+
+    # We use the scheduler to trigger the job immediately.
+    # This ensures that APScheduler's concurrency control (max_instances=1) is respected.
+    try:
+        job = scheduler.get_job("pipeline_job")
+        if job:
+            # Trigger the job to run now
+            job.modify(next_run_time=datetime.now(IST))
+            return (
+                jsonify(
+                    {"status": "success", "message": "Pipeline triggered immediately"}
+                ),
+                200,
+            )
+        else:
+            logger.error("❌ Pipeline job 'pipeline_job' not found in scheduler.")
+            return (
+                jsonify(
+                    {"status": "error", "message": "Pipeline job not found in scheduler"}
+                ),
+                500,
+            )
+    except Exception as e:
+        logger.error(f"❌ Error in manual trigger: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({"status": "healthy", "timestamp": datetime.now(IST).isoformat()}), 200
+
+
+# ---------------------------
 # Main
 # ---------------------------
 if __name__ == "__main__":
     initialize_brand_configs()
 
-    scheduler = BackgroundScheduler(timezone=IST)
     # Schedule at fixed 10-minute wall-clock slots (:00, :10, :20, :30, :40, :50)
     # so runs are predictable and do NOT fire immediately on boot. This gives
     # operators a stable cadence and a baseline for future collision avoidance.
@@ -5348,12 +5398,13 @@ if __name__ == "__main__":
         max_instances=1,
         misfire_grace_time=120,
         replace_existing=True,
+        id="pipeline_job",
     )
     scheduler.start()
 
     first_run = scheduler.get_jobs()[0].next_run_time
 
-    logger.info("✅ Optimized Shopify ETL worker started (INCREMENTAL SUMMARIES)")
+    logger.info("✅ Optimized Shopify ETL worker started (WITH MANUAL TRIGGER API)")
     if BACKFILL_MODE:
         msg = "   - Mode: BACKFILL (orders window overridden by BACKFILL_* env)"
         if BACKFILL_BRAND_INDICES:
@@ -5372,10 +5423,12 @@ if __name__ == "__main__":
     logger.info("   - Connection pooling: Enabled (retry on exhaustion)")
     logger.info("   - Async API fetching: Enabled")
     logger.info("   - Summary updates: INCREMENTAL (only affected dates) 🚀")
+    logger.info("   - Manual Trigger API: POST /trigger (port 5000)")
 
     try:
-        while True:
-            time.sleep(60)
+        # Run the Flask app (replaces the sleep loop)
+        # Using 0.0.0.0 to listen on all interfaces
+        app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
     except (KeyboardInterrupt, SystemExit):
         logger.info("Shutting down scheduler...")
         scheduler.shutdown()
