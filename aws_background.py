@@ -62,6 +62,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
 import base64
 import uuid
+import queue
 # from kafka import KafkaProducer (REMOVED)
 
 from datetime import datetime, timedelta
@@ -132,6 +133,11 @@ scheduler = BackgroundScheduler(timezone=IST)
 app = Flask(__name__)
 PIPELINE_AUTH_HEADER = os.environ.get("PIPELINE_AUTH_HEADER", "pipeline@nosecret123")
 SELF_RUN = os.environ.get("SELF_RUN", "true").strip().lower() == "true"
+MANAGER_STARTED_ENDPOINT = os.environ.get("MANAGER_STARTED_ENDPOINT")
+MANAGER_COMPLETED_ENDPOINT = os.environ.get("MANAGER_COMPLETED_ENDPOINT")
+PIPELINE_ID = os.environ.get("PIPELINE_ID", "shopify-pipeline-etl")
+
+MANUAL_TRIGGER_QUEUE = queue.Queue()
 
 # HTTP Session (requests) with pooling/retries (used for sessions API)
 http_session = requests.Session()
@@ -5227,11 +5233,34 @@ def process_single_brand(brand_index: int):
 # Job runner
 # ---------------------------
 def run_data_pipeline():
+    manual_run_id = None
+    try:
+        manual_run_id = MANUAL_TRIGGER_QUEUE.get_nowait()
+    except queue.Empty:
+        pass
+
     job_start_time = now_ist()
     job_id = f"job-{uuid.uuid4().hex[:8]}"
     logger.info(
-        f"\n{'=' * 60}\nJOB TRIGGERED AT: {job_start_time.strftime('%Y-%m-%d %I:%M:%S %p')}\nJOB ID: {job_id}\n{'=' * 60}"
+        f"\n{'=' * 60}\nJOB TRIGGERED AT: {job_start_time.strftime('%Y-%m-%d %I:%M:%S %p')}\nJOB ID: {job_id}\nMANUAL TRIGGER: {bool(manual_run_id)}\n{'=' * 60}"
     )
+
+    if manual_run_id and MANAGER_STARTED_ENDPOINT:
+        try:
+            started_payload = {
+                "runId": manual_run_id,
+                "pipelineId": PIPELINE_ID,
+                "status": "running"
+            }
+            logger.info(f"📤 Sending manual trigger STARTED webhook to {MANAGER_STARTED_ENDPOINT}")
+            http_session.post(
+                MANAGER_STARTED_ENDPOINT,
+                json=started_payload,
+                headers={"x-pipeline-key": PIPELINE_AUTH_HEADER},
+                timeout=10
+            )
+        except Exception as e:
+            logger.error(f"❌ Failed to send STARTED webhook: {e}")
 
     try:
         if not active_brand_indices:
@@ -5331,6 +5360,23 @@ def run_data_pipeline():
     except Exception as e:
         logger.error(f"❌ PIPELINE FAILED with error: {e}")
         traceback.print_exc()
+    finally:
+        if manual_run_id and MANAGER_COMPLETED_ENDPOINT:
+            try:
+                completed_payload = {
+                    "runId": manual_run_id,
+                    "pipelineId": PIPELINE_ID,
+                    "status": "completed"
+                }
+                logger.info(f"📤 Sending manual trigger COMPLETED webhook to {MANAGER_COMPLETED_ENDPOINT}")
+                http_session.post(
+                    MANAGER_COMPLETED_ENDPOINT,
+                    json=completed_payload,
+                    headers={"x-pipeline-key": PIPELINE_AUTH_HEADER},
+                    timeout=10
+                )
+            except Exception as e:
+                logger.error(f"❌ Failed to send COMPLETED webhook: {e}")
 
 
 # ---------------------------
@@ -5353,23 +5399,42 @@ def manual_trigger():
     # This ensures that APScheduler's concurrency control (max_instances=1) is respected.
     try:
         job = scheduler.get_job("pipeline_job")
-        if job:
-            # Trigger the job to run now
-            job.modify(next_run_time=datetime.now(IST))
-            return (
-                jsonify(
-                    {"status": "success", "message": "Pipeline triggered immediately"}
-                ),
-                200,
-            )
-        else:
-            logger.error("❌ Pipeline job 'pipeline_job' not found in scheduler.")
-            return (
-                jsonify(
-                    {"status": "error", "message": "Pipeline job not found in scheduler"}
-                ),
-                500,
-            )
+        if not job:
+            logger.info("Pipeline job not found in scheduler (likely finished previous manual run). Re-adding job.")
+            if SELF_RUN:
+                job = scheduler.add_job(
+                    run_data_pipeline,
+                    "cron",
+                    minute="0,10,20,30,40,50",
+                    second=0,
+                    coalesce=True,
+                    max_instances=1,
+                    misfire_grace_time=120,
+                    replace_existing=True,
+                    id="pipeline_job",
+                )
+            else:
+                job = scheduler.add_job(
+                    run_data_pipeline,
+                    trigger=None,
+                    next_run_time=None,
+                    coalesce=True,
+                    max_instances=1,
+                    misfire_grace_time=120,
+                    replace_existing=True,
+                    id="pipeline_job",
+                )
+
+        run_id = str(uuid.uuid4())
+        MANUAL_TRIGGER_QUEUE.put(run_id)
+        # Trigger the job to run now
+        job.modify(next_run_time=datetime.now(IST))
+        return (
+            jsonify(
+                {"status": "success", "message": "Pipeline triggered immediately", "runId": run_id}
+            ),
+            200,
+        )
     except Exception as e:
         logger.error(f"❌ Error in manual trigger: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
