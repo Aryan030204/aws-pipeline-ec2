@@ -265,7 +265,8 @@ def backfill_brand(brand_id: str, brand_name: str) -> None:
     db_port = int(config.get("port", 3306))
 
     shop_name = config.get("shop_name")
-    access_token = config.get("access_token")
+    access_token_raw = config.get("access_token")
+    access_token = access_token_raw if TEST_MODE else decrypt_value(access_token_raw)
     api_version = config.get("api_version", "2024-04")
 
     if not all([db_host, db_user, db_pass, db_name]):
