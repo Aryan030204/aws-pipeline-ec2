@@ -54,6 +54,7 @@ import os
 import json
 import time
 import logging
+from collections import deque
 import traceback
 from typing import Dict, Iterable, List, Optional, Tuple, Any, Set
 from functools import lru_cache
@@ -110,6 +111,66 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+class _LastLogsHandler(logging.Handler):
+    def __init__(self, maxlen: int = 2) -> None:
+        super().__init__()
+        self._buffer = deque(maxlen=maxlen)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            self._buffer.append(msg)
+        except Exception:
+            # Avoid breaking logging on handler errors.
+            pass
+
+    def get_recent(self) -> List[str]:
+        return list(self._buffer)
+
+
+_last_logs_handler = _LastLogsHandler(maxlen=2)
+_last_logs_handler.setLevel(logging.INFO)
+_last_logs_handler.setFormatter(
+    logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+)
+logging.getLogger().addHandler(_last_logs_handler)
+
+
+def _derive_error_code(exc: Optional[BaseException]) -> str:
+    if exc is None:
+        return "PIPELINE_FAILED"
+
+    if isinstance(exc, (mysql.connector.Error, SQLAlchemyError)):
+        return "DB_ERROR"
+
+    if isinstance(
+        exc,
+        (
+            requests.exceptions.Timeout,
+            asyncio.TimeoutError,
+            TimeoutError,
+        ),
+    ):
+        return "TIMEOUT"
+
+    if isinstance(exc, (requests.exceptions.RequestException, aiohttp.ClientError)):
+        return "HTTP_ERROR"
+
+    if isinstance(exc, KeyError):
+        return "MISSING_ENV"
+
+    if isinstance(exc, (ValueError, TypeError)):
+        return "VALIDATION_ERROR"
+
+    if isinstance(exc, (FileNotFoundError, PermissionError, OSError)):
+        return "IO_ERROR"
+
+    return exc.__class__.__name__.upper()
+
 # ---- Globals ----
 IST = ZoneInfo("Asia/Kolkata")
 CPU_COUNT = multiprocessing.cpu_count()
@@ -135,6 +196,7 @@ PIPELINE_AUTH_HEADER = os.environ.get("PIPELINE_AUTH_HEADER", "pipeline@nosecret
 SELF_RUN = os.environ.get("SELF_RUN", "true").strip().lower() == "true"
 MANAGER_STARTED_ENDPOINT = os.environ.get("MANAGER_STARTED_ENDPOINT")
 MANAGER_COMPLETED_ENDPOINT = os.environ.get("MANAGER_COMPLETED_ENDPOINT")
+MANAGER_FAILED_ENDPOINT = os.environ.get("MANAGER_FAILED_ENDPOINT")
 PIPELINE_ID = os.environ.get("PIPELINE_ID", "shopify-pipeline-etl")
 
 MANUAL_TRIGGER_QUEUE = queue.Queue()
@@ -1430,6 +1492,10 @@ async def fetch_orders_async(
         "line_items/properties/name,line_items/properties/value,"
         "customer,customer/id,customer/email,customer/first_name,"
         "customer/last_name,customer/phone,customer/tags,"
+        "shipping_address,shipping_address/address1,shipping_address/phone,"
+        "shipping_address/city,shipping_address/zip,shipping_address/province,"
+        "billing_address,billing_address/address1,billing_address/phone,"
+        "billing_address/city,billing_address/zip,billing_address/province,"
         "note_attributes,note_attributes/name,note_attributes/value"
     )
 
@@ -5234,6 +5300,8 @@ def process_single_brand(brand_index: int):
 # ---------------------------
 def run_data_pipeline():
     manual_run_id = None
+    succeeded = False
+    failure_exception: Optional[Exception] = None
     try:
         manual_run_id = MANUAL_TRIGGER_QUEUE.get_nowait()
     except queue.Empty:
@@ -5357,11 +5425,14 @@ def run_data_pipeline():
         # --- NEW: UTM Pipeline API Trigger ---
         trigger_utm_pipeline("ETL_COMPLETED", job_id)
 
+        succeeded = True
+
     except Exception as e:
         logger.error(f"❌ PIPELINE FAILED with error: {e}")
         traceback.print_exc()
+        failure_exception = e
     finally:
-        if manual_run_id and MANAGER_COMPLETED_ENDPOINT:
+        if manual_run_id and succeeded and MANAGER_COMPLETED_ENDPOINT:
             try:
                 completed_payload = {
                     "runId": manual_run_id,
@@ -5377,6 +5448,27 @@ def run_data_pipeline():
                 )
             except Exception as e:
                 logger.error(f"❌ Failed to send COMPLETED webhook: {e}")
+
+        if manual_run_id and (not succeeded) and MANAGER_FAILED_ENDPOINT:
+            try:
+                recent_logs = _last_logs_handler.get_recent()
+                error_body = "\n".join(recent_logs) if recent_logs else "No logs captured."
+                error_code = _derive_error_code(failure_exception)
+                failed_payload = {
+                    "runId": manual_run_id,
+                    "pipelineId": PIPELINE_ID,
+                    "errorCode": error_code,
+                    "errorBody": error_body,
+                }
+                logger.info(f"📤 Sending manual trigger FAILED webhook to {MANAGER_FAILED_ENDPOINT}")
+                http_session.post(
+                    MANAGER_FAILED_ENDPOINT,
+                    json=failed_payload,
+                    headers={"x-pipeline-key": PIPELINE_AUTH_HEADER},
+                    timeout=10,
+                )
+            except Exception as e:
+                logger.error(f"❌ Failed to send FAILED webhook: {e}")
 
 
 # ---------------------------
