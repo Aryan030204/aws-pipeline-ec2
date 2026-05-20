@@ -524,6 +524,48 @@ def is_backfill_active_for(brand_idx: int) -> bool:
     return brand_idx in BACKFILL_BRAND_INDICES
 
 
+DISCOUNT_DASHBOARD_BACKFILL = (
+    os.environ.get("DISCOUNT_DASHBOARD_BACKFILL", "false").strip().lower() == "true"
+)
+DISCOUNT_BACKFILL_START_DATE = os.environ.get("DISCOUNT_BACKFILL_START_DATE", "").strip()
+DISCOUNT_BACKFILL_END_DATE = os.environ.get("DISCOUNT_BACKFILL_END_DATE", "").strip()
+
+
+def _parse_backfill_date(val: str) -> Optional[str]:
+    if not val:
+        return None
+    try:
+        return datetime.strptime(val, "%Y-%m-%d").date().isoformat()
+    except Exception:
+        logger.warning(f"DISCOUNT_BACKFILL_* value '{val}' not parseable; ignoring.")
+        return None
+
+
+DISCOUNT_BACKFILL_START_DATE_PARSED = _parse_backfill_date(
+    DISCOUNT_BACKFILL_START_DATE
+)
+DISCOUNT_BACKFILL_END_DATE_PARSED = _parse_backfill_date(DISCOUNT_BACKFILL_END_DATE)
+
+if DISCOUNT_DASHBOARD_BACKFILL:
+    if (
+        DISCOUNT_BACKFILL_START_DATE_PARSED
+        and DISCOUNT_BACKFILL_END_DATE_PARSED
+        and DISCOUNT_BACKFILL_START_DATE_PARSED > DISCOUNT_BACKFILL_END_DATE_PARSED
+    ):
+        logger.warning(
+            "DISCOUNT_BACKFILL_START_DATE > DISCOUNT_BACKFILL_END_DATE. Disabling discount dashboard backfill."
+        )
+        DISCOUNT_DASHBOARD_BACKFILL = False
+    else:
+        date_label = "all dates"
+        if DISCOUNT_BACKFILL_START_DATE_PARSED or DISCOUNT_BACKFILL_END_DATE_PARSED:
+            date_label = (
+                f"{DISCOUNT_BACKFILL_START_DATE_PARSED or 'beginning'}"
+                f" to {DISCOUNT_BACKFILL_END_DATE_PARSED or 'today'}"
+            )
+        logger.info(f"🔁 DISCOUNT_DASHBOARD_BACKFILL ON :: {date_label}")
+
+
 # ---------------------------
 # Utilities: time/profiling
 # ---------------------------
@@ -1808,6 +1850,269 @@ def upsert_returns_fact_from_orders(
                 pass
 
 
+# ---------------------------
+# Discount dashboard fact helpers
+# ---------------------------
+def _classify_payment_mode(payment_gateway_names: Optional[str]) -> str:
+    pg = payment_gateway_names or ""
+    if "Gokwik PPCOD" in pg:
+        return "partially_paid"
+    if (
+        not pg
+        or "Cash on Delivery (COD)" in pg
+        or "cash_on_delivery" in pg
+    ):
+        return "cod"
+    return "prepaid"
+
+
+def _parse_iso_to_ist_date_hour(
+    iso_ts: Optional[str],
+) -> Tuple[Optional[str], Optional[int]]:
+    if not iso_ts:
+        return None, None
+    try:
+        dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00")).astimezone(IST)
+        return dt.date().isoformat(), dt.hour
+    except Exception:
+        return None, None
+
+
+def _normalize_discount_code_rows_from_orders(
+    orders_list: List[Dict],
+) -> List[Tuple[Any, ...]]:
+    rows: List[Tuple[Any, ...]] = []
+    seen: Set[Tuple[str, str]] = set()
+
+    for order in orders_list or []:
+        order_id = str(order.get("id")) if order.get("id") else None
+        if not order_id:
+            continue
+
+        created_date, created_hour = _parse_iso_to_ist_date_hour(order.get("created_at"))
+        if not created_date or created_hour is None:
+            continue
+
+        discount_codes = order.get("discount_codes") or []
+        if not discount_codes:
+            continue
+
+        payment_gateway_names = (
+            ", ".join(order.get("payment_gateway_names") or []) or None
+        )
+        payment_mode = _classify_payment_mode(payment_gateway_names)
+
+        try:
+            total_price = float(order.get("total_price") or 0)
+        except Exception:
+            total_price = 0.0
+
+        for discount in discount_codes:
+            if not discount:
+                continue
+            code = (discount.get("code") or "").strip()
+            if not code:
+                continue
+
+            key = (order_id, code)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            try:
+                discount_amount = float(discount.get("amount") or 0)
+            except Exception:
+                discount_amount = 0.0
+
+            rows.append(
+                (
+                    order_id,
+                    order.get("name"),
+                    format_datetime(order.get("created_at")),
+                    created_date,
+                    created_hour,
+                    code,
+                    discount_amount,
+                    payment_gateway_names,
+                    payment_mode,
+                    total_price,
+                )
+            )
+
+    return rows
+
+
+def upsert_dashboard_order_discount_fact_from_orders(
+    orders_list: List[Dict], cursor, connection, brand_name: str
+) -> Set[str]:
+    rows = _normalize_discount_code_rows_from_orders(orders_list)
+    if not rows:
+        logger.info(f"✔️ [{brand_name}] No discount-code orders to upsert")
+        return set()
+
+    sql = """
+        INSERT INTO dashboard_order_discount_fact (
+            order_id, order_name, created_at, created_date, created_hour,
+            discount_code, discount_amount, payment_gateway_names, payment_mode,
+            total_price
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            order_name = VALUES(order_name),
+            created_at = VALUES(created_at),
+            created_date = VALUES(created_date),
+            created_hour = VALUES(created_hour),
+            discount_amount = VALUES(discount_amount),
+            payment_gateway_names = VALUES(payment_gateway_names),
+            payment_mode = VALUES(payment_mode),
+            total_price = VALUES(total_price)
+    """
+    cursor.executemany(sql, rows)
+    connection.commit()
+
+    affected_dates = {str(row[3]) for row in rows if row[3]}
+    logger.info(
+        f"✅ [{brand_name}] Upserted {len(rows)} discount fact rows "
+        f"for {len(affected_dates)} date(s)"
+    )
+    return affected_dates
+
+
+def backfill_dashboard_order_discount_fact_from_shopify_orders(
+    cursor, connection, brand_name: str, batch_size: int = 5000
+) -> Set[str]:
+    where_clauses = ["discount_codes IS NOT NULL", "discount_codes != ''"]
+    params: List[Any] = []
+
+    if DISCOUNT_BACKFILL_START_DATE_PARSED:
+        where_clauses.append("created_date >= %s")
+        params.append(DISCOUNT_BACKFILL_START_DATE_PARSED)
+    if DISCOUNT_BACKFILL_END_DATE_PARSED:
+        where_clauses.append("created_date <= %s")
+        params.append(DISCOUNT_BACKFILL_END_DATE_PARSED)
+
+    sql = f"""
+        SELECT
+            order_id,
+            order_name,
+            created_at,
+            created_date,
+            created_time,
+            discount_codes,
+            discount_amount,
+            payment_gateway_names,
+            total_price
+        FROM shopify_orders
+        WHERE {' AND '.join(where_clauses)}
+        ORDER BY created_date, order_id
+        LIMIT %s OFFSET %s
+    """
+
+    affected_dates: Set[str] = set()
+    total_rows = 0
+    offset = 0
+
+    while True:
+        cursor.execute(sql, tuple(params + [batch_size, offset]))
+        source_rows = cursor.fetchall()
+        if not source_rows:
+            break
+        offset += len(source_rows)
+
+        upsert_rows: List[Tuple[Any, ...]] = []
+        seen: Set[Tuple[str, str]] = set()
+        for row in source_rows:
+            order_id = str(row.get("order_id") or "")
+            if not order_id:
+                continue
+
+            created_date = row.get("created_date")
+            if created_date is not None:
+                created_date = str(created_date)
+
+            created_time = str(row.get("created_time") or "")
+            try:
+                created_hour = int(created_time.split(":")[0])
+            except Exception:
+                created_hour = None
+
+            if not created_date or created_hour is None:
+                continue
+
+            discount_codes = [
+                c.strip()
+                for c in str(row.get("discount_codes") or "").split(",")
+                if c and c.strip()
+            ]
+            if not discount_codes:
+                continue
+
+            payment_gateway_names = row.get("payment_gateway_names")
+            payment_mode = _classify_payment_mode(payment_gateway_names)
+
+            try:
+                total_price = float(row.get("total_price") or 0)
+            except Exception:
+                total_price = 0.0
+            # Historical shopify_orders rows only have order-level discount_amount,
+            # not per-code amounts after splitting comma-separated codes.
+            discount_amount = 0.0
+
+            for code in discount_codes:
+                key = (order_id, code)
+                if key in seen:
+                    continue
+                seen.add(key)
+                upsert_rows.append(
+                    (
+                        order_id,
+                        row.get("order_name"),
+                        row.get("created_at"),
+                        created_date,
+                        created_hour,
+                        code,
+                        discount_amount,
+                        payment_gateway_names,
+                        payment_mode,
+                        total_price,
+                    )
+                )
+
+        if not upsert_rows:
+            continue
+
+        cursor.executemany(
+            """
+            INSERT INTO dashboard_order_discount_fact (
+                order_id, order_name, created_at, created_date, created_hour,
+                discount_code, discount_amount, payment_gateway_names, payment_mode,
+                total_price
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                order_name = VALUES(order_name),
+                created_at = VALUES(created_at),
+                created_date = VALUES(created_date),
+                created_hour = VALUES(created_hour),
+                discount_amount = VALUES(discount_amount),
+                payment_gateway_names = VALUES(payment_gateway_names),
+                payment_mode = VALUES(payment_mode),
+                total_price = VALUES(total_price)
+            """,
+            upsert_rows,
+        )
+        connection.commit()
+
+        total_rows += len(upsert_rows)
+        affected_dates.update(str(row[3]) for row in upsert_rows if row[3])
+
+    logger.info(
+        f"✅ [{brand_name}] Discount dashboard backfill upserted {total_rows} fact rows "
+        f"for {len(affected_dates)} date(s)"
+    )
+    return affected_dates
+
+
 def _ensure_products_sold_units_daily(cursor, connection):
     cursor.execute(
         """
@@ -2636,6 +2941,83 @@ def ensure_summary_tables(cursor, connection):
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dashboard_order_discount_fact (
+                order_id VARCHAR(50) NOT NULL,
+                order_name VARCHAR(50),
+                created_at DATETIME,
+                created_date DATE NOT NULL,
+                created_hour TINYINT UNSIGNED NOT NULL,
+                discount_code VARCHAR(255) NOT NULL,
+                discount_amount DECIMAL(12,2) DEFAULT 0,
+                payment_gateway_names TEXT,
+                payment_mode ENUM('prepaid', 'cod', 'partially_paid') NOT NULL,
+                total_price DECIMAL(12,2) NOT NULL DEFAULT 0,
+                PRIMARY KEY (order_id, discount_code),
+                KEY idx_discount_date (discount_code, created_date),
+                KEY idx_date_discount (created_date, discount_code),
+                KEY idx_discount_hour (discount_code, created_date, created_hour),
+                KEY idx_payment_discount_date (payment_mode, discount_code, created_date)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dashboard_discount_daily (
+                date DATE NOT NULL,
+                discount_code VARCHAR(255) NOT NULL,
+                total_orders INT NOT NULL DEFAULT 0,
+                gross_revenue DECIMAL(12,2) NOT NULL DEFAULT 0,
+                aov DECIMAL(12,2) NOT NULL DEFAULT 0,
+                PRIMARY KEY (date, discount_code),
+                KEY idx_discount_date (discount_code, date),
+                KEY idx_date (date)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dashboard_discount_hourly (
+                date DATE NOT NULL,
+                hour TINYINT UNSIGNED NOT NULL,
+                discount_code VARCHAR(255) NOT NULL,
+                total_orders INT NOT NULL DEFAULT 0,
+                gross_revenue DECIMAL(12,2) NOT NULL DEFAULT 0,
+                aov DECIMAL(12,2) NOT NULL DEFAULT 0,
+                PRIMARY KEY (date, hour, discount_code),
+                KEY idx_discount_date_hour (discount_code, date, hour),
+                KEY idx_date_hour (date, hour)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dashboard_discount_payment_daily (
+                date DATE NOT NULL,
+                discount_code VARCHAR(255) NOT NULL,
+                payment_mode ENUM('prepaid', 'cod', 'partially_paid') NOT NULL,
+                total_orders INT NOT NULL DEFAULT 0,
+                gross_revenue DECIMAL(12,2) NOT NULL DEFAULT 0,
+                PRIMARY KEY (date, discount_code, payment_mode),
+                KEY idx_discount_date (discount_code, date),
+                KEY idx_payment_discount_date (payment_mode, discount_code, date),
+                KEY idx_date_payment (date, payment_mode)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dashboard_discount_payment_hourly (
+                date DATE NOT NULL,
+                hour TINYINT UNSIGNED NOT NULL,
+                discount_code VARCHAR(255) NOT NULL,
+                payment_mode ENUM('prepaid', 'cod', 'partially_paid') NOT NULL,
+                total_orders INT NOT NULL DEFAULT 0,
+                gross_revenue DECIMAL(12,2) NOT NULL DEFAULT 0,
+                aov DECIMAL(12,2) NOT NULL DEFAULT 0,
+                PRIMARY KEY (date, hour, discount_code, payment_mode),
+                KEY idx_discount_date_hour (discount_code, date, hour),
+                KEY idx_payment_discount_date_hour (payment_mode, discount_code, date, hour),
+                KEY idx_date_hour_payment (date, hour, payment_mode)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+
         # Ensure adjusted_total_sessions exists even if table was created earlier
         try:
             cursor.execute("""
@@ -3160,6 +3542,197 @@ def update_hour_wise_sales_incremental(
         )
 
 
+def update_dashboard_discount_daily_incremental(
+    cursor, connection, brand_name: str, target_dates: Iterable[str]
+):
+    """Update dashboard_discount_daily for only the specific affected dates."""
+    placeholders, params = _dates_in_clause(target_dates)
+    if not params:
+        logger.debug(f"[{brand_name}] dashboard_discount_daily: no dates to rebuild")
+        return
+
+    with timed(
+        f"[{brand_name}] dashboard_discount_daily incremental ({len(params)} date(s))"
+    ):
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS dashboard_discount_daily_stage LIKE dashboard_discount_daily"
+        )
+        cursor.execute("TRUNCATE TABLE dashboard_discount_daily_stage")
+
+        sql = f"""
+        INSERT INTO dashboard_discount_daily_stage (
+            date, discount_code, total_orders, gross_revenue, aov
+        )
+        SELECT
+            created_date AS date,
+            discount_code,
+            COUNT(DISTINCT order_id) AS total_orders,
+            SUM(COALESCE(total_price, 0)) AS gross_revenue,
+            CASE
+                WHEN COUNT(DISTINCT order_id) > 0
+                THEN SUM(COALESCE(total_price, 0)) / COUNT(DISTINCT order_id)
+                ELSE 0
+            END AS aov
+        FROM dashboard_order_discount_fact
+        WHERE created_date IN ({placeholders})
+        GROUP BY created_date, discount_code
+        """
+        cursor.execute(sql, params)
+        connection.commit()
+
+        merge_staging_to_main_by_date(
+            cursor,
+            connection,
+            "dashboard_discount_daily",
+            "dashboard_discount_daily_stage",
+            brand_name,
+        )
+
+
+def update_dashboard_discount_hourly_incremental(
+    cursor, connection, brand_name: str, target_dates: Iterable[str]
+):
+    """Update dashboard_discount_hourly for only the specific affected dates."""
+    placeholders, params = _dates_in_clause(target_dates)
+    if not params:
+        logger.debug(f"[{brand_name}] dashboard_discount_hourly: no dates to rebuild")
+        return
+
+    with timed(
+        f"[{brand_name}] dashboard_discount_hourly incremental ({len(params)} date(s))"
+    ):
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS dashboard_discount_hourly_stage LIKE dashboard_discount_hourly"
+        )
+        cursor.execute("TRUNCATE TABLE dashboard_discount_hourly_stage")
+
+        sql = f"""
+        INSERT INTO dashboard_discount_hourly_stage (
+            date, hour, discount_code, total_orders, gross_revenue, aov
+        )
+        SELECT
+            created_date AS date,
+            created_hour AS hour,
+            discount_code,
+            COUNT(DISTINCT order_id) AS total_orders,
+            SUM(COALESCE(total_price, 0)) AS gross_revenue,
+            CASE
+                WHEN COUNT(DISTINCT order_id) > 0
+                THEN SUM(COALESCE(total_price, 0)) / COUNT(DISTINCT order_id)
+                ELSE 0
+            END AS aov
+        FROM dashboard_order_discount_fact
+        WHERE created_date IN ({placeholders})
+        GROUP BY created_date, created_hour, discount_code
+        """
+        cursor.execute(sql, params)
+        connection.commit()
+
+        merge_staging_to_main_by_date(
+            cursor,
+            connection,
+            "dashboard_discount_hourly",
+            "dashboard_discount_hourly_stage",
+            brand_name,
+        )
+
+
+def update_dashboard_discount_payment_daily_incremental(
+    cursor, connection, brand_name: str, target_dates: Iterable[str]
+):
+    """Update dashboard_discount_payment_daily for only the specific affected dates."""
+    placeholders, params = _dates_in_clause(target_dates)
+    if not params:
+        logger.debug(
+            f"[{brand_name}] dashboard_discount_payment_daily: no dates to rebuild"
+        )
+        return
+
+    with timed(
+        f"[{brand_name}] dashboard_discount_payment_daily incremental ({len(params)} date(s))"
+    ):
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS dashboard_discount_payment_daily_stage LIKE dashboard_discount_payment_daily"
+        )
+        cursor.execute("TRUNCATE TABLE dashboard_discount_payment_daily_stage")
+
+        sql = f"""
+        INSERT INTO dashboard_discount_payment_daily_stage (
+            date, discount_code, payment_mode, total_orders, gross_revenue
+        )
+        SELECT
+            created_date AS date,
+            discount_code,
+            payment_mode,
+            COUNT(DISTINCT order_id) AS total_orders,
+            SUM(COALESCE(total_price, 0)) AS gross_revenue
+        FROM dashboard_order_discount_fact
+        WHERE created_date IN ({placeholders})
+        GROUP BY created_date, discount_code, payment_mode
+        """
+        cursor.execute(sql, params)
+        connection.commit()
+
+        merge_staging_to_main_by_date(
+            cursor,
+            connection,
+            "dashboard_discount_payment_daily",
+            "dashboard_discount_payment_daily_stage",
+            brand_name,
+        )
+
+
+def update_dashboard_discount_payment_hourly_incremental(
+    cursor, connection, brand_name: str, target_dates: Iterable[str]
+):
+    """Update dashboard_discount_payment_hourly for only the specific affected dates."""
+    placeholders, params = _dates_in_clause(target_dates)
+    if not params:
+        logger.debug(
+            f"[{brand_name}] dashboard_discount_payment_hourly: no dates to rebuild"
+        )
+        return
+
+    with timed(
+        f"[{brand_name}] dashboard_discount_payment_hourly incremental ({len(params)} date(s))"
+    ):
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS dashboard_discount_payment_hourly_stage LIKE dashboard_discount_payment_hourly"
+        )
+        cursor.execute("TRUNCATE TABLE dashboard_discount_payment_hourly_stage")
+
+        sql = f"""
+        INSERT INTO dashboard_discount_payment_hourly_stage (
+            date, hour, discount_code, payment_mode, total_orders, gross_revenue, aov
+        )
+        SELECT
+            created_date AS date,
+            created_hour AS hour,
+            discount_code,
+            payment_mode,
+            COUNT(DISTINCT order_id) AS total_orders,
+            SUM(COALESCE(total_price, 0)) AS gross_revenue,
+            CASE
+                WHEN COUNT(DISTINCT order_id) > 0
+                THEN SUM(COALESCE(total_price, 0)) / COUNT(DISTINCT order_id)
+                ELSE 0
+            END AS aov
+        FROM dashboard_order_discount_fact
+        WHERE created_date IN ({placeholders})
+        GROUP BY created_date, created_hour, discount_code, payment_mode
+        """
+        cursor.execute(sql, params)
+        connection.commit()
+
+        merge_staging_to_main_by_date(
+            cursor,
+            connection,
+            "dashboard_discount_payment_hourly",
+            "dashboard_discount_payment_hourly_stage",
+            brand_name,
+        )
+
+
 def update_overall_summary_incremental(
     cursor,
     connection,
@@ -3530,6 +4103,18 @@ def execute_summary_queries_incremental(
             update_discount_summary_incremental(cursor, connection, brand_name, dates_set)
             update_gross_summary_incremental(cursor, connection, brand_name, dates_set)
             update_hour_wise_sales_incremental(cursor, connection, brand_name, dates_set)
+            update_dashboard_discount_daily_incremental(
+                cursor, connection, brand_name, dates_set
+            )
+            update_dashboard_discount_hourly_incremental(
+                cursor, connection, brand_name, dates_set
+            )
+            update_dashboard_discount_payment_daily_incremental(
+                cursor, connection, brand_name, dates_set
+            )
+            update_dashboard_discount_payment_hourly_incremental(
+                cursor, connection, brand_name, dates_set
+            )
             update_overall_summary_incremental(
                 cursor, connection, brand_key, brand_name, dates_set
             )
@@ -4795,6 +5380,8 @@ def process_single_brand(brand_index: int):
     ]
 
     with get_db_cursor(brand_index) as (cursor, connection):
+        ensure_summary_tables(cursor, connection)
+
         for process in process_types:
             logger.info(
                 f"\n--- Processing {process['type']} orders for {brand_name} ---"
@@ -4883,6 +5470,13 @@ def process_single_brand(brand_index: int):
                 df, brand_index, brand_name, process["table"], batch_size
             )
 
+            if process["type"] == "NEW":
+                discount_fact_dates = upsert_dashboard_order_discount_fact_from_orders(
+                    filtered, cursor, connection, brand_name
+                )
+                if discount_fact_dates:
+                    affected_dates.update(discount_fact_dates)
+
             # Upsert returns_fact from the same filtered snapshots
             changed_return_dates = upsert_returns_fact_from_orders(
                 brand_index, filtered, cursor=cursor, connection=connection
@@ -4915,6 +5509,21 @@ def process_single_brand(brand_index: int):
                     logger.info(
                         "✔️ UPDATED orders produced no new/changed affected dates"
                     )
+
+        if DISCOUNT_DASHBOARD_BACKFILL:
+            logger.info(f"🔁 Starting discount dashboard backfill for {brand_name}")
+            discount_backfill_dates = (
+                backfill_dashboard_order_discount_fact_from_shopify_orders(
+                    cursor, connection, brand_name
+                )
+            )
+            if discount_backfill_dates:
+                affected_dates.update(discount_backfill_dates)
+                logger.info(
+                    f"📅 Discount dashboard backfill affected "
+                    f"{len(discount_backfill_dates)} date(s) "
+                    f"({min(discount_backfill_dates)}..{max(discount_backfill_dates)})"
+                )
 
     # Record completion
     with timed("Record pipeline completion timestamp"):
@@ -5258,6 +5867,15 @@ if __name__ == "__main__":
         logger.info(msg)
     else:
         logger.info("   - Mode: Regular incremental")
+
+    if DISCOUNT_DASHBOARD_BACKFILL:
+        date_label = "all dates"
+        if DISCOUNT_BACKFILL_START_DATE_PARSED or DISCOUNT_BACKFILL_END_DATE_PARSED:
+            date_label = (
+                f"{DISCOUNT_BACKFILL_START_DATE_PARSED or 'beginning'}"
+                f" to {DISCOUNT_BACKFILL_END_DATE_PARSED or 'today'}"
+            )
+        logger.info(f"   - Discount dashboard backfill: ENABLED ({date_label})")
 
     logger.info(
         f"   - Parallel workers: {min(len(active_brand_indices), max(2, CPU_COUNT // 2))}"
