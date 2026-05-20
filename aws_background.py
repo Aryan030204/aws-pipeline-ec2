@@ -527,6 +527,9 @@ def is_backfill_active_for(brand_idx: int) -> bool:
 DISCOUNT_DASHBOARD_BACKFILL = (
     os.environ.get("DISCOUNT_DASHBOARD_BACKFILL", "false").strip().lower() == "true"
 )
+DISCOUNT_DASHBOARD_ONLY_MODE = (
+    os.environ.get("DISCOUNT_DASHBOARD_ONLY_MODE", "false").strip().lower() == "true"
+)
 DISCOUNT_BACKFILL_START_DATE = os.environ.get("DISCOUNT_BACKFILL_START_DATE", "").strip()
 DISCOUNT_BACKFILL_END_DATE = os.environ.get("DISCOUNT_BACKFILL_END_DATE", "").strip()
 
@@ -564,6 +567,12 @@ if DISCOUNT_DASHBOARD_BACKFILL:
                 f" to {DISCOUNT_BACKFILL_END_DATE_PARSED or 'today'}"
             )
         logger.info(f"🔁 DISCOUNT_DASHBOARD_BACKFILL ON :: {date_label}")
+
+if DISCOUNT_DASHBOARD_ONLY_MODE and not DISCOUNT_DASHBOARD_BACKFILL:
+    logger.warning(
+        "DISCOUNT_DASHBOARD_ONLY_MODE requires DISCOUNT_DASHBOARD_BACKFILL=true. Disabling discount-only mode."
+    )
+    DISCOUNT_DASHBOARD_ONLY_MODE = False
 
 
 # ---------------------------
@@ -4141,6 +4150,52 @@ def execute_summary_queries_incremental(
         traceback.print_exc()
 
 
+def execute_discount_dashboard_backfill_only(brand_index: int, brand_name: str):
+    """Backfill only discount dashboard fact and aggregates from shopify_orders."""
+    if not DISCOUNT_DASHBOARD_BACKFILL:
+        logger.info(
+            f"✔️ Discount dashboard backfill disabled for {brand_name}; nothing to do"
+        )
+        return
+
+    logger.info(f"🔁 Starting DISCOUNT-ONLY dashboard backfill for {brand_name}")
+    try:
+        with get_db_cursor(brand_index, dictionary=True) as (cursor, connection):
+            ensure_summary_tables(cursor, connection)
+            affected_dates = backfill_dashboard_order_discount_fact_from_shopify_orders(
+                cursor, connection, brand_name
+            )
+
+            if not affected_dates:
+                logger.info(
+                    f"✔️ Discount-only backfill found no discount rows for {brand_name}"
+                )
+                return
+
+            ordered = sorted(affected_dates)
+            logger.info(
+                f"📊 Rebuilding discount dashboard aggregates for {brand_name}: "
+                f"{len(ordered)} date(s), {ordered[0]}..{ordered[-1]}"
+            )
+            update_dashboard_discount_daily_incremental(
+                cursor, connection, brand_name, affected_dates
+            )
+            update_dashboard_discount_hourly_incremental(
+                cursor, connection, brand_name, affected_dates
+            )
+            update_dashboard_discount_payment_daily_incremental(
+                cursor, connection, brand_name, affected_dates
+            )
+            update_dashboard_discount_payment_hourly_incremental(
+                cursor, connection, brand_name, affected_dates
+            )
+
+        logger.info(f"✅ Discount-only dashboard backfill complete for {brand_name}")
+    except Exception as e:
+        logger.error(f"❌ Discount-only dashboard backfill failed for {brand_name}: {e}")
+        traceback.print_exc()
+
+
 # ---------------------------
 # Email (unchanged behavior)
 # ---------------------------
@@ -5322,6 +5377,10 @@ def process_single_brand(brand_index: int):
 
     logger.info(f"\n{'=' * 50}\nSTARTING PROCESS FOR SHOP: {brand_name}\n{'=' * 50}")
 
+    if DISCOUNT_DASHBOARD_ONLY_MODE:
+        execute_discount_dashboard_backfill_only(brand_index, brand_name)
+        return
+
     shop_name = os.environ.get(f"SHOP_NAME_{brand_index}")
     api_version = os.environ.get(f"API_VERSION_{brand_index}")
     access_token = os.environ.get(f"ACCESS_TOKEN_{brand_index}")
@@ -5860,7 +5919,9 @@ if __name__ == "__main__":
     else:
         logger.info("   - Schedule: MANUAL ONLY (SELF_RUN=false)")
 
-    if BACKFILL_MODE:
+    if DISCOUNT_DASHBOARD_ONLY_MODE:
+        logger.info("   - Mode: DISCOUNT DASHBOARD BACKFILL ONLY")
+    elif BACKFILL_MODE:
         msg = "   - Mode: BACKFILL (orders window overridden by BACKFILL_* env)"
         if BACKFILL_BRAND_INDICES:
             msg += f" [Restricted to brands: {BACKFILL_BRAND_INDICES}]"
