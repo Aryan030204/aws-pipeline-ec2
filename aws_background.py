@@ -54,6 +54,7 @@ import os
 import json
 import time
 import logging
+import re
 from collections import deque
 import traceback
 from typing import Dict, Iterable, List, Optional, Tuple, Any, Set
@@ -586,6 +587,87 @@ def now_ist() -> datetime:
 
 def ts() -> str:
     return now_ist().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def extract_bundle_item_columns_from_props(props) -> Dict[str, Optional[str]]:
+    item_columns = {}
+    for n in range(1, 11):
+        item_columns[f"_ITEM{n}_name"] = None
+        item_columns[f"_ITEM{n}_value"] = None
+
+    if not props:
+        return item_columns
+
+    props_map = {}
+    for prop in props[:100]:
+        if isinstance(prop, dict) and prop.get("name"):
+            props_map[str(prop.get("name"))] = prop.get("value")
+
+    extracted_items = []
+
+    raw_uniware = props_map.get("uniware_items")
+    if raw_uniware:
+        try:
+            data = json.loads(raw_uniware)
+            for item in data.get("items", []):
+                raw_item_props = item.get("properties", "{}")
+                if isinstance(raw_item_props, str):
+                    try:
+                        item_props = json.loads(raw_item_props)
+                    except Exception:
+                        item_props = {}
+                else:
+                    item_props = raw_item_props or {}
+
+                if item_props.get("_product") != "child":
+                    continue
+
+                name = (item.get("title") or item.get("name") or "").strip()
+                price = item.get("price")
+                if not name:
+                    continue
+                extracted_items.append(
+                    {
+                        "name": name,
+                        "value": str(price).strip()
+                        if price not in (None, "")
+                        else None,
+                    }
+                )
+        except Exception:
+            pass
+
+    if not extracted_items:
+        i = 1
+        while True:
+            key = f"sub_item_{i}"
+            if key not in props_map:
+                break
+            raw_value = str(props_map[key] or "").strip()
+            before_sep = raw_value.split("::")[0].strip()
+            match = re.match(r"^(.*?)\s+x\s+\d+\s*$", before_sep)
+            name = match.group(1).strip() if match else before_sep
+            if name:
+                extracted_items.append({"name": name, "value": None})
+            i += 1
+
+    if not extracted_items:
+        for idx, prop in enumerate(props[:10]):
+            if prop and prop.get("name", "").startswith("_ITEM"):
+                value = (prop.get("value") or "").strip()
+                value_parts = value.split("SKU:")
+                extracted_items.append(
+                    {
+                        "name": value_parts[0].strip() if len(value_parts) > 0 else None,
+                        "value": value_parts[1].strip() if len(value_parts) > 1 else None,
+                    }
+                )
+
+    for idx, item in enumerate(extracted_items[:10], start=1):
+        item_columns[f"_ITEM{idx}_name"] = item.get("name") or None
+        item_columns[f"_ITEM{idx}_value"] = item.get("value") or None
+
+    return item_columns
 
 
 @contextmanager
@@ -1524,6 +1606,7 @@ def transform_orders_to_df_optimized(
                 "line_item_total_discount": None,
                 "product_id": None,
                 "variant_id": None,
+                "line_item_properties_json": None,
                 "tags": order.get("tags") or None,
                 "updated_at": format_datetime(updated_at_str),
                 "updated_date": updated_date,
@@ -1648,24 +1731,16 @@ def transform_orders_to_df_optimized(
                         "variant_id": str(item.get("variant_id"))
                         if item.get("variant_id")
                         else None,
+                        "line_item_properties_json": None,
                         "user_agent": base.get("user_agent"),
                     }
                 )
 
                 props = item.get("properties", []) or []
-                for n in range(1, 10 + 1):
-                    row.setdefault(f"_ITEM{n}_name", None)
-                    row.setdefault(f"_ITEM{n}_value", None)
-                for idx, prop in enumerate(props[:10]):
-                    if prop and prop.get("name", "").startswith("_ITEM"):
-                        value = (prop.get("value") or "").strip()
-                        value_parts = value.split("SKU:")
-                        row[f"_ITEM{idx + 1}_name"] = (
-                            value_parts[0].strip() if len(value_parts) > 0 else None
-                        )
-                        row[f"_ITEM{idx + 1}_value"] = (
-                            value_parts[1].strip() if len(value_parts) > 1 else None
-                        )
+                row["line_item_properties_json"] = (
+                    json.dumps(props, ensure_ascii=False) if props else None
+                )
+                row.update(extract_bundle_item_columns_from_props(props))
 
                 for note in order.get("note_attributes", []) or []:
                     if note and note.get("name") in row:
@@ -2633,6 +2708,31 @@ def ensure_user_agent_column(brand_index: int, table_name: str):
         pass
 
 
+def ensure_bundle_property_columns(brand_index: int, table_name: str):
+    """
+    Ensure line_item_properties_json exists in the specific table so bundle
+    rollups can be rebuilt directly from shopify_orders rows.
+    """
+    engine = sqlalchemy_engines.get(brand_index)
+    if not engine:
+        return
+
+    try:
+        with engine.connect() as conn:
+            try:
+                conn.execute(
+                    text(
+                        f"ALTER TABLE {table_name} ADD COLUMN line_item_properties_json TEXT"
+                    )
+                )
+                conn.commit()
+            except Exception as e:
+                if "Duplicate column name" in str(e):
+                    pass
+    except Exception:
+        pass
+
+
 def ensure_device_summary_columns(brand_index: int, table_name: str):
     """
     Ensure device-wise session and ATC columns exist in the specific table.
@@ -2746,6 +2846,7 @@ def load_data_to_sql_optimized(
         Column("line_item_total_discount", Float),
         Column("product_id", String(50)),
         Column("variant_id", String(50)),
+        Column("line_item_properties_json", Text),
         Column("tags", Text),
         Column("updated_at", DateTime),
         Column("updated_date", String(10)),
@@ -5411,6 +5512,8 @@ def process_single_brand(brand_index: int):
     # --- Pre-flight Schema Migration (Avoid Locks) ---
     ensure_user_agent_column(brand_index, "shopify_orders")
     ensure_user_agent_column(brand_index, "shopify_orders_update")
+    ensure_bundle_property_columns(brand_index, "shopify_orders")
+    ensure_bundle_property_columns(brand_index, "shopify_orders_update")
     ensure_device_summary_columns(brand_index, "hourly_sessions_summary")
     ensure_device_summary_columns(brand_index, "hourly_sessions_summary_shopify")
     ensure_utm_names_column(brand_index, "overall_utm_summary")
