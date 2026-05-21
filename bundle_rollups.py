@@ -4,7 +4,7 @@ import os
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
 logger = logging.getLogger(__name__)
