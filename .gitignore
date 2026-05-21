@@ -1,4 +1,5 @@
 .env
+.env.bundle
 venv
 __pycache__
 .env.local

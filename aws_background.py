@@ -103,6 +103,8 @@ try:
 except ImportError:
     QStash = None
 
+from bundle_rollups import execute_bundle_rollups_incremental, is_bundle_rollup_brand
+
 # ---- Logging ----
 logging.basicConfig(
     level=logging.INFO,
@@ -5612,6 +5614,22 @@ def process_single_brand(brand_index: int):
         logger.info(
             f"✔️ No order-based summary updates needed for {brand_name} (no affected dates)"
         )
+
+    if is_bundle_rollup_brand(brand_name, brand_key, shop_name):
+        try:
+            with get_db_cursor(brand_index) as (cursor, connection):
+                execute_bundle_rollups_incremental(
+                    cursor=cursor,
+                    connection=connection,
+                    brand_name=brand_name,
+                    target_dates=affected_dates,
+                    shop_name=shop_name,
+                    access_token=access_token,
+                    api_version=api_version,
+                )
+        except Exception as e:
+            logger.error(f"Bundle rollup refresh failed for {brand_name}: {e}")
+            traceback.print_exc()
 
     # --- ShopifyQL Summaries (Always updated for 'today' or affected range) ---
     try:
