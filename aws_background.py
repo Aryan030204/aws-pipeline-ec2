@@ -105,6 +105,13 @@ except ImportError:
     QStash = None
 
 from bundle_rollups import execute_bundle_rollups_incremental, is_bundle_rollup_brand
+from product_fill_rate import (
+    calculate_fill_rate_percentages,
+    collect_fill_rate_affected_created_dates,
+    execute_fill_rate_pipeline_incremental,
+    fetch_fast_mover_product_ids,
+    register_fill_rate_pipeline_run,
+)
 
 # ---- Logging ----
 logging.basicConfig(
@@ -532,6 +539,9 @@ DISCOUNT_DASHBOARD_BACKFILL = (
 )
 DISCOUNT_DASHBOARD_ONLY_MODE = (
     os.environ.get("DISCOUNT_DASHBOARD_ONLY_MODE", "false").strip().lower() == "true"
+)
+FILL_RATE_PIPELINE_SWITCH = (
+    os.environ.get("FILL_RATE_PIPELINE_SWITCH", "false").strip().lower() == "true"
 )
 DISCOUNT_BACKFILL_START_DATE = os.environ.get("DISCOUNT_BACKFILL_START_DATE", "").strip()
 DISCOUNT_BACKFILL_END_DATE = os.environ.get("DISCOUNT_BACKFILL_END_DATE", "").strip()
@@ -5545,6 +5555,18 @@ def process_single_brand(brand_index: int):
 
     with get_db_cursor(brand_index) as (cursor, connection):
         ensure_summary_tables(cursor, connection)
+        fill_rate_fast_movers: Set[int] = set()
+        fill_rate_affected_dates: Set[str] = set()
+
+        if FILL_RATE_PIPELINE_SWITCH:
+            try:
+                fill_rate_fast_movers = fetch_fast_mover_product_ids(cursor, brand_name)
+            except Exception as e:
+                logger.error(f"❌ Failed to fetch fast movers for fill-rate metrics in {brand_name}: {e}")
+                traceback.print_exc()
+                fill_rate_fast_movers = set()
+        else:
+            logger.info(f"✔️ Fill-rate pipeline switch disabled for {brand_name}; skipping fulfillment metrics")
 
         for process in process_types:
             logger.info(
@@ -5657,6 +5679,17 @@ def process_single_brand(brand_index: int):
                     connection=connection,
                 )
 
+            if FILL_RATE_PIPELINE_SWITCH and fill_rate_fast_movers:
+                fill_rate_dates = collect_fill_rate_affected_created_dates(
+                    filtered, fill_rate_fast_movers
+                )
+                if fill_rate_dates:
+                    fill_rate_affected_dates.update(fill_rate_dates)
+                    logger.info(
+                        f"📦 Fill-rate affected created dates for {process['type']}: "
+                        f"{len(fill_rate_dates)} date(s) ({min(fill_rate_dates)}..{max(fill_rate_dates)})"
+                    )
+
             # UPDATED orders: build affected dates from updated_at + returns_fact deltas.
             if process["type"] == "UPDATED":
                 upd_dates = get_affected_dates_updates(
@@ -5688,6 +5721,48 @@ def process_single_brand(brand_index: int):
                     f"{len(discount_backfill_dates)} date(s) "
                     f"({min(discount_backfill_dates)}..{max(discount_backfill_dates)})"
                 )
+
+        if FILL_RATE_PIPELINE_SWITCH and fill_rate_fast_movers:
+            try:
+                daily_rows, metric_rows = execute_fill_rate_pipeline_incremental(
+                    cursor=cursor,
+                    connection=connection,
+                    brand_name=brand_name,
+                    target_dates=fill_rate_affected_dates,
+                    fast_mover_product_ids=fill_rate_fast_movers,
+                )
+                logger.info(
+                    f"✅ Fill-rate materialization updated for {brand_name}: "
+                    f"daily_rows={daily_rows}, metric_rows={metric_rows}, "
+                    f"affected_created_dates={len(fill_rate_affected_dates)}"
+                )
+
+                should_run_calc, run_count, interval = register_fill_rate_pipeline_run(
+                    cursor=cursor,
+                    connection=connection,
+                    brand_name=brand_name,
+                )
+                if should_run_calc:
+                    calc_rows = calculate_fill_rate_percentages(
+                        cursor=cursor,
+                        connection=connection,
+                        brand_name=brand_name,
+                        product_ids=fill_rate_fast_movers,
+                    )
+                    logger.info(
+                        f"✅ Fill-rate calculator executed for {brand_name}: "
+                        f"calc_rows={calc_rows}, run_count={run_count}, interval={interval}"
+                    )
+                else:
+                    logger.info(
+                        f"✔️ Fill-rate calculator skipped for {brand_name}: "
+                        f"run_count={run_count}, interval={interval}"
+                    )
+            except Exception as e:
+                logger.error(f"❌ Fill-rate materialization failed for {brand_name}: {e}")
+                traceback.print_exc()
+        elif FILL_RATE_PIPELINE_SWITCH:
+            logger.info(f"✔️ No fast movers found for {brand_name}; fill-rate materialization skipped")
 
     # Record completion
     with timed("Record pipeline completion timestamp"):
