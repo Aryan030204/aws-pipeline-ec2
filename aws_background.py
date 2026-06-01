@@ -89,6 +89,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import QueuePool
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from flask import Flask, request, jsonify
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -105,6 +106,12 @@ except ImportError:
     QStash = None
 
 from bundle_rollups import execute_bundle_rollups_incremental, is_bundle_rollup_brand
+from workers import fillrate_common
+from workers.fillrate_fast_movers import run_job as run_fillrate_fast_movers_job
+from workers.fillrate_aggregator import process_order_batch as fillrate_process_order_batch
+from workers.fillrate_calculator import (
+    run_job as run_fillrate_calculator_job,
+)
 
 # ---- Logging ----
 logging.basicConfig(
@@ -141,7 +148,6 @@ _last_logs_handler.setFormatter(
     )
 )
 logging.getLogger().addHandler(_last_logs_handler)
-
 
 def _derive_error_code(exc: Optional[BaseException]) -> str:
     if exc is None:
@@ -5545,6 +5551,8 @@ def process_single_brand(brand_index: int):
 
     with get_db_cursor(brand_index) as (cursor, connection):
         ensure_summary_tables(cursor, connection)
+        if fillrate_common.is_fillrate_enabled():
+            fillrate_common.ensure_tables(cursor, connection)
 
         for process in process_types:
             logger.info(
@@ -5633,6 +5641,18 @@ def process_single_brand(brand_index: int):
             load_data_to_sql_optimized(
                 df, brand_index, brand_name, process["table"], batch_size
             )
+
+            if fillrate_common.is_fillrate_enabled():
+                fillrate_process_order_batch(
+                    __import__(__name__),
+                    brand_index=brand_index,
+                    brand_name=brand_name,
+                    brand_key=brand_key,
+                    process_type=process["type"],
+                    orders_list=filtered,
+                    cursor=cursor,
+                    connection=connection,
+                )
 
             if process["type"] == "NEW":
                 discount_fact_dates = upsert_dashboard_order_discount_fact_from_orders(
@@ -5999,6 +6019,29 @@ def health_check():
 if __name__ == "__main__":
     initialize_brand_configs()
 
+    if fillrate_common.is_fillrate_enabled() and fillrate_common.is_fast_mover_worker_enabled():
+        scheduler.add_job(
+            lambda: run_fillrate_fast_movers_job(__import__(__name__)),
+            CronTrigger.from_crontab(fillrate_common.fast_mover_cron(), timezone=IST),
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=300,
+            replace_existing=True,
+            id="fillrate_fast_movers_job",
+            next_run_time=now_ist(),
+        )
+
+    if fillrate_common.is_fillrate_enabled() and fillrate_common.is_calculator_enabled():
+        scheduler.add_job(
+            lambda: run_fillrate_calculator_job(__import__(__name__)),
+            CronTrigger.from_crontab(fillrate_common.calculator_cron(), timezone=IST),
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=300,
+            replace_existing=True,
+            id="fillrate_calculator_job",
+        )
+
     # Conditionally schedule the pipeline
     if SELF_RUN:
         # Schedule at fixed 10-minute wall-clock slots (:00, :10, :20, :30, :40, :50)
@@ -6064,6 +6107,12 @@ if __name__ == "__main__":
     )
     logger.info("   - Connection pooling: Enabled (retry on exhaustion)")
     logger.info("   - Async API fetching: Enabled")
+    if fillrate_common.is_fillrate_enabled():
+        logger.info(
+            f"   - Fill-rate: ENABLED (fast-mover cron={fillrate_common.fast_mover_cron()}, calculator cron={fillrate_common.calculator_cron()})"
+        )
+    else:
+        logger.info("   - Fill-rate: DISABLED")
     logger.info("   - Summary updates: INCREMENTAL (only affected dates) 🚀")
     logger.info("   - Manual Trigger API: POST /trigger (port 5000)")
 
