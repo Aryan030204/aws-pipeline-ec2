@@ -1323,7 +1323,7 @@ async def fetch_orders_async(
 
     # Ensure refunds/cancel snapshots are present
     fields = (
-        "id,name,created_at,updated_at,cancelled_at,total_price,financial_status,"
+        "id,name,tags,created_at,updated_at,cancelled_at,total_price,financial_status,"
         "payment_gateway_names,app_id,currency,discount_codes,discount_applications,landing_site,"
         "refunds,refunds/created_at,refunds/transactions,"
         "refunds/transactions/amount,refunds/transactions/kind,refunds/transactions/status,"
@@ -2703,6 +2703,28 @@ def ensure_user_agent_column(brand_index: int, table_name: str):
                 if "Duplicate column name" in str(e):
                     pass
                 else:
+                    pass
+    except Exception:
+        pass
+
+
+def ensure_customer_tag_column(brand_index: int, table_name: str):
+    """
+    Ensure customer_tag exists in the specific table.
+    """
+    engine = sqlalchemy_engines.get(brand_index)
+    if not engine:
+        return
+
+    try:
+        with engine.connect() as conn:
+            try:
+                conn.execute(
+                    text(f"ALTER TABLE {table_name} ADD COLUMN customer_tag TEXT")
+                )
+                conn.commit()
+            except Exception as e:
+                if "Duplicate column name" in str(e):
                     pass
     except Exception:
         pass
@@ -5512,6 +5534,7 @@ def process_single_brand(brand_index: int):
     # --- Pre-flight Schema Migration (Avoid Locks) ---
     ensure_user_agent_column(brand_index, "shopify_orders")
     ensure_user_agent_column(brand_index, "shopify_orders_update")
+    ensure_customer_tag_column(brand_index, "shopify_orders")
     ensure_bundle_property_columns(brand_index, "shopify_orders")
     ensure_bundle_property_columns(brand_index, "shopify_orders_update")
     ensure_device_summary_columns(brand_index, "hourly_sessions_summary")

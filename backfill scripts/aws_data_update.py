@@ -653,9 +653,10 @@ async def fetch_orders_async(api_base_url: str, access_token: str, start_date: s
 
     # Ensure refunds/cancel snapshots are present
     fields = (
-        "id,name,created_at,updated_at,cancelled_at,total_price,financial_status,"
+        "id,name,tags,created_at,updated_at,cancelled_at,total_price,financial_status,"
         "payment_gateway_names,app_id,refunds,refunds/created_at,refunds/transactions,"
-        "refunds/transactions/amount,refunds/transactions/kind,refunds/transactions/status"
+        "refunds/transactions/amount,refunds/transactions/kind,refunds/transactions/status,"
+        "customer,customer/tags"
     )
 
     date_filter_field_max = date_filter_field.replace('_min', '_max')
