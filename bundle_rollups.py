@@ -20,7 +20,9 @@ BUNDLE_MAP = {
        8417496137924: "3 Products at 349",
        8458140745924: "2 Products at 399",
        8382929600708: "Daily Deo Combo",
-       8395644993732: "Fab four Kit"
+       8395644993732: "Fab four Kit",
+       8613032362180: "6 Products at 799 [Rs.799]",
+       8607284330692: "6 Products at 799 [Rs.7,794]",
 }
 
 BUNDLE_TARGET_BRAND_TAG = os.environ.get("BUNDLE_TARGET_BRAND_TAG", "tmc").strip().lower()
