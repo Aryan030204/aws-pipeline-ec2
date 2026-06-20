@@ -67,11 +67,12 @@ import uuid
 import queue
 # from kafka import KafkaProducer (REMOVED)
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date, timezone
 from zoneinfo import ZoneInfo
 
 import mysql.connector
 from mysql.connector import pooling
+from pymongo import MongoClient
 
 from sqlalchemy import (
     create_engine,
@@ -185,6 +186,8 @@ if TEST_MODE:
     logger.info(
         "⚠️ TEST_MODE enabled: QStash and DB SSL will be DISABLED, loading config from local env (.env.local)."
     )
+
+MONGO_URI = os.environ.get("MONGO_URI", "").strip()
 
 brand_tag_to_index_map: Dict[str, int] = {}
 brand_id_from_config: Dict[
@@ -2813,6 +2816,172 @@ def ensure_utm_names_column(brand_index: int, table_name: str = "overall_utm_sum
                     pass
     except Exception:
         pass
+
+
+def ensure_ci_events_column(
+    brand_index: int, table_name: str = "hourly_sessions_summary_shopify"
+):
+    """
+    Ensure ci_events exists in the specific table.
+    """
+    engine = sqlalchemy_engines.get(brand_index)
+    if not engine:
+        return
+
+    try:
+        with engine.connect() as conn:
+            try:
+                conn.execute(
+                    text(f"ALTER TABLE {table_name} ADD COLUMN ci_events INT DEFAULT 0")
+                )
+                conn.commit()
+            except Exception as e:
+                if "Duplicate column name" in str(e):
+                    pass
+    except Exception:
+        pass
+
+
+def _normalize_brand_token(value: Optional[str]) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (value or "").strip().lower())
+
+
+def is_ajmal_brand(brand_name: Optional[str], brand_key: Optional[str] = None) -> bool:
+    normalized_tokens = {
+        _normalize_brand_token(brand_name),
+        _normalize_brand_token(brand_key),
+    }
+    return "ajmal" in normalized_tokens
+
+
+def _resolve_mongo_sessions_collection():
+    if not MONGO_URI:
+        raise ValueError("MONGO_URI is not configured")
+
+    client = MongoClient(MONGO_URI, tz_aware=True)
+    return client, client["alerts"]["sessions"]
+
+
+def _ist_date_range_to_utc_bounds(
+    start_date: date, end_date: date
+) -> Tuple[datetime, datetime]:
+    start_ist = datetime.combine(start_date, datetime.min.time(), tzinfo=IST)
+    end_ist_exclusive = datetime.combine(
+        end_date + timedelta(days=1), datetime.min.time(), tzinfo=IST
+    )
+    return (
+        start_ist.astimezone(timezone.utc),
+        end_ist_exclusive.astimezone(timezone.utc),
+    )
+
+
+def fetch_checkout_initiated_hourly_counts_from_mongo(
+    start_date: date, end_date: date
+) -> List[Dict[str, Any]]:
+    start_utc, end_utc = _ist_date_range_to_utc_bounds(start_date, end_date)
+    client = None
+    try:
+        client, collection = _resolve_mongo_sessions_collection()
+        cursor = collection.find(
+            {
+                "event_type": "checkout_initiated",
+                "createdAt": {"$gte": start_utc, "$lt": end_utc},
+            },
+            {"createdAt": 1},
+        )
+
+        counts: Dict[Tuple[date, int], int] = {}
+        for doc in cursor:
+            created_at = doc.get("createdAt")
+            if not isinstance(created_at, datetime):
+                continue
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+
+            created_at_ist = created_at.astimezone(IST)
+            bucket_key = (created_at_ist.date(), created_at_ist.hour)
+            counts[bucket_key] = counts.get(bucket_key, 0) + 1
+
+        return [
+            {"date": bucket_date, "hour": bucket_hour, "ci_events": count}
+            for (bucket_date, bucket_hour), count in sorted(counts.items())
+        ]
+    finally:
+        if client is not None:
+            client.close()
+
+
+def _do_upsert_checkout_initiated_ci_events(
+    results: List[Dict[str, Any]],
+    cursor,
+    connection,
+    brand_name: str,
+    start_date: date,
+    end_date: date,
+):
+    cursor.execute(
+        """
+        UPDATE hourly_sessions_summary_shopify
+        SET ci_events = 0
+        WHERE date BETWEEN %s AND %s
+        """,
+        (start_date, end_date),
+    )
+
+    for row in results:
+        cursor.execute(
+            """
+            INSERT INTO hourly_sessions_summary_shopify (date, hour, ci_events)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                ci_events = VALUES(ci_events)
+            """,
+            (row["date"], row["hour"], row["ci_events"]),
+        )
+
+    connection.commit()
+    logger.info(
+        f"✅ Checkout-initiated ci_events updated for {brand_name} "
+        f"({len(results)} hour buckets, {start_date}..{end_date})"
+    )
+
+
+def sync_checkout_initiated_ci_events(
+    brand_index: int,
+    brand_name: str,
+    start_date: date,
+    end_date: date,
+    brand_key: Optional[str] = None,
+    cursor=None,
+    connection=None,
+):
+    if not is_ajmal_brand(brand_name, brand_key):
+        logger.info(
+            f"Skipping checkout-initiated Mongo sync for {brand_name}: non-AJMAL brand"
+        )
+        return
+
+    try:
+        results = fetch_checkout_initiated_hourly_counts_from_mongo(start_date, end_date)
+    except Exception as e:
+        logger.error(
+            f"❌ Error fetching checkout-initiated Mongo events for {brand_name}: {e}"
+        )
+        return
+
+    if cursor is not None:
+        _do_upsert_checkout_initiated_ci_events(
+            results, cursor, connection, brand_name, start_date, end_date
+        )
+        return
+
+    try:
+        with get_db_cursor(brand_index) as (c, conn):
+            _do_upsert_checkout_initiated_ci_events(
+                results, c, conn, brand_name, start_date, end_date
+            )
+    except Exception as e:
+        logger.error(f"❌ Error updating checkout-initiated ci_events for {brand_name}: {e}")
 
 
 def load_data_to_sql_optimized(
@@ -5474,6 +5643,22 @@ def update_sessions_summary(
                 connection=connection,
             )
 
+            ci_start_dt = now_ist().date() - timedelta(days=1)
+            ci_end_dt = now_ist().date()
+            if is_backfill_active_for(brand_index) and BACKFILL_START_IST and BACKFILL_END_IST:
+                ci_start_dt = BACKFILL_START_IST.date()
+                ci_end_dt = BACKFILL_END_IST.date()
+
+            sync_checkout_initiated_ci_events(
+                brand_index=brand_index,
+                brand_name=brand_name,
+                brand_key=os.environ.get(f"BRAND_TAG_{brand_index}"),
+                start_date=ci_start_dt,
+                end_date=ci_end_dt,
+                cursor=cursor,
+                connection=connection,
+            )
+
             update_last_fetch_timestamp(cursor, connection, now_ist())
             logger.info(f"✅ Sessions updated via ShopifyQL for {brand_name}")
 
@@ -5539,6 +5724,7 @@ def process_single_brand(brand_index: int):
     ensure_bundle_property_columns(brand_index, "shopify_orders_update")
     ensure_device_summary_columns(brand_index, "hourly_sessions_summary")
     ensure_device_summary_columns(brand_index, "hourly_sessions_summary_shopify")
+    ensure_ci_events_column(brand_index, "hourly_sessions_summary_shopify")
     ensure_utm_names_column(brand_index, "overall_utm_summary")
 
     # Sessions
