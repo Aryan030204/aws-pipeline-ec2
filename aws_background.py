@@ -55,6 +55,10 @@ import json
 import time
 import logging
 import re
+import atexit
+import random
+import signal
+import threading
 from collections import deque
 import traceback
 from typing import Dict, Iterable, List, Optional, Tuple, Any, Set
@@ -71,11 +75,11 @@ from datetime import datetime, timedelta, date, timezone
 from zoneinfo import ZoneInfo
 
 import mysql.connector
-from mysql.connector import pooling
 from pymongo import MongoClient
 
 from sqlalchemy import (
     create_engine,
+    event,
     Table,
     Column,
     MetaData,
@@ -86,8 +90,9 @@ from sqlalchemy import (
     Text,
     text,
 )
+from sqlalchemy.engine import URL
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.pool import QueuePool
+from sqlalchemy.pool import NullPool
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request, jsonify
@@ -193,9 +198,9 @@ brand_tag_to_index_map: Dict[str, int] = {}
 brand_id_from_config: Dict[
     int, int
 ] = {}  # brand_index -> brand_id from pipelinecreds MongoDB
-db_connection_pools: Dict[int, pooling.MySQLConnectionPool] = {}
+brand_db_configs: Dict[int, Dict[str, Any]] = {}
 sqlalchemy_engines: Dict[int, Any] = {}
-active_brand_indices: List[int] = []  # only brands with valid pools/engines
+active_brand_indices: List[int] = []  # only brands with valid configs/engines
 scheduler = BackgroundScheduler(timezone=IST)
 app = Flask(__name__)
 PIPELINE_AUTH_HEADER = os.environ.get("PIPELINE_AUTH_HEADER", "pipeline@nosecret123")
@@ -207,6 +212,72 @@ PIPELINE_ID = os.environ.get("PIPELINE_ID", "shopify-pipeline-etl")
 
 MANUAL_TRIGGER_QUEUE = queue.Queue()
 
+
+class RDSProxyValidationError(RuntimeError):
+    pass
+
+
+DB_RETRY_ATTEMPTS = int(os.environ.get("DB_RETRY_ATTEMPTS", "3"))
+DB_RETRY_BASE_DELAY_S = float(os.environ.get("DB_RETRY_BASE_DELAY_S", "0.5"))
+DB_TEST_ON_STARTUP = os.environ.get("DB_TEST_ON_STARTUP", "false").strip().lower() == "true"
+REQUIRE_RDS_PROXY = os.environ.get("REQUIRE_RDS_PROXY", "true").strip().lower() == "true"
+EXPECTED_RDS_PROXY_HOST = os.environ.get("EXPECTED_RDS_PROXY_HOST", "").strip()
+
+_db_metrics_lock = threading.Lock()
+_db_shutdown_lock = threading.Lock()
+_db_shutdown_done = False
+_db_context = threading.local()
+_db_connection_metrics: Dict[str, int] = {
+    "active_connector_connections": 0,
+    "peak_connector_connections": 0,
+    "connections_opened_total": 0,
+    "connection_failures_total": 0,
+    "active_sqlalchemy_connections": 0,
+    "peak_sqlalchemy_connections": 0,
+}
+
+
+def _metric_inc(name: str, amount: int = 1) -> None:
+    with _db_metrics_lock:
+        _db_connection_metrics[name] = _db_connection_metrics.get(name, 0) + amount
+        if name == "active_connector_connections":
+            _db_connection_metrics["peak_connector_connections"] = max(
+                _db_connection_metrics["peak_connector_connections"],
+                _db_connection_metrics["active_connector_connections"],
+            )
+        elif name == "active_sqlalchemy_connections":
+            _db_connection_metrics["peak_sqlalchemy_connections"] = max(
+                _db_connection_metrics["peak_sqlalchemy_connections"],
+                _db_connection_metrics["active_sqlalchemy_connections"],
+            )
+
+
+def _metric_dec(name: str, amount: int = 1) -> None:
+    with _db_metrics_lock:
+        _db_connection_metrics[name] = max(
+            0, _db_connection_metrics.get(name, 0) - amount
+        )
+
+
+def get_db_connection_metrics_snapshot() -> Dict[str, int]:
+    with _db_metrics_lock:
+        return dict(_db_connection_metrics)
+
+
+def log_db_connection_metrics(prefix: str = "DB_CONNECTION_METRICS") -> None:
+    metrics = get_db_connection_metrics_snapshot()
+    logger.info(
+        "%s active_connector=%s peak_connector=%s opened_total=%s failures_total=%s "
+        "active_sqlalchemy=%s peak_sqlalchemy=%s",
+        prefix,
+        metrics["active_connector_connections"],
+        metrics["peak_connector_connections"],
+        metrics["connections_opened_total"],
+        metrics["connection_failures_total"],
+        metrics["active_sqlalchemy_connections"],
+        metrics["peak_sqlalchemy_connections"],
+    )
+
 # HTTP Session (requests) with pooling/retries (used for sessions API)
 http_session = requests.Session()
 retry_strategy = Retry(
@@ -217,6 +288,52 @@ adapter = HTTPAdapter(
 )
 http_session.mount("https://", adapter)
 http_session.mount("http://", adapter)
+
+
+def close_all_database_resources() -> None:
+    global _db_shutdown_done
+    with _db_shutdown_lock:
+        if _db_shutdown_done:
+            return
+        _db_shutdown_done = True
+
+    log_db_connection_metrics("DB_CONNECTION_METRICS_SHUTDOWN_BEGIN")
+    disposed = 0
+    for brand_idx, engine in list(sqlalchemy_engines.items()):
+        try:
+            engine.dispose()
+            disposed += 1
+        except Exception as e:
+            logger.warning(
+                "Error disposing SQLAlchemy engine for brand_index=%s: %s",
+                brand_idx,
+                e,
+            )
+
+    sqlalchemy_engines.clear()
+    brand_db_configs.clear()
+    try:
+        http_session.close()
+    except Exception:
+        pass
+
+    logger.info(
+        "Database resource shutdown complete: disposed_sqlalchemy_engines=%s",
+        disposed,
+    )
+    log_db_connection_metrics("DB_CONNECTION_METRICS_SHUTDOWN_COMPLETE")
+
+
+def _handle_shutdown_signal(signum, frame) -> None:
+    logger.info("Received shutdown signal %s", signum)
+    close_all_database_resources()
+    raise SystemExit(0)
+
+
+atexit.register(close_all_database_resources)
+if threading.current_thread() is threading.main_thread():
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+    signal.signal(signal.SIGINT, _handle_shutdown_signal)
 
 
 # ---------------------------
@@ -858,11 +975,159 @@ def fetch_brand_config(brand_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _is_ssl_connection_error(exc: BaseException) -> bool:
+    err_msg = str(exc).lower()
+    return "ssl" in err_msg or "certificate verify failed" in err_msg
+
+
+def _build_db_config(
+    db_host: str,
+    db_user: str,
+    db_password: str,
+    db_port: int,
+    db_name: str,
+    ca_path: Optional[str],
+    verify_cert: bool,
+    verify_identity: bool,
+) -> Dict[str, Any]:
+    effective_verify_identity = verify_identity
+    if verify_identity and (
+        "elb.amazonaws.com" in db_host
+        or ("amazonaws.com" in db_host and "rds.amazonaws.com" not in db_host)
+    ):
+        effective_verify_identity = False
+
+    config: Dict[str, Any] = {
+        "host": db_host,
+        "port": db_port,
+        "user": db_user,
+        "password": db_password,
+        "database": db_name,
+        "connection_timeout": int(os.environ.get("DB_CONNECT_TIMEOUT_S", "10")),
+        "read_timeout": int(os.environ.get("DB_READ_TIMEOUT_S", "120")),
+        "write_timeout": int(os.environ.get("DB_WRITE_TIMEOUT_S", "120")),
+    }
+
+    effective_ca_path = ca_path
+    if db_host.lower() in ["localhost", "127.0.0.1"]:
+        effective_ca_path = None
+
+    if effective_ca_path:
+        config.update(
+            {
+                "ssl_ca": effective_ca_path,
+                "ssl_verify_cert": verify_cert,
+                "ssl_verify_identity": effective_verify_identity,
+            }
+        )
+
+    return config
+
+
+def _validate_rds_proxy_host(db_host: str, brand_name: str) -> None:
+    if TEST_MODE:
+        return
+    if not REQUIRE_RDS_PROXY:
+        return
+
+    host = (db_host or "").strip().lower()
+    expected = EXPECTED_RDS_PROXY_HOST.lower()
+    if expected:
+        if host != expected:
+            raise RDSProxyValidationError(
+                f"DB host rejected for {brand_name}: expected configured RDS Proxy host"
+            )
+        return
+
+    if ".proxy-" not in host and "proxy-" not in host:
+        raise RDSProxyValidationError(
+            f"DB host rejected for {brand_name}: host does not look like an RDS Proxy endpoint"
+        )
+
+
+def _create_sqlalchemy_engine_for_brand(
+    brand_idx: int,
+    brand_name: str,
+    db_config: Dict[str, Any],
+) -> Any:
+    connect_args = {
+        "connection_timeout": db_config.get("connection_timeout", 10),
+        "read_timeout": db_config.get("read_timeout", 120),
+        "write_timeout": db_config.get("write_timeout", 120),
+    }
+    for key in ("ssl_ca", "ssl_verify_cert", "ssl_verify_identity"):
+        if key in db_config:
+            connect_args[key] = db_config[key]
+
+    engine = create_engine(
+        URL.create(
+            "mysql+mysqlconnector",
+            username=db_config["user"],
+            password=db_config["password"],
+            host=db_config["host"],
+            port=int(db_config.get("port", 3306)),
+            database=db_config["database"],
+            query={"charset": "utf8mb4"},
+        ),
+        connect_args=connect_args,
+        poolclass=NullPool,
+        pool_pre_ping=True,
+        echo=False,
+        future=True,
+    )
+
+    @event.listens_for(engine, "connect")
+    def _on_sqlalchemy_connect(dbapi_connection, connection_record):
+        _metric_inc("active_sqlalchemy_connections")
+        logger.debug(
+            "SQLALCHEMY_CONNECTION_OPENED brand=%s brand_index=%s",
+            brand_name,
+            brand_idx,
+        )
+
+    @event.listens_for(engine, "close")
+    def _on_sqlalchemy_close(dbapi_connection, connection_record):
+        _metric_dec("active_sqlalchemy_connections")
+        logger.debug(
+            "SQLALCHEMY_CONNECTION_CLOSED brand=%s brand_index=%s",
+            brand_name,
+            brand_idx,
+        )
+
+    return engine
+
+
+def _replace_sqlalchemy_engine_for_brand(
+    brand_idx: int, brand_name: str, db_config: Dict[str, Any]
+) -> None:
+    old_engine = sqlalchemy_engines.get(brand_idx)
+    if old_engine is not None:
+        try:
+            old_engine.dispose()
+        except Exception:
+            pass
+    sqlalchemy_engines[brand_idx] = _create_sqlalchemy_engine_for_brand(
+        brand_idx, brand_name, db_config
+    )
+
+
+def _test_brand_database_connection(brand_idx: int, brand_name: str) -> None:
+    with get_db_connection(brand_idx) as cnx:
+        cursor = cnx.cursor()
+        try:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+        finally:
+            cursor.close()
+    engine = sqlalchemy_engines.get(brand_idx)
+    if engine is not None:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+
+
 def initialize_brand_configs():
     import tempfile
     import certifi
-    from sqlalchemy import create_engine
-    from sqlalchemy.pool import QueuePool
 
     def _trunc(val: Any, length: int = 4) -> str:
         s = str(val) if val is not None else ""
@@ -896,160 +1161,41 @@ def initialize_brand_configs():
         verify_cert,
         verify_identity,
     ):
-        def _trunc(val: Any, length: int = 4) -> str:
-            s = str(val) if val is not None else ""
-            if len(s) <= length:
-                return s
-            return f"{s[:length]}..."
-
         logger.info(
             f"🔑 Config for {brand_name} ({'LOCAL' if TEST_MODE else 'API'}): "
-            f"host={_trunc(db_host, 12)}, user={_trunc(db_user)}, pass={_trunc(db_password)}, "
-            f"db={db_name}, token={_trunc(access_token, 8)}"
+            f"host={_trunc(db_host, 12)}, user={_trunc(db_user)}, db={db_name}"
         )
 
-        if verify_identity and (
-            "elb.amazonaws.com" in db_host
-            or ("amazonaws.com" in db_host and "rds.amazonaws.com" not in db_host)
-        ):
-            effective_verify_identity = False
-        else:
-            effective_verify_identity = verify_identity
- 
-        db_config = {
-            "host": db_host,
-            "port": db_port,
-            "user": db_user,
-            "password": db_password,
-            "database": db_name,
-            "connection_timeout": int(os.environ.get("DB_CONNECT_TIMEOUT_S", "10")),
-        }
+        _validate_rds_proxy_host(db_host, brand_name)
 
-        # Local development fix: Disable SSL if host is localhost/127.0.0.1
-        effective_ca_path = ca_path
-        if db_host.lower() in ["localhost", "127.0.0.1"]:
-            effective_ca_path = None
+        db_config = _build_db_config(
+            db_host=db_host,
+            db_user=db_user,
+            db_password=db_password,
+            db_port=db_port,
+            db_name=db_name,
+            ca_path=ca_path,
+            verify_cert=verify_cert,
+            verify_identity=verify_identity,
+        )
+        brand_db_configs[brand_idx] = db_config
 
-        if effective_ca_path:
-            db_config.update(
-                {
-                    "ssl_ca": effective_ca_path,
-                    "ssl_verify_cert": verify_cert,
-                    "ssl_verify_identity": effective_verify_identity,
-                }
-            )
-
-        # --------------------------
-        # 1. Connection Pool (Retry with SSL fallback)
-        # --------------------------
         try:
-            pool = pooling.MySQLConnectionPool(
-                pool_name=f"pool_{brand_idx}",
-                pool_size=int(os.environ.get(f"DB_POOL_SIZE_{brand_idx}", "5")),
-                pool_reset_session=True,
-                **db_config,
+            sqlalchemy_engines[brand_idx] = _create_sqlalchemy_engine_for_brand(
+                brand_idx, brand_name, db_config
             )
-            db_connection_pools[brand_idx] = pool
         except Exception as e:
-            err_msg = str(e).lower()
-            if effective_ca_path and (
-                "ssl" in err_msg or "certificate verify failed" in err_msg
-            ):
-                logger.warning(
-                    f"⚠️ SSL connection failed for {brand_name}. Retrying WITHOUT SSL fallback..."
-                )
-                # Remove SSL config and retry
-                db_config.pop("ssl_ca", None)
-                db_config.pop("ssl_verify_cert", None)
-                db_config.pop("ssl_verify_identity", None)
-                try:
-                    pool = pooling.MySQLConnectionPool(
-                        pool_name=f"pool_{brand_idx}",
-                        pool_size=int(os.environ.get(f"DB_POOL_SIZE_{brand_idx}", "5")),
-                        pool_reset_session=True,
-                        **db_config,
-                    )
-                    db_connection_pools[brand_idx] = pool
-                    effective_ca_path = None  # Mark as disabled for engine too
-                except Exception as retry_e:
-                    logger.error(
-                        f"❌ Pool error for {brand_name} (even without SSL): {retry_e}"
-                    )
-                    return
-            else:
-                logger.error(f"❌ Pool error for {brand_name}: {e}")
-                return
+            brand_db_configs.pop(brand_idx, None)
+            logger.error(f"❌ Engine setup error for {brand_name}: {e}")
+            return
 
-        # --------------------------
-        # 2. SQLAlchemy Engine (Retry with SSL fallback)
-        # --------------------------
-        try:
-            mysql_connect_str = f"mysql+mysqlconnector://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}?charset=utf8mb4"
-            connect_args = {
-                "connection_timeout": int(os.environ.get("DB_CONNECT_TIMEOUT_S", "10"))
-            }
-            if effective_ca_path:
-                connect_args.update(
-                    {
-                        "ssl_ca": effective_ca_path,
-                        "ssl_verify_cert": verify_cert,
-                        "ssl_verify_identity": effective_verify_identity,
-                    }
-                )
-
-            engine = create_engine(
-                mysql_connect_str,
-                connect_args=connect_args,
-                poolclass=QueuePool,
-                pool_size=int(os.environ.get(f"SA_POOL_SIZE_{brand_idx}", "1")),
-                max_overflow=int(os.environ.get(f"SA_MAX_OVERFLOW_{brand_idx}", "0")),
-                pool_pre_ping=True,
-                pool_recycle=int(os.environ.get("SA_POOL_RECYCLE_S", "1800")),
-                echo=False,
-                future=True,
-            )
-            # Test connectivity immediately for the engine
-            with engine.connect() as conn:
-                conn.execute(text("SELECT 1"))
-            sqlalchemy_engines[brand_idx] = engine
-        except Exception as e:
-            err_msg = str(e).lower()
-            if effective_ca_path and (
-                "ssl" in err_msg or "certificate verify failed" in err_msg
-            ):
-                logger.warning(
-                    f"⚠️ Engine SSL failed for {brand_name}. Retrying WITHOUT SSL fallback..."
-                )
-                try:
-                    engine = create_engine(
-                        mysql_connect_str,
-                        connect_args={
-                            "connection_timeout": int(
-                                os.environ.get("DB_CONNECT_TIMEOUT_S", "10")
-                            )
-                        },
-                        poolclass=QueuePool,
-                        pool_size=int(os.environ.get(f"SA_POOL_SIZE_{brand_idx}", "1")),
-                        max_overflow=int(
-                            os.environ.get(f"SA_MAX_OVERFLOW_{brand_idx}", "0")
-                        ),
-                        pool_pre_ping=True,
-                        pool_recycle=int(os.environ.get("SA_POOL_RECYCLE_S", "1800")),
-                        echo=False,
-                        future=True,
-                    )
-                    with engine.connect() as conn:
-                        conn.execute(text("SELECT 1"))
-                    sqlalchemy_engines[brand_idx] = engine
-                except Exception as retry_e:
-                    logger.error(
-                        f"❌ Engine error for {brand_name} (even without SSL): {retry_e}"
-                    )
-                    db_connection_pools.pop(brand_idx, None)
-                    return
-            else:
-                logger.error(f"❌ Engine error for {brand_name}: {e}")
-                db_connection_pools.pop(brand_idx, None)
+        if DB_TEST_ON_STARTUP:
+            try:
+                _test_brand_database_connection(brand_idx, brand_name)
+            except Exception as e:
+                sqlalchemy_engines.pop(brand_idx, None)
+                brand_db_configs.pop(brand_idx, None)
+                logger.error(f"❌ Startup DB test failed for {brand_name}: {e}")
                 return
 
         os.environ[f"BRAND_NAME_{brand_idx}"] = brand_name
@@ -1216,58 +1362,172 @@ def initialize_brand_configs():
                     verify_cert,
                     verify_identity,
                 )
+            except RDSProxyValidationError:
+                raise
             except Exception as e:
                 logger.error(f"❌ API config error for {brand_tag_value}: {e}")
                 continue
 
     logger.info(f"✅ Active brands initialized: {active_brand_indices}")
+    logger.info("Database connection mode: lazy")
+    logger.info("SQLAlchemy pool mode: NullPool")
+    logger.info(f"Configured brands: {len(active_brand_indices)}")
+    logger.info(f"Active brand concurrency: {os.environ.get('MAX_CONCURRENT_BRANDS', '3')}")
+    logger.info(f"RDS Proxy enforcement: {'enabled' if REQUIRE_RDS_PROXY and not TEST_MODE else 'disabled'}")
+    logger.info(f"Startup connection test: {'enabled' if DB_TEST_ON_STARTUP else 'disabled'}")
+    log_db_connection_metrics("DB_CONNECTION_METRICS_STARTUP")
 
 
 # ---------------------------
-# Pooled DB helpers (with retry)
+# Lazy DB helpers
 # ---------------------------
-@contextmanager
-def get_db_connection(brand_index: int, attempts: int = 10, sleep_s: float = 0.2):
-    pool = db_connection_pools.get(brand_index)
-    if not pool:
-        raise ValueError(f"No connection pool for brand {brand_index}")
+def _connector_config_without_ssl(config: Dict[str, Any]) -> Dict[str, Any]:
+    clean = dict(config)
+    clean.pop("ssl_ca", None)
+    clean.pop("ssl_verify_cert", None)
+    clean.pop("ssl_verify_identity", None)
+    return clean
 
-    last_err = None
-    for _ in range(attempts):
-        try:
-            cnx = pool.get_connection()
-        except mysql.connector.errors.PoolError as e:
-            last_err = e
-            time.sleep(sleep_s)
-            continue
-        # Pool hands out connections without checking liveness. A socket that
-        # went stale while idle (NAT/firewall idle timeout, RDS failover) will
-        # hang on the first cursor.execute — mysql.connector has no socket
-        # read timeout — and the thread parks forever with nothing in
-        # processlist. ping(reconnect=True) bounds that failure mode: it
-        # either revives the connection or raises, so we retry cleanly.
-        try:
-            cnx.ping(reconnect=True, attempts=2, delay=0)
-            break
-        except mysql.connector.Error as e:
-            last_err = e
+
+def _open_mysql_connection_once(
+    brand_index: int,
+    brand_name: str,
+    config: Dict[str, Any],
+):
+    cnx = None
+    try:
+        cnx = mysql.connector.connect(**config)
+        cnx.ping(reconnect=False, attempts=1, delay=0)
+    except Exception:
+        if cnx is not None:
             try:
                 cnx.close()
             except Exception:
                 pass
-            time.sleep(sleep_s)
-    else:
-        raise last_err or mysql.connector.errors.PoolError(
-            "Failed getting connection; pool exhausted"
+        raise
+
+    _metric_inc("active_connector_connections")
+    _metric_inc("connections_opened_total")
+
+    connection_id = None
+    try:
+        cursor = cnx.cursor()
+        try:
+            cursor.execute("SELECT CONNECTION_ID()")
+            row = cursor.fetchone()
+            connection_id = row[0] if row else None
+        finally:
+            cursor.close()
+    except Exception as e:
+        logger.debug(
+            "Could not fetch MySQL connection id for brand=%s brand_index=%s: %s",
+            brand_name,
+            brand_index,
+            e,
+        )
+
+    logger.info(
+        "DB_CONNECTION_OPENED connection_id=%s brand=%s brand_index=%s pipeline=orders_etl "
+        "job_id=%s thread=%s",
+        connection_id,
+        brand_name,
+        brand_index,
+        getattr(_db_context, "job_id", None),
+        threading.current_thread().name,
+    )
+    return cnx
+
+
+@contextmanager
+def get_db_connection(
+    brand_index: int,
+    attempts: int = DB_RETRY_ATTEMPTS,
+    sleep_s: float = DB_RETRY_BASE_DELAY_S,
+):
+    config = brand_db_configs.get(brand_index)
+    if not config:
+        raise ValueError(f"No database config for brand {brand_index}")
+
+    brand_name = os.environ.get(f"BRAND_NAME_{brand_index}", f"Brand_{brand_index}")
+    last_err: Optional[BaseException] = None
+    cnx = None
+
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            cnx = _open_mysql_connection_once(brand_index, brand_name, config)
+            break
+        except mysql.connector.Error as e:
+            last_err = e
+            _metric_inc("connection_failures_total")
+            if "ssl_ca" in config and _is_ssl_connection_error(e):
+                logger.warning(
+                    "DB_CONNECT_SSL_FAILED brand=%s brand_index=%s attempt=%s/%s; retrying without SSL",
+                    brand_name,
+                    brand_index,
+                    attempt,
+                    attempts,
+                )
+                fallback_config = _connector_config_without_ssl(config)
+                try:
+                    cnx = _open_mysql_connection_once(
+                        brand_index, brand_name, fallback_config
+                    )
+                    brand_db_configs[brand_index] = fallback_config
+                    _replace_sqlalchemy_engine_for_brand(
+                        brand_index, brand_name, fallback_config
+                    )
+                    break
+                except mysql.connector.Error as fallback_err:
+                    last_err = fallback_err
+                    _metric_inc("connection_failures_total")
+
+            if attempt >= attempts:
+                break
+
+            delay = sleep_s * (2 ** (attempt - 1)) + random.uniform(0, sleep_s)
+            logger.warning(
+                "DB_CONNECT_RETRY brand=%s brand_index=%s attempt=%s/%s delay=%.2fs error=%s",
+                brand_name,
+                brand_index,
+                attempt,
+                attempts,
+                delay,
+                e,
+            )
+            log_db_connection_metrics("DB_CONNECTION_METRICS_RETRY")
+            time.sleep(delay)
+
+    if cnx is None:
+        raise last_err or mysql.connector.Error(
+            f"Failed opening database connection for brand {brand_index}"
         )
 
     try:
         yield cnx
-    finally:
+    except Exception:
         try:
-            cnx.close()  # returns to pool
+            if cnx.in_transaction:
+                cnx.rollback()
         except Exception:
             pass
+        raise
+    finally:
+        try:
+            try:
+                if cnx.in_transaction:
+                    cnx.rollback()
+            except Exception:
+                pass
+            cnx.close()
+        finally:
+            _metric_dec("active_connector_connections")
+            logger.info(
+                "DB_CONNECTION_CLOSED brand=%s brand_index=%s pipeline=orders_etl job_id=%s thread=%s",
+                brand_name,
+                brand_index,
+                getattr(_db_context, "job_id", None),
+                threading.current_thread().name,
+            )
 
 
 @contextmanager
@@ -1276,6 +1536,13 @@ def get_db_cursor(brand_index: int, dictionary=True):
         cursor = connection.cursor(dictionary=dictionary)
         try:
             yield cursor, connection
+        except Exception:
+            try:
+                if connection.in_transaction:
+                    connection.rollback()
+            except Exception:
+                pass
+            raise
         finally:
             try:
                 cursor.close()
@@ -1794,33 +2061,14 @@ def upsert_returns_fact_from_orders(
     if not orders_list:
         return set()
 
-    close_after = False
     if cursor is None or connection is None:
-        close_after = True
-        (cursor, connection) = next(get_db_cursor(brand_index))
+        with get_db_cursor(brand_index) as (cursor, connection):
+            return upsert_returns_fact_from_orders(
+                brand_index, orders_list, cursor=cursor, connection=connection
+            )
 
     try:
-        # NEW: keep DB connection alive/reconnect (especially during long backfills where
-        # the mysql.connector connection can go idle while Shopify fetch / SQLAlchemy load runs)
-        try:
-            connection.ping(reconnect=True, attempts=3, delay=2)
-        except Exception as e:
-            logger.warning(f"⚠️ returns_fact ping/reconnect failed: {e}")
-
-        try:
-            _ensure_returns_fact(cursor, connection)
-        except mysql.connector.errors.OperationalError as e:
-            if getattr(e, "errno", None) == 2013:
-                logger.warning(
-                    "⚠️ Lost DB connection while ensuring returns_fact; retrying once after reconnect"
-                )
-                try:
-                    connection.ping(reconnect=True, attempts=3, delay=2)
-                except Exception as ee:
-                    logger.warning(f"⚠️ returns_fact reconnect retry failed: {ee}")
-                _ensure_returns_fact(cursor, connection)
-            else:
-                raise
+        _ensure_returns_fact(cursor, connection)
 
         agg: Dict[Tuple[str, str, str], float] = {}
 
@@ -1911,20 +2159,7 @@ def upsert_returns_fact_from_orders(
             VALUES (%s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE amount = VALUES(amount);
         """
-        try:
-            executemany_chunked(cursor, connection, insert_sql, rows)
-        except mysql.connector.errors.OperationalError as e:
-            if getattr(e, "errno", None) == 2013:
-                logger.warning(
-                    "⚠️ Lost DB connection during returns_fact upsert; retrying once after reconnect"
-                )
-                try:
-                    connection.ping(reconnect=True, attempts=3, delay=2)
-                except Exception as ee:
-                    logger.warning(f"⚠️ returns_fact reconnect retry failed: {ee}")
-                executemany_chunked(cursor, connection, insert_sql, rows)
-            else:
-                raise
+        executemany_chunked(cursor, connection, insert_sql, rows)
 
         logger.info(
             f"✅ Upserted {len(rows)} rows into returns_fact ({len(changed_dates)} changed event dates)"
@@ -1932,11 +2167,7 @@ def upsert_returns_fact_from_orders(
         return changed_dates
 
     finally:
-        if close_after:
-            try:
-                cursor.close()
-            except Exception:
-                pass
+        pass
 
 
 # ---------------------------
@@ -2413,17 +2644,19 @@ def upsert_products_sold_units_daily_from_orders(
     if not orders_list:
         return
 
-    close_after = False
     if cursor is None or connection is None:
-        close_after = True
-        (cursor, connection) = next(get_db_cursor(brand_index))
+        with get_db_cursor(brand_index) as (cursor, connection):
+            return upsert_products_sold_units_daily_from_orders(
+                brand_index,
+                orders_list,
+                brand_name,
+                shop_name,
+                access_token,
+                cursor=cursor,
+                connection=connection,
+            )
 
     try:
-        try:
-            connection.ping(reconnect=True, attempts=3, delay=2)
-        except Exception as e:
-            logger.warning(f"⚠️ products_sold_units_daily ping/reconnect failed: {e}")
-
         _ensure_products_sold_units_daily(cursor, connection)
 
         pair_window_qty, product_window_qty = _collect_product_variant_window_units(
@@ -2556,12 +2789,6 @@ def upsert_products_sold_units_daily_from_orders(
             f"❌ [{brand_name}] Error updating products_sold_units_daily: {e}"
         )
         traceback.print_exc()
-    finally:
-        if close_after:
-            try:
-                cursor.close()
-            except Exception:
-                pass
 
 
 # ---------------------------
@@ -5676,19 +5903,23 @@ def update_sessions_summary(
 # ---------------------------
 # Per-brand processing
 # ---------------------------
-def process_single_brand(brand_index: int):
-    if brand_index not in db_connection_pools:
-        logger.error(f"❌ Skipping brand {brand_index}: no connection pool")
+def process_single_brand(brand_index: int, job_id: Optional[str] = None):
+    if brand_index not in brand_db_configs:
+        logger.error(f"❌ Skipping brand {brand_index}: no database config")
         return
+    _db_context.job_id = job_id
     brand_name = os.environ.get(f"BRAND_NAME_{brand_index}", f"Brand_{brand_index}")
     brand_key = os.environ.get(
         f"BRAND_TAG_{brand_index}"
     )  # used for session_adjustment_buckets & alerts
 
     logger.info(f"\n{'=' * 50}\nSTARTING PROCESS FOR SHOP: {brand_name}\n{'=' * 50}")
+    log_db_connection_metrics(f"DB_CONNECTION_METRICS_BRAND_START brand={brand_name}")
 
     if DISCOUNT_DASHBOARD_ONLY_MODE:
         execute_discount_dashboard_backfill_only(brand_index, brand_name)
+        log_db_connection_metrics(f"DB_CONNECTION_METRICS_BRAND_COMPLETE brand={brand_name}")
+        _db_context.job_id = None
         return
 
     shop_name = os.environ.get(f"SHOP_NAME_{brand_index}")
@@ -5984,6 +6215,8 @@ def process_single_brand(brand_index: int):
         traceback.print_exc()
 
     logger.info(f"✅ COMPLETED PROCESSING FOR {brand_name}")
+    log_db_connection_metrics(f"DB_CONNECTION_METRICS_BRAND_COMPLETE brand={brand_name}")
+    _db_context.job_id = None
 
 
 # ---------------------------
@@ -6023,7 +6256,7 @@ def run_data_pipeline():
 
     try:
         if not active_brand_indices:
-            logger.warning("No active brands with valid pools/engines. Nothing to do.")
+            logger.warning("No active brands with valid database configs. Nothing to do.")
             return
 
         # Filter indices if in backfill mode to avoid processing unrelated brands
@@ -6044,7 +6277,7 @@ def run_data_pipeline():
         # heavy (multi-table JOINs, summary rebuilds, session upserts); running
         # all brands at once drives EBSByteBalance% to 0. Override with env
         # MAX_CONCURRENT_BRANDS when scaling up the RDS instance.
-        max_concurrent_brands = int(os.environ.get("MAX_CONCURRENT_BRANDS", "2"))
+        max_concurrent_brands = int(os.environ.get("MAX_CONCURRENT_BRANDS", "3"))
         max_workers = max(1, min(len(target_indices), max_concurrent_brands))
         logger.info(
             f"Processing {len(target_indices)} brands with {max_workers} parallel workers"
@@ -6054,7 +6287,7 @@ def run_data_pipeline():
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             logger.info(f"🚀 Starting {len(target_indices)} brand worker threads...")
             futures = {
-                executor.submit(process_single_brand, i): i for i in target_indices
+                executor.submit(process_single_brand, i, job_id): i for i in target_indices
             }
             for fut in as_completed(futures):
                 idx = futures[fut]
@@ -6065,6 +6298,10 @@ def run_data_pipeline():
                 except Exception as e:
                     logger.error(f"❌ Failed processing brand {name}: {e}")
                     traceback.print_exc()
+                finally:
+                    log_db_connection_metrics(
+                        f"DB_CONNECTION_METRICS_BRAND_FUTURE_DONE brand={name}"
+                    )
 
         logger.info("🏁 All brand worker threads have returned.")
 
@@ -6269,9 +6506,9 @@ if __name__ == "__main__":
         logger.info(f"   - Discount dashboard backfill: ENABLED ({date_label})")
 
     logger.info(
-        f"   - Parallel workers: {min(len(active_brand_indices), max(2, CPU_COUNT // 2))}"
+        f"   - Parallel workers: {min(len(active_brand_indices), int(os.environ.get('MAX_CONCURRENT_BRANDS', '3')))}"
     )
-    logger.info("   - Connection pooling: Enabled (retry on exhaustion)")
+    logger.info("   - Database connections: Lazy short-lived mysql.connector + SQLAlchemy NullPool")
     logger.info("   - Async API fetching: Enabled")
     logger.info("   - Summary updates: INCREMENTAL (only affected dates) 🚀")
     logger.info("   - Manual Trigger API: POST /trigger (port 5000)")
@@ -6282,11 +6519,9 @@ if __name__ == "__main__":
         app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
     except (KeyboardInterrupt, SystemExit):
         logger.info("Shutting down scheduler...")
-        scheduler.shutdown()
-        for i, engine in sqlalchemy_engines.items():
-            try:
-                engine.dispose()
-            except Exception:
-                pass
-        http_session.close()
+        try:
+            scheduler.shutdown()
+        except Exception:
+            pass
+        close_all_database_resources()
         logger.info("✅ Shutdown complete")
