@@ -52,6 +52,7 @@ import pandas as pd
 import numpy as np
 import os
 import json
+import ast
 import time
 import logging
 import re
@@ -222,6 +223,58 @@ DB_RETRY_BASE_DELAY_S = float(os.environ.get("DB_RETRY_BASE_DELAY_S", "0.5"))
 DB_TEST_ON_STARTUP = os.environ.get("DB_TEST_ON_STARTUP", "false").strip().lower() == "true"
 REQUIRE_RDS_PROXY = os.environ.get("REQUIRE_RDS_PROXY", "true").strip().lower() == "true"
 EXPECTED_RDS_PROXY_HOST = os.environ.get("EXPECTED_RDS_PROXY_HOST", "").strip()
+
+
+def _parse_jsonish_string_map(
+    raw_value: str, env_name: str
+) -> Dict[str, str]:
+    raw = (raw_value or "").strip()
+    if not raw:
+        return {}
+
+    parsed: Any = None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        quoted_keys = re.sub(r'([{,]\s*)([A-Za-z0-9_]+)\s*:', r'\1"\2":', raw)
+        try:
+            parsed = json.loads(quoted_keys)
+        except json.JSONDecodeError:
+            try:
+                parsed = ast.literal_eval(quoted_keys)
+            except (ValueError, SyntaxError) as exc:
+                logger.warning(
+                    "Invalid %s value; RTO processing will be skipped: %s",
+                    env_name,
+                    exc,
+                )
+                return {}
+
+    if not isinstance(parsed, dict):
+        logger.warning(
+            "Invalid %s value; expected an object map, got %s. RTO processing will be skipped.",
+            env_name,
+            type(parsed).__name__,
+        )
+        return {}
+
+    normalized: Dict[str, str] = {}
+    for key, value in parsed.items():
+        if key is None or value is None:
+            continue
+
+        key_str = str(key).strip()
+        value_str = str(value).strip()
+        if key_str and value_str:
+            normalized[key_str.lower()] = value_str
+
+    return normalized
+
+
+RTO_MAPPINGS = _parse_jsonish_string_map(
+    os.environ.get("RTO_MAPPINGS", ""),
+    "RTO_MAPPINGS",
+)
 
 _db_metrics_lock = threading.Lock()
 _db_shutdown_lock = threading.Lock()
@@ -2806,6 +2859,28 @@ def _dates_in_clause(dates: Iterable[str]) -> Tuple[str, Tuple[str, ...]]:
     return placeholders, tuple(ordered)
 
 
+def get_rto_tag_for_brand(brand_name: Optional[str]) -> Optional[str]:
+    if not brand_name:
+        return None
+    return RTO_MAPPINGS.get(str(brand_name).strip().lower())
+
+
+def _build_mysql_regex_for_exact_tag(tag_value: str) -> str:
+    escaped_tag = re.escape(tag_value.strip().lower()).replace(r"\ ", " ")
+    return rf"(^|,)[[:space:]]*{escaped_tag}[[:space:]]*(,|$)"
+
+
+def get_rto_affected_dates_updates(orders_list: List[Dict]) -> Set[str]:
+    """Return created_date values for UPDATED orders so tag-only changes can rebuild RTO."""
+    dates: Set[str] = set()
+    for order in orders_list or []:
+        if order.get("created_at"):
+            created_date = _parse_iso_to_ist_date(order["created_at"])
+            if created_date:
+                dates.add(created_date)
+    return dates
+
+
 def get_affected_dates_new_orders(orders_list: List[Dict]) -> Set[str]:
     """Return the set of IST dates whose summaries are affected by NEW orders.
     Summaries for NEW orders depend only on created_date.
@@ -3472,6 +3547,17 @@ def ensure_summary_tables(cursor, connection):
         """)
 
         cursor.execute("""
+            CREATE TABLE IF NOT EXISTS rto_summary (
+                summary_date DATE PRIMARY KEY,
+                total_orders INT NOT NULL DEFAULT 0,
+                rto_orders INT NOT NULL DEFAULT 0,
+                rto_percentage DECIMAL(8,2) NOT NULL DEFAULT 0,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                KEY idx_summary_date (summary_date)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS dashboard_order_discount_fact (
                 order_id VARCHAR(50) NOT NULL,
                 order_name VARCHAR(50),
@@ -3562,7 +3648,13 @@ def ensure_summary_tables(cursor, connection):
 
 
 def merge_staging_to_main_by_date(
-    cursor, connection, table_name, staging_table_name, brand_name, batch_size=5
+    cursor,
+    connection,
+    table_name,
+    staging_table_name,
+    brand_name,
+    batch_size=5,
+    date_column="date",
 ):
     """Merge staging into main using range DELETE + range INSERT per chunk.
 
@@ -3575,7 +3667,9 @@ def merge_staging_to_main_by_date(
         f"🔍 [{brand_name}] Starting staging merge from {staging_table_name} to {table_name}"
     )
 
-    cursor.execute(f"SELECT DISTINCT date FROM {staging_table_name} ORDER BY date")
+    cursor.execute(
+        f"SELECT DISTINCT {date_column} FROM {staging_table_name} ORDER BY {date_column}"
+    )
     rows = cursor.fetchall()
 
     affected_dates = []
@@ -3598,14 +3692,14 @@ def merge_staging_to_main_by_date(
         chunk_params = [str(d) for d in chunk]
 
         cursor.execute(
-            f"DELETE FROM {table_name} WHERE date IN ({placeholders})",
+            f"DELETE FROM {table_name} WHERE {date_column} IN ({placeholders})",
             chunk_params,
         )
         deleted_count = cursor.rowcount
 
         cursor.execute(
             f"INSERT INTO {table_name} "
-            f"SELECT * FROM {staging_table_name} WHERE date IN ({placeholders})",
+            f"SELECT * FROM {staging_table_name} WHERE {date_column} IN ({placeholders})",
             chunk_params,
         )
         inserted_count = cursor.rowcount
@@ -4338,6 +4432,65 @@ def update_overall_summary_incremental(
         )
 
 
+def update_rto_summary_incremental(
+    cursor, connection, brand_name: str, target_dates: Iterable[str]
+):
+    """Update rto_summary for only the specific affected dates."""
+    rto_tag = get_rto_tag_for_brand(brand_name)
+    if not rto_tag:
+        logger.info(
+            f"[{brand_name}] RTO summary skipped: brand not present in RTO_MAPPINGS"
+        )
+        return
+
+    placeholders, params = _dates_in_clause(target_dates)
+    if not params:
+        logger.debug(f"[{brand_name}] rto_summary: no dates to rebuild")
+        return
+
+    regex_pattern = _build_mysql_regex_for_exact_tag(rto_tag)
+
+    with timed(f"[{brand_name}] rto_summary incremental ({len(params)} date(s))"):
+        cursor.execute("CREATE TABLE IF NOT EXISTS rto_summary_stage LIKE rto_summary")
+        cursor.execute("TRUNCATE TABLE rto_summary_stage")
+
+        sql = f"""
+        INSERT INTO rto_summary_stage (
+            summary_date, total_orders, rto_orders, rto_percentage
+        )
+        SELECT
+            summary_date,
+            total_orders,
+            rto_orders,
+            ROUND(COALESCE(rto_orders * 100.0 / NULLIF(total_orders, 0), 0), 2) AS rto_percentage
+        FROM (
+            SELECT
+                STR_TO_DATE(created_date, '%Y-%m-%d') AS summary_date,
+                COUNT(DISTINCT order_id) AS total_orders,
+                COUNT(
+                    DISTINCT CASE
+                        WHEN tags IS NOT NULL AND LOWER(tags) REGEXP %s THEN order_id
+                    END
+                ) AS rto_orders
+            FROM shopify_orders
+            WHERE created_date IN ({placeholders})
+            GROUP BY created_date
+        ) AS rto_daily
+        WHERE summary_date IS NOT NULL
+        """
+        cursor.execute(sql, (regex_pattern, *params))
+        connection.commit()
+
+        merge_staging_to_main_by_date(
+            cursor,
+            connection,
+            "rto_summary",
+            "rto_summary_stage",
+            brand_name,
+            date_column="summary_date",
+        )
+
+
 def update_shopify_orders_utm_daily_incremental(
     cursor, connection, brand_name: str, target_dates: Iterable[str]
 ):
@@ -4600,6 +4753,7 @@ def execute_summary_queries_incremental(
     brand_name: str,
     brand_key: Optional[str],
     target_dates: Iterable[str],
+    rto_target_dates: Optional[Iterable[str]] = None,
 ):
     """Rebuild each summary table for only the dates in target_dates.
 
@@ -4608,16 +4762,21 @@ def execute_summary_queries_incremental(
     only touches those exact dates — not everything in between.
     """
     dates_set = {d for d in target_dates if d}
-    if not dates_set:
+    rto_dates_set = {d for d in (rto_target_dates or []) if d}
+    if not dates_set and not rto_dates_set:
         logger.info(f"✔️ No dates to update summaries for {brand_name}")
         return
 
     ordered = sorted(dates_set)
-    range_label = (
-        f"{len(ordered)} date(s): {ordered[0]}..{ordered[-1]}"
-        if len(ordered) > 1
-        else f"1 date: {ordered[0]}"
-    )
+    rto_ordered = sorted(rto_dates_set)
+    if ordered:
+        range_label = (
+            f"{len(ordered)} date(s): {ordered[0]}..{ordered[-1]}"
+            if len(ordered) > 1
+            else f"1 date: {ordered[0]}"
+        )
+    else:
+        range_label = "0 dates"
 
     try:
         with get_db_cursor(brand_index, dictionary=False) as (cursor, connection):
@@ -4628,28 +4787,43 @@ def execute_summary_queries_incremental(
             ensure_summary_tables(cursor, connection)
 
             # Update each summary incrementally
-            update_sales_summary_incremental(cursor, connection, brand_name, dates_set)
-            update_order_summary_incremental(cursor, connection, brand_name, dates_set)
-            update_discount_summary_incremental(cursor, connection, brand_name, dates_set)
-            update_gross_summary_incremental(cursor, connection, brand_name, dates_set)
-            update_hour_wise_sales_incremental(cursor, connection, brand_name, dates_set)
-            update_dashboard_discount_daily_incremental(
-                cursor, connection, brand_name, dates_set
-            )
-            update_dashboard_discount_hourly_incremental(
-                cursor, connection, brand_name, dates_set
-            )
-            update_dashboard_discount_payment_daily_incremental(
-                cursor, connection, brand_name, dates_set
-            )
-            update_dashboard_discount_payment_hourly_incremental(
-                cursor, connection, brand_name, dates_set
-            )
-            update_overall_summary_incremental(
-                cursor, connection, brand_key, brand_name, dates_set
-            )
-            update_shopify_orders_utm_daily_incremental(
-                cursor, connection, brand_name, dates_set
+            if dates_set:
+                update_sales_summary_incremental(
+                    cursor, connection, brand_name, dates_set
+                )
+                update_order_summary_incremental(
+                    cursor, connection, brand_name, dates_set
+                )
+                update_discount_summary_incremental(
+                    cursor, connection, brand_name, dates_set
+                )
+                update_gross_summary_incremental(
+                    cursor, connection, brand_name, dates_set
+                )
+                update_hour_wise_sales_incremental(
+                    cursor, connection, brand_name, dates_set
+                )
+                update_dashboard_discount_daily_incremental(
+                    cursor, connection, brand_name, dates_set
+                )
+                update_dashboard_discount_hourly_incremental(
+                    cursor, connection, brand_name, dates_set
+                )
+                update_dashboard_discount_payment_daily_incremental(
+                    cursor, connection, brand_name, dates_set
+                )
+                update_dashboard_discount_payment_hourly_incremental(
+                    cursor, connection, brand_name, dates_set
+                )
+                update_overall_summary_incremental(
+                    cursor, connection, brand_key, brand_name, dates_set
+                )
+                update_shopify_orders_utm_daily_incremental(
+                    cursor, connection, brand_name, dates_set
+                )
+
+            update_rto_summary_incremental(
+                cursor, connection, brand_name, rto_dates_set or dates_set
             )
 
             logger.info(
@@ -5972,6 +6146,7 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
 
     # Track affected dates across all order processing (sparse set, not a range)
     affected_dates: Set[str] = set()
+    rto_affected_dates: Set[str] = set()
 
     # Orders (NEW + UPDATED) with single connection/cursor reused
     process_types = [
@@ -6061,6 +6236,8 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
                 new_dates = get_affected_dates_new_orders(filtered)
                 if new_dates:
                     affected_dates.update(new_dates)
+                    if get_rto_tag_for_brand(brand_name):
+                        rto_affected_dates.update(new_dates)
                     logger.info(
                         f"📅 Affected dates for {process['type']}: "
                         f"{len(new_dates)} date(s) ({min(new_dates)}..{max(new_dates)})"
@@ -6103,6 +6280,11 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
                     filtered,
                     extra_event_dates=changed_return_dates,
                 )
+                rto_upd_dates = set()
+                if get_rto_tag_for_brand(brand_name):
+                    rto_upd_dates = get_rto_affected_dates_updates(filtered)
+                    if rto_upd_dates:
+                        rto_affected_dates.update(rto_upd_dates)
                 if upd_dates:
                     affected_dates.update(upd_dates)
                     logger.info(
@@ -6112,6 +6294,11 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
                 else:
                     logger.info(
                         "✔️ UPDATED orders produced no new/changed affected dates"
+                    )
+                if rto_upd_dates:
+                    logger.info(
+                        f"[{brand_name}] RTO affected created_date(s) from UPDATED orders: "
+                        f"{len(rto_upd_dates)} ({min(rto_upd_dates)}..{max(rto_upd_dates)})"
                     )
 
         if DISCOUNT_DASHBOARD_BACKFILL:
@@ -6144,14 +6331,23 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
             logger.info(f"✅ Recorded pipeline completion for {brand_name}")
 
     # Summaries (INCREMENTAL - only affected dates, sparse)
-    if affected_dates:
+    if affected_dates or rto_affected_dates:
         ordered = sorted(affected_dates)
+        rto_ordered = sorted(rto_affected_dates)
         logger.info(
             f"\n--- Updating summaries for {brand_name} "
-            f"(INCREMENTAL: {len(ordered)} date(s), {ordered[0]}..{ordered[-1]}) ---"
+            f"(INCREMENTAL: "
+            f"{len(ordered)} standard date(s)"
+            f"{f', {ordered[0]}..{ordered[-1]}' if ordered else ''}; "
+            f"{len(rto_ordered)} rto date(s)"
+            f"{f', {rto_ordered[0]}..{rto_ordered[-1]}' if rto_ordered else ''}) ---"
         )
         execute_summary_queries_incremental(
-            brand_index, brand_name, brand_key, affected_dates
+            brand_index,
+            brand_name,
+            brand_key,
+            affected_dates,
+            rto_target_dates=rto_affected_dates,
         )
     else:
         logger.info(
