@@ -223,6 +223,9 @@ DB_RETRY_BASE_DELAY_S = float(os.environ.get("DB_RETRY_BASE_DELAY_S", "0.5"))
 DB_TEST_ON_STARTUP = os.environ.get("DB_TEST_ON_STARTUP", "false").strip().lower() == "true"
 REQUIRE_RDS_PROXY = os.environ.get("REQUIRE_RDS_PROXY", "true").strip().lower() == "true"
 EXPECTED_RDS_PROXY_HOST = os.environ.get("EXPECTED_RDS_PROXY_HOST", "").strip()
+RTO_LOOKUP_MONGO = (
+    os.environ.get("RTO_LOOKUP_MONGO", "false").strip().lower() == "true"
+)
 
 
 def _parse_jsonish_string_map(
@@ -280,6 +283,7 @@ _db_metrics_lock = threading.Lock()
 _db_shutdown_lock = threading.Lock()
 _db_shutdown_done = False
 _db_context = threading.local()
+brand_rto_tags_by_index: Dict[int, str] = {}
 _db_connection_metrics: Dict[str, int] = {
     "active_connector_connections": 0,
     "peak_connector_connections": 0,
@@ -1200,6 +1204,7 @@ def initialize_brand_configs():
         brand_idx,
         brand_name,
         brand_tag,
+        rto_tags,
         db_host,
         db_user,
         db_password,
@@ -1259,6 +1264,12 @@ def initialize_brand_configs():
         os.environ[f"DB_DATABASE_{brand_idx}"] = db_name
         os.environ[f"SPEED_KEY_{brand_idx}"] = speed_key
         os.environ[f"APP_ID_MAPPING_{brand_idx}"] = app_map_str
+
+        normalized_rto_tag = _normalize_rto_tag_value(rto_tags)
+        if normalized_rto_tag:
+            brand_rto_tags_by_index[brand_idx] = normalized_rto_tag
+        else:
+            brand_rto_tags_by_index.pop(brand_idx, None)
 
         brand_id_from_config[brand_idx] = (
             brand_idx  # store brand_id from pipelinecreds document
@@ -1343,6 +1354,7 @@ def initialize_brand_configs():
                     brand_idx,
                     brand_name,
                     brand_tag,
+                    os.environ.get(f"RTO_TAGS_{i}"),
                     db_host,
                     db_user,
                     db_password,
@@ -1401,6 +1413,7 @@ def initialize_brand_configs():
                     brand_idx,
                     brand_name,
                     brand_tag,
+                    config.get("rto_tags"),
                     db_host,
                     db_user,
                     db_password,
@@ -2859,10 +2872,62 @@ def _dates_in_clause(dates: Iterable[str]) -> Tuple[str, Tuple[str, ...]]:
     return placeholders, tuple(ordered)
 
 
-def get_rto_tag_for_brand(brand_name: Optional[str]) -> Optional[str]:
-    if not brand_name:
+def _normalize_rto_key(value: Optional[str]) -> str:
+    return str(value or "").strip().lower()
+
+
+def _normalize_rto_tag_value(value: Any) -> Optional[str]:
+    if value is None:
         return None
-    return RTO_MAPPINGS.get(str(brand_name).strip().lower())
+
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            normalized = _normalize_rto_tag_value(item)
+            if normalized:
+                return normalized
+        return None
+
+    tag = str(value).strip()
+    return tag or None
+
+
+def _build_rto_db_database_map() -> Dict[str, str]:
+    resolved: Dict[str, str] = {}
+    candidate_indices = sorted(set(active_brand_indices) | set(brand_db_configs.keys()))
+    for brand_index in candidate_indices:
+        db_name = os.environ.get(f"DB_DATABASE_{brand_index}") or (
+            brand_db_configs.get(brand_index) or {}
+        ).get("database")
+        if not db_name:
+            continue
+
+        mapped_tag: Optional[str] = None
+        if RTO_LOOKUP_MONGO:
+            mapped_tag = brand_rto_tags_by_index.get(brand_index)
+        else:
+            config_brand_name = os.environ.get(f"BRAND_NAME_{brand_index}")
+            if config_brand_name:
+                mapped_tag = RTO_MAPPINGS.get(_normalize_rto_key(config_brand_name))
+
+        if mapped_tag:
+            resolved[_normalize_rto_key(db_name)] = mapped_tag
+
+    return resolved
+
+
+def get_rto_tag_for_brand(brand_index: int, brand_name: Optional[str] = None) -> Optional[str]:
+    db_name = os.environ.get(f"DB_DATABASE_{brand_index}") or (
+        brand_db_configs.get(brand_index) or {}
+    ).get("database")
+    if db_name:
+        mapped_tag = _build_rto_db_database_map().get(_normalize_rto_key(db_name))
+        if mapped_tag:
+            return mapped_tag
+
+    if not RTO_LOOKUP_MONGO and brand_name:
+        return RTO_MAPPINGS.get(_normalize_rto_key(brand_name))
+
+    return None
 
 
 def _build_mysql_regex_for_exact_tag(tag_value: str) -> str:
@@ -4433,10 +4498,10 @@ def update_overall_summary_incremental(
 
 
 def update_rto_summary_incremental(
-    cursor, connection, brand_name: str, target_dates: Iterable[str]
+    cursor, connection, brand_index: int, brand_name: str, target_dates: Iterable[str]
 ):
     """Update rto_summary for only the specific affected dates."""
-    rto_tag = get_rto_tag_for_brand(brand_name)
+    rto_tag = get_rto_tag_for_brand(brand_index, brand_name)
     if not rto_tag:
         logger.info(
             f"[{brand_name}] RTO summary skipped: brand not present in RTO_MAPPINGS"
@@ -4823,7 +4888,7 @@ def execute_summary_queries_incremental(
                 )
 
             update_rto_summary_incremental(
-                cursor, connection, brand_name, rto_dates_set or dates_set
+                cursor, connection, brand_index, brand_name, rto_dates_set or dates_set
             )
 
             logger.info(
@@ -6236,7 +6301,7 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
                 new_dates = get_affected_dates_new_orders(filtered)
                 if new_dates:
                     affected_dates.update(new_dates)
-                    if get_rto_tag_for_brand(brand_name):
+                    if get_rto_tag_for_brand(brand_index, brand_name):
                         rto_affected_dates.update(new_dates)
                     logger.info(
                         f"📅 Affected dates for {process['type']}: "
@@ -6281,7 +6346,7 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
                     extra_event_dates=changed_return_dates,
                 )
                 rto_upd_dates = set()
-                if get_rto_tag_for_brand(brand_name):
+                if get_rto_tag_for_brand(brand_index, brand_name):
                     rto_upd_dates = get_rto_affected_dates_updates(filtered)
                     if rto_upd_dates:
                         rto_affected_dates.update(rto_upd_dates)

@@ -117,7 +117,7 @@ def run_backfill():
     processed_count = 0
     for brand_index in indices_to_process:
         brand_name = os.environ.get(f"BRAND_NAME_{brand_index}", f"Brand_{brand_index}")
-        if not get_rto_tag_for_brand(brand_name):
+        if not get_rto_tag_for_brand(brand_index, brand_name):
             logger.info(f"[{brand_name}] Skipping RTO backfill: brand not present in RTO_MAPPINGS")
             continue
 
@@ -135,6 +135,7 @@ def run_backfill():
                 update_rto_summary_incremental(
                     cursor,
                     connection,
+                    brand_index,
                     brand_name,
                     target_dates,
                 )
