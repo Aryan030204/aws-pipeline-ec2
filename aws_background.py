@@ -183,6 +183,32 @@ def _derive_error_code(exc: Optional[BaseException]) -> str:
 
 # ---- Globals ----
 IST = ZoneInfo("Asia/Kolkata")
+brand_timezones: Dict[int, ZoneInfo] = {}
+
+def parse_store_timezone(tz_str: Optional[str]) -> ZoneInfo:
+    """
+    Parses timezone strings of the form "(GMT+05:30) Asia/Kolkata" or "Asia/Kolkata".
+    Falls back to IST (Asia/Kolkata) if missing or invalid.
+    """
+    if not tz_str:
+        return ZoneInfo("Asia/Kolkata")
+    tz_str = tz_str.strip()
+    if ") " in tz_str:
+        tz_name = tz_str.split(") ", 1)[1].strip()
+    else:
+        tz_name = tz_str
+    try:
+        return ZoneInfo(tz_name)
+    except Exception as e:
+        logger.warning(
+            f"⚠️ Could not load timezone '{tz_name}' from raw value '{tz_str}' (error: {e}). "
+            "Falling back to Asia/Kolkata."
+        )
+        return ZoneInfo("Asia/Kolkata")
+
+def get_brand_timezone(brand_index: int) -> ZoneInfo:
+    return brand_timezones.get(brand_index, ZoneInfo("Asia/Kolkata"))
+
 CPU_COUNT = multiprocessing.cpu_count()
 
 # --- TEST_MODE ---
@@ -1218,11 +1244,14 @@ def initialize_brand_configs():
         ca_path,
         verify_cert,
         verify_identity,
+        store_timezone,
     ):
         logger.info(
             f"🔑 Config for {brand_name} ({'LOCAL' if TEST_MODE else 'API'}): "
             f"host={_trunc(db_host, 12)}, user={_trunc(db_user)}, db={db_name}"
         )
+
+        brand_timezones[brand_idx] = parse_store_timezone(store_timezone)
 
         _validate_rds_proxy_host(db_host, brand_name)
 
@@ -1368,6 +1397,7 @@ def initialize_brand_configs():
                     ca_path,
                     verify_cert,
                     verify_identity,
+                    os.environ.get(f"STORE_TIMEZONE_{i}"),
                 )
             except Exception as e:
                 logger.error(f"❌ Local config error for {idx_str}: {e}")
@@ -1427,6 +1457,7 @@ def initialize_brand_configs():
                     ca_path,
                     verify_cert,
                     verify_identity,
+                    config.get("store_timezone"),
                 )
             except RDSProxyValidationError:
                 raise
@@ -1747,14 +1778,17 @@ def fetch_orders(
 # ---------------------------
 # Transform (optimized; logic preserved)
 # ---------------------------
-def convert_to_desired_format(dt_obj: datetime) -> str:
-    iso_str = dt_obj.strftime("%Y-%m-%dT%H:%M:%S%z")
-    return f"{iso_str[:19]}%2B05:30"
+def convert_to_desired_format(dt_obj: datetime, tz: ZoneInfo) -> str:
+    if dt_obj.tzinfo is None:
+        dt_obj = dt_obj.replace(tzinfo=tz)
+    else:
+        dt_obj = dt_obj.astimezone(tz)
+    iso_str = dt_obj.isoformat()
+    return iso_str[:19] + iso_str[19:].replace("+", "%2B")
 
 
-def convert_to_desired_format_session(dt_obj: datetime) -> str:
-    iso_str = dt_obj.strftime("%Y-%m-%dT%H:%M:%S%z")
-    return f"{iso_str[:19]}%2B05:30"
+def convert_to_desired_format_session(dt_obj: datetime, tz: ZoneInfo) -> str:
+    return convert_to_desired_format(dt_obj, tz)
 
 
 def extract_date_time(
@@ -2106,12 +2140,12 @@ def _ensure_returns_fact(cursor, connection):
     connection.commit()
 
 
-def _parse_iso_to_ist_date(iso_ts: Optional[str]) -> Optional[str]:
+def _parse_iso_to_store_date(iso_ts: Optional[str], tz: ZoneInfo) -> Optional[str]:
     if not iso_ts:
         return None
     try:
         dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
-        return dt.astimezone(IST).date().isoformat()
+        return dt.astimezone(tz).date().isoformat()
     except Exception:
         return None
 
@@ -2135,6 +2169,7 @@ def upsert_returns_fact_from_orders(
 
     try:
         _ensure_returns_fact(cursor, connection)
+        tz = get_brand_timezone(brand_index)
 
         agg: Dict[Tuple[str, str, str], float] = {}
 
@@ -2145,7 +2180,7 @@ def upsert_returns_fact_from_orders(
 
             cancelled_at = o.get("cancelled_at")
             if cancelled_at:
-                d = _parse_iso_to_ist_date(cancelled_at)
+                d = _parse_iso_to_store_date(cancelled_at, tz)
                 if d:
                     amt = float(o.get("total_price") or 0.0)
                     key = (oid, "CANCEL", d)
@@ -2153,7 +2188,7 @@ def upsert_returns_fact_from_orders(
 
             refunds = o.get("refunds") or []
             for rf in refunds:
-                rdate = _parse_iso_to_ist_date(rf.get("created_at"))
+                rdate = _parse_iso_to_store_date(rf.get("created_at"), tz)
                 if not rdate:
                     continue
                 txns = rf.get("transactions") or []
@@ -2252,13 +2287,14 @@ def _classify_payment_mode(payment_gateway_names: Optional[str]) -> str:
     return "prepaid"
 
 
-def _parse_iso_to_ist_date_hour(
+def _parse_iso_to_store_date_hour(
     iso_ts: Optional[str],
+    tz: ZoneInfo,
 ) -> Tuple[Optional[str], Optional[int]]:
     if not iso_ts:
         return None, None
     try:
-        dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00")).astimezone(IST)
+        dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00")).astimezone(tz)
         return dt.date().isoformat(), dt.hour
     except Exception:
         return None, None
@@ -2266,6 +2302,7 @@ def _parse_iso_to_ist_date_hour(
 
 def _normalize_discount_code_rows_from_orders(
     orders_list: List[Dict],
+    tz: ZoneInfo,
 ) -> List[Tuple[Any, ...]]:
     rows: List[Tuple[Any, ...]] = []
     seen: Set[Tuple[str, str]] = set()
@@ -2275,7 +2312,7 @@ def _normalize_discount_code_rows_from_orders(
         if not order_id:
             continue
 
-        created_date, created_hour = _parse_iso_to_ist_date_hour(order.get("created_at"))
+        created_date, created_hour = _parse_iso_to_store_date_hour(order.get("created_at"), tz)
         if not created_date or created_hour is None:
             continue
 
@@ -2329,9 +2366,9 @@ def _normalize_discount_code_rows_from_orders(
 
 
 def upsert_dashboard_order_discount_fact_from_orders(
-    orders_list: List[Dict], cursor, connection, brand_name: str
+    orders_list: List[Dict], cursor, connection, brand_name: str, tz: ZoneInfo
 ) -> Set[str]:
-    rows = _normalize_discount_code_rows_from_orders(orders_list)
+    rows = _normalize_discount_code_rows_from_orders(orders_list, tz)
     if not rows:
         logger.info(f"✔️ [{brand_name}] No discount-code orders to upsert")
         return set()
@@ -2520,6 +2557,7 @@ def _ensure_products_sold_units_daily(cursor, connection):
 
 def _collect_product_variant_window_units(
     orders_list: List[Dict],
+    tz: ZoneInfo,
 ) -> Tuple[Dict[Tuple[int, int], Dict[str, int]], Dict[int, Dict[str, int]]]:
     """
     Build sold-unit deltas from fetched orders (today-inclusive windows).
@@ -2531,10 +2569,10 @@ def _collect_product_variant_window_units(
     pair_window_qty: Dict[Tuple[int, int], Dict[str, int]] = {}
     product_window_qty: Dict[int, Dict[str, int]] = {}
 
-    today_ist = now_ist().date()
+    today_ist = datetime.now(tz).date()
 
     for order in orders_list:
-        created_ist = _parse_iso_to_ist_date(order.get("created_at"))
+        created_ist = _parse_iso_to_store_date(order.get("created_at"), tz)
         if not created_ist:
             continue
 
@@ -2724,9 +2762,10 @@ def upsert_products_sold_units_daily_from_orders(
 
     try:
         _ensure_products_sold_units_daily(cursor, connection)
+        tz = get_brand_timezone(brand_index)
 
         pair_window_qty, product_window_qty = _collect_product_variant_window_units(
-            orders_list
+            orders_list, tz
         )
         if not pair_window_qty:
             logger.info(
@@ -2801,7 +2840,7 @@ def upsert_products_sold_units_daily_from_orders(
 
                 existing_pair_values[(pid, vid)] = {"7d": s7, "30d": s30, "90d": s90}
 
-        now_dt = now_ist().strftime("%Y-%m-%d %H:%M:%S")
+        now_dt = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
         upsert_rows = []
 
         for (pid, vid), delta in pair_window_qty.items():
@@ -2935,25 +2974,25 @@ def _build_mysql_regex_for_exact_tag(tag_value: str) -> str:
     return rf"(^|,)[[:space:]]*{escaped_tag}[[:space:]]*(,|$)"
 
 
-def get_rto_affected_dates_updates(orders_list: List[Dict]) -> Set[str]:
+def get_rto_affected_dates_updates(orders_list: List[Dict], tz: ZoneInfo) -> Set[str]:
     """Return created_date values for UPDATED orders so tag-only changes can rebuild RTO."""
     dates: Set[str] = set()
     for order in orders_list or []:
         if order.get("created_at"):
-            created_date = _parse_iso_to_ist_date(order["created_at"])
+            created_date = _parse_iso_to_store_date(order["created_at"], tz)
             if created_date:
                 dates.add(created_date)
     return dates
 
 
-def get_affected_dates_new_orders(orders_list: List[Dict]) -> Set[str]:
-    """Return the set of IST dates whose summaries are affected by NEW orders.
+def get_affected_dates_new_orders(orders_list: List[Dict], tz: ZoneInfo) -> Set[str]:
+    """Return the set of store dates whose summaries are affected by NEW orders.
     Summaries for NEW orders depend only on created_date.
     """
     dates: Set[str] = set()
     for o in orders_list or []:
         if o.get("created_at"):
-            d = _parse_iso_to_ist_date(o["created_at"])
+            d = _parse_iso_to_store_date(o["created_at"], tz)
             if d:
                 dates.add(d)
     return dates
@@ -2961,9 +3000,10 @@ def get_affected_dates_new_orders(orders_list: List[Dict]) -> Set[str]:
 
 def get_affected_dates_updates(
     orders_list: List[Dict],
+    tz: ZoneInfo,
     extra_event_dates: Optional[Set[str]] = None,
 ) -> Set[str]:
-    """Return the set of IST dates whose summaries are affected by UPDATED orders.
+    """Return the set of store dates whose summaries are affected by UPDATED orders.
 
     Sources:
       - updated_at date for orders that can affect summaries
@@ -2991,7 +3031,7 @@ def get_affected_dates_updates(
 
         # updated_at is the updated_date driver for summary refreshes.
         if o.get("updated_at"):
-            d = _parse_iso_to_ist_date(o["updated_at"])
+            d = _parse_iso_to_store_date(o["updated_at"], tz)
             if d:
                 dates.add(d)
 
@@ -3230,22 +3270,22 @@ def _resolve_mongo_sessions_collection():
 
 
 def _ist_date_range_to_utc_bounds(
-    start_date: date, end_date: date
+    start_date: date, end_date: date, tz: ZoneInfo = IST
 ) -> Tuple[datetime, datetime]:
-    start_ist = datetime.combine(start_date, datetime.min.time(), tzinfo=IST)
-    end_ist_exclusive = datetime.combine(
-        end_date + timedelta(days=1), datetime.min.time(), tzinfo=IST
+    start_tz = datetime.combine(start_date, datetime.min.time(), tzinfo=tz)
+    end_tz_exclusive = datetime.combine(
+        end_date + timedelta(days=1), datetime.min.time(), tzinfo=tz
     )
     return (
-        start_ist.astimezone(timezone.utc),
-        end_ist_exclusive.astimezone(timezone.utc),
+        start_tz.astimezone(timezone.utc),
+        end_tz_exclusive.astimezone(timezone.utc),
     )
 
 
 def fetch_checkout_initiated_hourly_counts_from_mongo(
-    start_date: date, end_date: date
+    start_date: date, end_date: date, tz: ZoneInfo = IST
 ) -> List[Dict[str, Any]]:
-    start_utc, end_utc = _ist_date_range_to_utc_bounds(start_date, end_date)
+    start_utc, end_utc = _ist_date_range_to_utc_bounds(start_date, end_date, tz)
     client = None
     try:
         client, collection = _resolve_mongo_sessions_collection()
@@ -3265,8 +3305,8 @@ def fetch_checkout_initiated_hourly_counts_from_mongo(
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=timezone.utc)
 
-            created_at_ist = created_at.astimezone(IST)
-            bucket_key = (created_at_ist.date(), created_at_ist.hour)
+            created_at_store = created_at.astimezone(tz)
+            bucket_key = (created_at_store.date(), created_at_store.hour)
             counts[bucket_key] = counts.get(bucket_key, 0) + 1
 
         return [
@@ -3328,8 +3368,9 @@ def sync_checkout_initiated_ci_events(
         )
         return
 
+    tz = get_brand_timezone(brand_index)
     try:
-        results = fetch_checkout_initiated_hourly_counts_from_mongo(start_date, end_date)
+        results = fetch_checkout_initiated_hourly_counts_from_mongo(start_date, end_date, tz)
     except Exception as e:
         logger.error(
             f"❌ Error fetching checkout-initiated Mongo events for {brand_name}: {e}"
@@ -5227,6 +5268,7 @@ def fetch_shopify_hourly_sessions_via_shopifyql(
     shop_name: str,
     api_version: str,
     access_token: str,
+    tz: ZoneInfo = IST,
     start_date: str = None,  # YYYY-MM-DD
     end_date: str = None,  # YYYY-MM-DD
 ) -> List[Dict[str, Any]]:
@@ -5345,9 +5387,9 @@ def fetch_shopify_hourly_sessions_via_shopifyql(
             try:
                 if "T" in str(h_val):
                     dt_utc = datetime.fromisoformat(str(h_val).replace("Z", "+00:00"))
-                    dt_ist = dt_utc.astimezone(IST)
-                    d_dt = dt_ist.date().isoformat()
-                    h_int = dt_ist.hour
+                    dt_store = dt_utc.astimezone(tz)
+                    d_dt = dt_store.date().isoformat()
+                    h_int = dt_store.hour
                 else:
                     d_dt = str(row.get("day"))
                     h_int = int(h_val)
@@ -5407,24 +5449,26 @@ def update_hourly_sessions_summary_from_shopifyql(
     shop_name: str,
     api_version: str,
     access_token: str,
+    tz: ZoneInfo,
     cursor=None,
     connection=None,
 ):
     """
     Update hourly_sessions_summary_shopify from ShopifyQL.
     """
-    today_dt = now_ist().date()
+    today_dt = datetime.now(tz).date()
     start_dt = today_dt - timedelta(days=1)
     end_dt = today_dt
 
     if is_backfill_active_for(brand_index) and BACKFILL_START_IST and BACKFILL_END_IST:
-        start_dt = BACKFILL_START_IST.date()
-        end_dt = BACKFILL_END_IST.date()
+        start_dt = BACKFILL_START_IST.astimezone(tz).date()
+        end_dt = BACKFILL_END_IST.astimezone(tz).date()
 
     results = fetch_shopify_hourly_sessions_via_shopifyql(
         shop_name=shop_name,
         api_version=api_version,
         access_token=access_token,
+        tz=tz,
         start_date=start_dt.isoformat(),
         end_date=end_dt.isoformat(),
     )
@@ -5551,20 +5595,21 @@ def update_sessions_summary_from_shopifyql(
     shop_name: str,
     api_version: str,
     access_token: str,
+    tz: ZoneInfo,
     cursor=None,
     connection=None,
 ):
     """
     Use ShopifyQL to update the daily sessions_summary table.
     """
-    today_dt = now_ist().date()
+    today_dt = datetime.now(tz).date()
     start_dt = today_dt - timedelta(days=2)  # default lookback
     end_dt = today_dt
 
     # 1. Determine dates
     if is_backfill_active_for(brand_index) and BACKFILL_START_IST and BACKFILL_END_IST:
-        start_dt = BACKFILL_START_IST.date()
-        end_dt = BACKFILL_END_IST.date()
+        start_dt = BACKFILL_START_IST.astimezone(tz).date()
+        end_dt = BACKFILL_END_IST.astimezone(tz).date()
         logger.info(f"📆 Sessions Backfill Mode: {start_dt} -> {end_dt}")
     else:
         # Try to find the last date in DB to optimize
@@ -6055,6 +6100,7 @@ def update_sessions_summary(
     shop_name: str,
     api_version: str,
     access_token: str,
+    tz: ZoneInfo,
 ):
     """
     Mixed mode:
@@ -6095,6 +6141,7 @@ def update_sessions_summary(
                 shop_name=shop_name,
                 api_version=api_version,
                 access_token=access_token,
+                tz=tz,
                 cursor=cursor,
                 connection=connection,
             )
@@ -6105,15 +6152,16 @@ def update_sessions_summary(
                 shop_name=shop_name,
                 api_version=api_version,
                 access_token=access_token,
+                tz=tz,
                 cursor=cursor,
                 connection=connection,
             )
 
-            ci_start_dt = now_ist().date() - timedelta(days=1)
-            ci_end_dt = now_ist().date()
+            ci_start_dt = datetime.now(tz).date() - timedelta(days=1)
+            ci_end_dt = datetime.now(tz).date()
             if is_backfill_active_for(brand_index) and BACKFILL_START_IST and BACKFILL_END_IST:
-                ci_start_dt = BACKFILL_START_IST.date()
-                ci_end_dt = BACKFILL_END_IST.date()
+                ci_start_dt = BACKFILL_START_IST.astimezone(tz).date()
+                ci_end_dt = BACKFILL_END_IST.astimezone(tz).date()
 
             sync_checkout_initiated_ci_events(
                 brand_index=brand_index,
@@ -6125,11 +6173,11 @@ def update_sessions_summary(
                 connection=connection,
             )
 
-            update_last_fetch_timestamp(cursor, connection, now_ist())
+            update_last_fetch_timestamp(cursor, connection, datetime.now(tz))
             logger.info(f"✅ Sessions updated via ShopifyQL for {brand_name}")
 
             # --- SYNC: Ensure hour_wise_sales picks up these latest sessions ---
-            today_str = now_ist().date().isoformat()
+            today_str = datetime.now(tz).date().isoformat()
             update_hour_wise_sales_incremental(
                 cursor, connection, brand_name, {today_str}
             )
@@ -6161,6 +6209,7 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
         _db_context.job_id = None
         return
 
+    tz = get_brand_timezone(brand_index)
     shop_name = os.environ.get(f"SHOP_NAME_{brand_index}")
     api_version = os.environ.get(f"API_VERSION_{brand_index}")
     access_token = os.environ.get(f"ACCESS_TOKEN_{brand_index}")
@@ -6207,6 +6256,7 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
         shop_name,
         api_version,
         access_token,
+        tz,
     )
 
     # Track affected dates across all order processing (sparse set, not a range)
@@ -6238,8 +6288,8 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
                 # Use provided IST window exactly
                 start_dt = BACKFILL_START_IST
                 end_dt = BACKFILL_END_IST
-                start_date = convert_to_desired_format(start_dt)
-                end_date = convert_to_desired_format(end_dt)
+                start_date = convert_to_desired_format(start_dt, tz)
+                end_date = convert_to_desired_format(end_dt, tz)
                 logger.info(
                     f"🔁 BACKFILL MODE: {process['type']} from {start_dt} to {end_dt} (IST)"
                 )
@@ -6252,8 +6302,8 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
                 last_ts = last_order[timestamp_col]
                 # Add 1 second to avoid re-fetching the last order (API is inclusive)
                 next_ts = last_ts + timedelta(seconds=1)
-                start_date = convert_to_desired_format(next_ts)
-                end_date = convert_to_desired_format(now_ist())
+                start_date = convert_to_desired_format(next_ts, tz)
+                end_date = convert_to_desired_format(datetime.now(tz), tz)
                 logger.info(f"Fetching orders after: {last_ts} (API start: {next_ts})")
 
                 # Still check for duplicates at last_ts in case of sub-second precision loss
@@ -6298,7 +6348,7 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
 
             # Track affected dates for NEW orders before load
             if process["type"] == "NEW":
-                new_dates = get_affected_dates_new_orders(filtered)
+                new_dates = get_affected_dates_new_orders(filtered, tz)
                 if new_dates:
                     affected_dates.update(new_dates)
                     if get_rto_tag_for_brand(brand_index, brand_name):
@@ -6318,7 +6368,7 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
 
             if process["type"] == "NEW":
                 discount_fact_dates = upsert_dashboard_order_discount_fact_from_orders(
-                    filtered, cursor, connection, brand_name
+                    filtered, cursor, connection, brand_name, tz
                 )
                 if discount_fact_dates:
                     affected_dates.update(discount_fact_dates)
@@ -6343,11 +6393,12 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
             if process["type"] == "UPDATED":
                 upd_dates = get_affected_dates_updates(
                     filtered,
+                    tz,
                     extra_event_dates=changed_return_dates,
                 )
                 rto_upd_dates = set()
                 if get_rto_tag_for_brand(brand_index, brand_name):
-                    rto_upd_dates = get_rto_affected_dates_updates(filtered)
+                    rto_upd_dates = get_rto_affected_dates_updates(filtered, tz)
                     if rto_upd_dates:
                         rto_affected_dates.update(rto_upd_dates)
                 if upd_dates:
