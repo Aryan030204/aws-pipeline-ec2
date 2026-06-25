@@ -4,6 +4,7 @@ Standalone script to backfill citywise session source tables and summaries.
 Usage:
     python "backfill scripts/backfill_citywise_summary.py" --start-date 2026-06-01 --end-date 2026-06-07
     python "backfill scripts/backfill_citywise_summary.py" --start-date 2026-06-01 --end-date 2026-06-07 --brand-index 0
+    python "backfill scripts/backfill_citywise_summary.py"
 """
 
 import argparse
@@ -46,6 +47,13 @@ def _parse_date(raw: str):
     return datetime.strptime(raw, "%Y-%m-%d").date()
 
 
+def _parse_env_date(raw: str):
+    if not raw:
+        return None
+    date_str = raw.split(" ")[0].split("T")[0]
+    return datetime.strptime(date_str, "%Y-%m-%d").date()
+
+
 def _date_range_iso_set(start_date, end_date):
     current = start_date
     values = set()
@@ -55,15 +63,16 @@ def _date_range_iso_set(start_date, end_date):
     return values
 
 
-def run_backfill(start_date, end_date, target_brand_index=None):
+def run_backfill(start_date, end_date, target_brand_indices=None):
     initialize_brand_configs()
     if not active_brand_indices:
         logger.warning("No active brands found based on current configuration.")
         return
 
     indices_to_process = active_brand_indices
-    if target_brand_index is not None:
-        indices_to_process = [i for i in active_brand_indices if i == target_brand_index]
+    if target_brand_indices:
+        target_brand_indices = set(target_brand_indices)
+        indices_to_process = [i for i in active_brand_indices if i in target_brand_indices]
 
     if not indices_to_process:
         logger.warning("No matching brands to process after filtering.")
@@ -146,17 +155,44 @@ def run_backfill(start_date, end_date, target_brand_index=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Backfill citywise summary tables")
-    parser.add_argument("--start-date", required=True, help="Start date in YYYY-MM-DD format")
-    parser.add_argument("--end-date", required=True, help="End date in YYYY-MM-DD format")
+    parser.add_argument("--start-date", help="Start date in YYYY-MM-DD format")
+    parser.add_argument("--end-date", help="End date in YYYY-MM-DD format")
     parser.add_argument("--brand-index", type=int, help="Optional brand index")
     args = parser.parse_args()
 
-    start_date = _parse_date(args.start_date)
-    end_date = _parse_date(args.end_date)
+    backfill_mode = os.getenv("BACKFILL_MODE", "false").strip().lower() == "true"
+
+    if args.start_date or args.end_date:
+        if not (args.start_date and args.end_date):
+            raise ValueError("Both --start-date and --end-date are required together")
+        start_date = _parse_date(args.start_date)
+        end_date = _parse_date(args.end_date)
+    else:
+        if not backfill_mode:
+            raise ValueError(
+                "Provide --start-date/--end-date or enable BACKFILL_MODE with BACKFILL_START_IST and BACKFILL_END_IST"
+            )
+
+        start_date = _parse_env_date(os.getenv("BACKFILL_START_IST", ""))
+        end_date = _parse_env_date(os.getenv("BACKFILL_END_IST", ""))
+        if not start_date or not end_date:
+            raise ValueError(
+                "BACKFILL_START_IST and BACKFILL_END_IST must be set when using env-driven backfill"
+            )
+
+    env_brand_indices = os.getenv("BACKFILL_BRAND_INDICES", "").strip()
+    target_brand_indices = None
+    if args.brand_index is not None:
+        target_brand_indices = [args.brand_index]
+    elif env_brand_indices:
+        target_brand_indices = [
+            int(v.strip()) for v in env_brand_indices.split(",") if v.strip()
+        ]
+
     if start_date > end_date:
         raise ValueError("--start-date cannot be after --end-date")
 
-    run_backfill(start_date, end_date, target_brand_index=args.brand_index)
+    run_backfill(start_date, end_date, target_brand_indices=target_brand_indices)
 
 
 if __name__ == "__main__":
