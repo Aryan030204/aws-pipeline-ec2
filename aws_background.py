@@ -2287,6 +2287,29 @@ def _classify_payment_mode(payment_gateway_names: Optional[str]) -> str:
     return "prepaid"
 
 
+def _normalize_city_name(raw_city: Optional[str]) -> str:
+    city = (raw_city or "").strip().lower()
+    return city or "Unknown"
+
+
+def _normalized_city_sql_expr(column_name: str) -> str:
+    return (
+        f"CASE "
+        f"WHEN {column_name} IS NULL OR TRIM({column_name}) = '' THEN 'Unknown' "
+        f"ELSE LOWER(TRIM({column_name})) "
+        f"END"
+    )
+
+
+def _date_range_iso_set(start_date: date, end_date: date) -> Set[str]:
+    current = start_date
+    values: Set[str] = set()
+    while current <= end_date:
+        values.add(current.isoformat())
+        current += timedelta(days=1)
+    return values
+
+
 def _parse_iso_to_store_date_hour(
     iso_ts: Optional[str],
     tz: ZoneInfo,
@@ -3635,6 +3658,62 @@ def ensure_summary_tables(cursor, connection):
         """)
 
         cursor.execute("""
+            CREATE TABLE IF NOT EXISTS daily_city_sessions_summary_shopify (
+                date DATE NOT NULL,
+                city VARCHAR(100) NOT NULL,
+                sessions INT DEFAULT 0,
+                atc_sessions INT DEFAULT 0,
+                PRIMARY KEY (date, city),
+                KEY idx_date (date)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hourly_city_sessions_summary_shopify (
+                date DATE NOT NULL,
+                hour TINYINT UNSIGNED NOT NULL,
+                city VARCHAR(100) NOT NULL,
+                sessions INT DEFAULT 0,
+                atc_sessions INT DEFAULT 0,
+                PRIMARY KEY (date, hour, city),
+                KEY idx_date (date),
+                KEY idx_date_hour (date, hour)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS daily_citywise_summary (
+                date DATE NOT NULL,
+                city VARCHAR(100) NOT NULL,
+                total_orders INT DEFAULT 0,
+                cod_orders INT DEFAULT 0,
+                prepaid_orders INT DEFAULT 0,
+                partially_paid_orders INT DEFAULT 0,
+                sessions INT DEFAULT 0,
+                atc_sessions INT DEFAULT 0,
+                PRIMARY KEY (date, city),
+                KEY idx_date (date)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hourly_citywise_summary (
+                date DATE NOT NULL,
+                hour TINYINT UNSIGNED NOT NULL,
+                city VARCHAR(100) NOT NULL,
+                total_orders INT DEFAULT 0,
+                cod_orders INT DEFAULT 0,
+                prepaid_orders INT DEFAULT 0,
+                partially_paid_orders INT DEFAULT 0,
+                sessions INT DEFAULT 0,
+                atc_sessions INT DEFAULT 0,
+                PRIMARY KEY (date, hour, city),
+                KEY idx_date (date),
+                KEY idx_date_hour (date, hour)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS overall_summary (
                 date DATE PRIMARY KEY,
                 gross_sales DECIMAL(12,2) DEFAULT 0,
@@ -4269,6 +4348,190 @@ def update_hour_wise_sales_incremental(
         # STEP 4 & 5: Fetch affected dates and merge
         merge_staging_to_main_by_date(
             cursor, connection, "hour_wise_sales", "hour_wise_sales_stage", brand_name
+        )
+
+
+def update_daily_citywise_summary_incremental(
+    cursor, connection, brand_name: str, target_dates: Iterable[str]
+):
+    """Update daily_citywise_summary for only the specific affected dates."""
+    placeholders, params = _dates_in_clause(target_dates)
+    if not params:
+        logger.debug(f"[{brand_name}] daily_citywise_summary: no dates to rebuild")
+        return
+
+    city_expr = _normalized_city_sql_expr("shipping_city")
+    with timed(
+        f"[{brand_name}] daily_citywise_summary incremental ({len(params)} date(s))"
+    ):
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS daily_citywise_summary_stage LIKE daily_citywise_summary"
+        )
+        cursor.execute("TRUNCATE TABLE daily_citywise_summary_stage")
+
+        sql = f"""
+        INSERT INTO daily_citywise_summary_stage (
+            date, city, total_orders, cod_orders, prepaid_orders, partially_paid_orders,
+            sessions, atc_sessions
+        )
+        WITH OrderAgg AS (
+            SELECT
+                STR_TO_DATE(created_date, '%Y-%m-%d') AS date,
+                {city_expr} AS city,
+                COUNT(DISTINCT order_id) AS total_orders,
+                COUNT(DISTINCT CASE
+                    WHEN (payment_gateway_names IS NULL
+                      OR payment_gateway_names = ''
+                      OR payment_gateway_names LIKE '%Cash on Delivery (COD)%'
+                      OR payment_gateway_names LIKE '%cash_on_delivery%')
+                      AND (payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR payment_gateway_names IS NULL)
+                    THEN order_id END) AS cod_orders,
+                COUNT(DISTINCT CASE
+                    WHEN payment_gateway_names IS NOT NULL
+                      AND payment_gateway_names != ''
+                      AND NOT (payment_gateway_names LIKE '%Cash on Delivery (COD)%'
+                          OR payment_gateway_names LIKE '%cash_on_delivery%'
+                          OR payment_gateway_names LIKE '%Gokwik PPCOD%')
+                    THEN order_id END) AS prepaid_orders,
+                COUNT(DISTINCT CASE
+                    WHEN payment_gateway_names LIKE '%Gokwik PPCOD%'
+                    THEN order_id END) AS partially_paid_orders
+            FROM shopify_orders
+            WHERE created_date IN ({placeholders})
+            GROUP BY created_date, city
+        ),
+        SessionAgg AS (
+            SELECT
+                date,
+                city,
+                SUM(sessions) AS sessions,
+                SUM(atc_sessions) AS atc_sessions
+            FROM daily_city_sessions_summary_shopify
+            WHERE date IN ({placeholders})
+            GROUP BY date, city
+        ),
+        AllKeys AS (
+            SELECT date, city FROM OrderAgg
+            UNION
+            SELECT date, city FROM SessionAgg
+        )
+        SELECT
+            ak.date,
+            ak.city,
+            COALESCE(oa.total_orders, 0) AS total_orders,
+            COALESCE(oa.cod_orders, 0) AS cod_orders,
+            COALESCE(oa.prepaid_orders, 0) AS prepaid_orders,
+            COALESCE(oa.partially_paid_orders, 0) AS partially_paid_orders,
+            COALESCE(sa.sessions, 0) AS sessions,
+            COALESCE(sa.atc_sessions, 0) AS atc_sessions
+        FROM AllKeys ak
+        LEFT JOIN OrderAgg oa ON ak.date = oa.date AND ak.city = oa.city
+        LEFT JOIN SessionAgg sa ON ak.date = sa.date AND ak.city = sa.city
+        """
+        cursor.execute(sql, params + params)
+        connection.commit()
+
+        merge_staging_to_main_by_date(
+            cursor,
+            connection,
+            "daily_citywise_summary",
+            "daily_citywise_summary_stage",
+            brand_name,
+        )
+
+
+def update_hourly_citywise_summary_incremental(
+    cursor, connection, brand_name: str, target_dates: Iterable[str]
+):
+    """Update hourly_citywise_summary for only the specific affected dates."""
+    placeholders, params = _dates_in_clause(target_dates)
+    if not params:
+        logger.debug(f"[{brand_name}] hourly_citywise_summary: no dates to rebuild")
+        return
+
+    city_expr = _normalized_city_sql_expr("shipping_city")
+    with timed(
+        f"[{brand_name}] hourly_citywise_summary incremental ({len(params)} date(s))"
+    ):
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS hourly_citywise_summary_stage LIKE hourly_citywise_summary"
+        )
+        cursor.execute("TRUNCATE TABLE hourly_citywise_summary_stage")
+
+        sql = f"""
+        INSERT INTO hourly_citywise_summary_stage (
+            date, hour, city, total_orders, cod_orders, prepaid_orders, partially_paid_orders,
+            sessions, atc_sessions
+        )
+        WITH OrderAgg AS (
+            SELECT
+                STR_TO_DATE(created_date, '%Y-%m-%d') AS date,
+                HOUR(created_time) AS hour,
+                {city_expr} AS city,
+                COUNT(DISTINCT order_id) AS total_orders,
+                COUNT(DISTINCT CASE
+                    WHEN (payment_gateway_names IS NULL
+                      OR payment_gateway_names = ''
+                      OR payment_gateway_names LIKE '%Cash on Delivery (COD)%'
+                      OR payment_gateway_names LIKE '%cash_on_delivery%')
+                      AND (payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR payment_gateway_names IS NULL)
+                    THEN order_id END) AS cod_orders,
+                COUNT(DISTINCT CASE
+                    WHEN payment_gateway_names IS NOT NULL
+                      AND payment_gateway_names != ''
+                      AND NOT (payment_gateway_names LIKE '%Cash on Delivery (COD)%'
+                          OR payment_gateway_names LIKE '%cash_on_delivery%'
+                          OR payment_gateway_names LIKE '%Gokwik PPCOD%')
+                    THEN order_id END) AS prepaid_orders,
+                COUNT(DISTINCT CASE
+                    WHEN payment_gateway_names LIKE '%Gokwik PPCOD%'
+                    THEN order_id END) AS partially_paid_orders
+            FROM shopify_orders
+            WHERE created_date IN ({placeholders})
+              AND created_time IS NOT NULL
+            GROUP BY created_date, hour, city
+        ),
+        SessionAgg AS (
+            SELECT
+                date,
+                hour,
+                city,
+                SUM(sessions) AS sessions,
+                SUM(atc_sessions) AS atc_sessions
+            FROM hourly_city_sessions_summary_shopify
+            WHERE date IN ({placeholders})
+            GROUP BY date, hour, city
+        ),
+        AllKeys AS (
+            SELECT date, hour, city FROM OrderAgg
+            UNION
+            SELECT date, hour, city FROM SessionAgg
+        )
+        SELECT
+            ak.date,
+            ak.hour,
+            ak.city,
+            COALESCE(oa.total_orders, 0) AS total_orders,
+            COALESCE(oa.cod_orders, 0) AS cod_orders,
+            COALESCE(oa.prepaid_orders, 0) AS prepaid_orders,
+            COALESCE(oa.partially_paid_orders, 0) AS partially_paid_orders,
+            COALESCE(sa.sessions, 0) AS sessions,
+            COALESCE(sa.atc_sessions, 0) AS atc_sessions
+        FROM AllKeys ak
+        LEFT JOIN OrderAgg oa
+            ON ak.date = oa.date AND ak.hour = oa.hour AND ak.city = oa.city
+        LEFT JOIN SessionAgg sa
+            ON ak.date = sa.date AND ak.hour = sa.hour AND ak.city = sa.city
+        """
+        cursor.execute(sql, params + params)
+        connection.commit()
+
+        merge_staging_to_main_by_date(
+            cursor,
+            connection,
+            "hourly_citywise_summary",
+            "hourly_citywise_summary_stage",
+            brand_name,
         )
 
 
@@ -4909,6 +5172,12 @@ def execute_summary_queries_incremental(
                 update_hour_wise_sales_incremental(
                     cursor, connection, brand_name, dates_set
                 )
+                update_daily_citywise_summary_incremental(
+                    cursor, connection, brand_name, dates_set
+                )
+                update_hourly_citywise_summary_incremental(
+                    cursor, connection, brand_name, dates_set
+                )
                 update_dashboard_discount_daily_incremental(
                     cursor, connection, brand_name, dates_set
                 )
@@ -5443,6 +5712,300 @@ def fetch_shopify_hourly_sessions_via_shopifyql(
             pass
 
 
+def fetch_shopify_daily_city_sessions_via_shopifyql(
+    shop_name: str,
+    api_version: str,
+    access_token: str,
+    start_date: str = None,
+    end_date: str = None,
+) -> List[Dict[str, Any]]:
+    """Fetch daily city sessions from ShopifyQL."""
+    if not shop_name or not access_token:
+        logger.warning(
+            "ShopifyQL daily city sessions fetch skipped: missing credentials"
+        )
+        return []
+
+    if start_date and end_date:
+        next_day = (
+            datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+        ).strftime("%Y-%m-%d")
+        date_clause = f"SINCE {start_date} UNTIL {next_day}"
+    else:
+        date_clause = "DURING today"
+
+    shopify_ql = f"""
+    FROM sessions
+      SHOW sessions, sessions_with_cart_additions, day, session_city
+      WHERE session_country IS NOT NULL
+        AND human_or_bot_session IN ('human', 'bot')
+      GROUP BY day, session_city
+      {date_clause}
+      ORDER BY day ASC, sessions DESC
+      LIMIT 10000
+    VISUALIZE sessions, sessions_with_cart_additions TYPE list_with_dimension_values
+    """
+
+    ql_flat = shopify_ql.replace("\n", " ").strip().replace('"', '\\"')
+    graphql_query = f'''
+    query {{
+      shopifyqlQuery(query: "{ql_flat}") {{
+        tableData {{
+          rows
+          columns {{
+            name
+            dataType
+            displayName
+          }}
+        }}
+        parseErrors
+      }}
+    }}
+    '''
+
+    payload = {"query": graphql_query}
+    shopifyql_api_version = "2025-10"
+    url = f"https://{shop_name}.myshopify.com/admin/api/{shopifyql_api_version}/graphql.json"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": access_token,
+    }
+
+    session = _make_shopifyql_session()
+    try:
+        resp = None
+        for attempt in range(1, 4):
+            try:
+                with timed(
+                    f"ShopifyQL daily city sessions fetch ({date_clause}) [attempt {attempt}/3]"
+                ):
+                    resp = session.post(
+                        url, headers=headers, data=json.dumps(payload), timeout=60
+                    )
+                break
+            except Exception as e:
+                logger.warning(f"⚠️ Attempt {attempt}/3 failed: {e}")
+                try:
+                    session.close()
+                except Exception:
+                    pass
+                session = _make_shopifyql_session()
+                time.sleep(2**attempt)
+
+        if not resp or resp.status_code != 200:
+            logger.error(
+                f"❌ ShopifyQL daily city sessions failed: {resp.status_code if resp else 'No response'}"
+            )
+            return []
+
+        body = resp.json()
+        if body.get("errors"):
+            logger.error(f"❌ GraphQL errors: {json.dumps(body['errors'])}")
+            return []
+
+        ql_result = body.get("data", {}).get("shopifyqlQuery", {})
+        if ql_result.get("parseErrors"):
+            logger.error(f"❌ Parse errors: {ql_result['parseErrors']}")
+            return []
+
+        table_data = ql_result.get("tableData")
+        if not table_data:
+            return []
+
+        rows = _format_shopifyql_table(table_data)
+        if not rows:
+            return []
+
+        aggregated: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for row in rows:
+            d_val = row.get("day")
+            if not d_val:
+                continue
+
+            city = _normalize_city_name(row.get("session_city"))
+            key = (str(d_val), city)
+            if key not in aggregated:
+                aggregated[key] = {
+                    "date": str(d_val),
+                    "city": city,
+                    "sessions": 0,
+                    "atc_sessions": 0,
+                }
+
+            aggregated[key]["sessions"] += int(row.get("sessions") or 0)
+            aggregated[key]["atc_sessions"] += int(
+                row.get("sessions_with_cart_additions") or 0
+            )
+
+        results = list(aggregated.values())
+        logger.info(
+            f"✅ ShopifyQL daily city sessions received {len(rows)} raw rows, aggregated into {len(results)} records"
+        )
+        return results
+    except Exception as e:
+        logger.error(f"❌ ShopifyQL daily city sessions exception: {e}")
+        return []
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
+def fetch_shopify_hourly_city_sessions_via_shopifyql(
+    shop_name: str,
+    api_version: str,
+    access_token: str,
+    tz: ZoneInfo = IST,
+    start_date: str = None,
+    end_date: str = None,
+) -> List[Dict[str, Any]]:
+    """Fetch hourly city sessions from ShopifyQL."""
+    if not shop_name or not access_token:
+        logger.warning(
+            "ShopifyQL hourly city sessions fetch skipped: missing credentials"
+        )
+        return []
+
+    if start_date and end_date:
+        next_day = (
+            datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+        ).strftime("%Y-%m-%d")
+        date_clause = f"SINCE {start_date} UNTIL {next_day}"
+    else:
+        date_clause = "DURING today"
+
+    shopify_ql = f"""
+    FROM sessions
+      SHOW sessions, sessions_with_cart_additions, hour, day, session_city
+      WHERE session_country IS NOT NULL
+        AND human_or_bot_session IN ('human', 'bot')
+      GROUP BY day, hour, session_city
+      {date_clause}
+      ORDER BY day ASC, hour ASC, sessions DESC
+      LIMIT 10000
+    VISUALIZE sessions, sessions_with_cart_additions TYPE list_with_dimension_values
+    """
+
+    ql_flat = shopify_ql.replace("\n", " ").strip().replace('"', '\\"')
+    graphql_query = f'''
+    query {{
+      shopifyqlQuery(query: "{ql_flat}") {{
+        tableData {{
+          rows
+          columns {{
+            name
+            dataType
+            displayName
+          }}
+        }}
+        parseErrors
+      }}
+    }}
+    '''
+
+    payload = {"query": graphql_query}
+    shopifyql_api_version = "2025-10"
+    url = f"https://{shop_name}.myshopify.com/admin/api/{shopifyql_api_version}/graphql.json"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": access_token,
+    }
+
+    session = _make_shopifyql_session()
+    try:
+        resp = None
+        for attempt in range(1, 4):
+            try:
+                with timed(
+                    f"ShopifyQL hourly city sessions fetch ({date_clause}) [attempt {attempt}/3]"
+                ):
+                    resp = session.post(
+                        url, headers=headers, data=json.dumps(payload), timeout=60
+                    )
+                break
+            except Exception as e:
+                logger.warning(f"⚠️ Attempt {attempt}/3 failed: {e}")
+                try:
+                    session.close()
+                except Exception:
+                    pass
+                session = _make_shopifyql_session()
+                time.sleep(2**attempt)
+
+        if not resp or resp.status_code != 200:
+            logger.error(
+                f"❌ ShopifyQL hourly city sessions failed: {resp.status_code if resp else 'No response'}"
+            )
+            return []
+
+        body = resp.json()
+        if body.get("errors"):
+            logger.error(f"❌ GraphQL errors: {json.dumps(body['errors'])}")
+            return []
+
+        ql_result = body.get("data", {}).get("shopifyqlQuery", {})
+        if ql_result.get("parseErrors"):
+            logger.error(f"❌ Parse errors: {ql_result['parseErrors']}")
+            return []
+
+        table_data = ql_result.get("tableData")
+        if not table_data:
+            return []
+
+        rows = _format_shopifyql_table(table_data)
+        if not rows:
+            return []
+
+        aggregated: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
+        for row in rows:
+            h_val = row.get("hour")
+            if h_val is None:
+                continue
+
+            city = _normalize_city_name(row.get("session_city"))
+            try:
+                if "T" in str(h_val):
+                    dt_utc = datetime.fromisoformat(str(h_val).replace("Z", "+00:00"))
+                    dt_store = dt_utc.astimezone(tz)
+                    d_dt = dt_store.date().isoformat()
+                    h_int = dt_store.hour
+                else:
+                    d_dt = str(row.get("day"))
+                    h_int = int(h_val)
+            except Exception:
+                continue
+
+            key = (d_dt, h_int, city)
+            if key not in aggregated:
+                aggregated[key] = {
+                    "date": d_dt,
+                    "hour": h_int,
+                    "city": city,
+                    "sessions": 0,
+                    "atc_sessions": 0,
+                }
+
+            aggregated[key]["sessions"] += int(row.get("sessions") or 0)
+            aggregated[key]["atc_sessions"] += int(
+                row.get("sessions_with_cart_additions") or 0
+            )
+
+        results = list(aggregated.values())
+        logger.info(
+            f"✅ ShopifyQL hourly city sessions received {len(rows)} raw rows, aggregated into {len(results)} records"
+        )
+        return results
+    except Exception as e:
+        logger.error(f"❌ ShopifyQL hourly city sessions exception: {e}")
+        return []
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
 def update_hourly_sessions_summary_from_shopifyql(
     brand_index: int,
     brand_name: str,
@@ -5586,6 +6149,172 @@ def _do_upsert_hourly_sessions_shopify(results, cursor, connection, brand_name):
     connection.commit()
     logger.info(
         f"✅ ShopifyQL hourly sessions and device breakdown updated for {brand_name} ({len(results)} rows)"
+    )
+
+
+def update_daily_city_sessions_summary_from_shopifyql(
+    brand_index: int,
+    brand_name: str,
+    shop_name: str,
+    api_version: str,
+    access_token: str,
+    tz: ZoneInfo,
+    cursor=None,
+    connection=None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+) -> Set[str]:
+    """Update daily city session source table from ShopifyQL."""
+    today_dt = datetime.now(tz).date()
+    start_dt = start_date or (today_dt - timedelta(days=2))
+    end_dt = end_date or today_dt
+
+    if (
+        start_date is None
+        and end_date is None
+        and is_backfill_active_for(brand_index)
+        and BACKFILL_START_IST
+        and BACKFILL_END_IST
+    ):
+        start_dt = BACKFILL_START_IST.astimezone(tz).date()
+        end_dt = BACKFILL_END_IST.astimezone(tz).date()
+
+    results = fetch_shopify_daily_city_sessions_via_shopifyql(
+        shop_name=shop_name,
+        api_version=api_version,
+        access_token=access_token,
+        start_date=start_dt.isoformat(),
+        end_date=end_dt.isoformat(),
+    )
+
+    if not results:
+        return set()
+
+    if cursor is not None:
+        _do_upsert_daily_city_sessions_shopify(results, cursor, connection, brand_name)
+    else:
+        try:
+            with get_db_cursor(brand_index) as (c, conn):
+                _do_upsert_daily_city_sessions_shopify(results, c, conn, brand_name)
+        except Exception as e:
+            logger.error(
+                f"❌ Error updating daily city sessions summary for {brand_name}: {e}"
+            )
+            return set()
+
+    return {str(r['date']) for r in results if r.get('date')}
+
+
+def _do_upsert_daily_city_sessions_shopify(results, cursor, connection, brand_name):
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_city_sessions_summary_shopify (
+            date DATE NOT NULL,
+            city VARCHAR(100) NOT NULL,
+            sessions INT DEFAULT 0,
+            atc_sessions INT DEFAULT 0,
+            PRIMARY KEY (date, city)
+        );
+    """
+    )
+    for r in results:
+        cursor.execute(
+            """
+            INSERT INTO daily_city_sessions_summary_shopify (date, city, sessions, atc_sessions)
+            VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                sessions = VALUES(sessions),
+                atc_sessions = VALUES(atc_sessions);
+        """,
+            (r["date"], r["city"], r["sessions"], r["atc_sessions"]),
+        )
+    connection.commit()
+    logger.info(
+        f"✅ ShopifyQL daily city sessions updated for {brand_name} ({len(results)} rows)"
+    )
+
+
+def update_hourly_city_sessions_summary_from_shopifyql(
+    brand_index: int,
+    brand_name: str,
+    shop_name: str,
+    api_version: str,
+    access_token: str,
+    tz: ZoneInfo,
+    cursor=None,
+    connection=None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+) -> Set[str]:
+    """Update hourly city session source table from ShopifyQL."""
+    today_dt = datetime.now(tz).date()
+    start_dt = start_date or (today_dt - timedelta(days=1))
+    end_dt = end_date or today_dt
+
+    if (
+        start_date is None
+        and end_date is None
+        and is_backfill_active_for(brand_index)
+        and BACKFILL_START_IST
+        and BACKFILL_END_IST
+    ):
+        start_dt = BACKFILL_START_IST.astimezone(tz).date()
+        end_dt = BACKFILL_END_IST.astimezone(tz).date()
+
+    results = fetch_shopify_hourly_city_sessions_via_shopifyql(
+        shop_name=shop_name,
+        api_version=api_version,
+        access_token=access_token,
+        tz=tz,
+        start_date=start_dt.isoformat(),
+        end_date=end_dt.isoformat(),
+    )
+
+    if not results:
+        return set()
+
+    if cursor is not None:
+        _do_upsert_hourly_city_sessions_shopify(results, cursor, connection, brand_name)
+    else:
+        try:
+            with get_db_cursor(brand_index) as (c, conn):
+                _do_upsert_hourly_city_sessions_shopify(results, c, conn, brand_name)
+        except Exception as e:
+            logger.error(
+                f"❌ Error updating hourly city sessions summary for {brand_name}: {e}"
+            )
+            return set()
+
+    return {str(r['date']) for r in results if r.get('date')}
+
+
+def _do_upsert_hourly_city_sessions_shopify(results, cursor, connection, brand_name):
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS hourly_city_sessions_summary_shopify (
+            date DATE NOT NULL,
+            hour TINYINT UNSIGNED NOT NULL,
+            city VARCHAR(100) NOT NULL,
+            sessions INT DEFAULT 0,
+            atc_sessions INT DEFAULT 0,
+            PRIMARY KEY (date, hour, city)
+        );
+    """
+    )
+    for r in results:
+        cursor.execute(
+            """
+            INSERT INTO hourly_city_sessions_summary_shopify (date, hour, city, sessions, atc_sessions)
+            VALUES (%s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                sessions = VALUES(sessions),
+                atc_sessions = VALUES(atc_sessions);
+        """,
+            (r["date"], r["hour"], r["city"], r["sessions"], r["atc_sessions"]),
+        )
+    connection.commit()
+    logger.info(
+        f"✅ ShopifyQL hourly city sessions updated for {brand_name} ({len(results)} rows)"
     )
 
 
@@ -6157,6 +6886,28 @@ def update_sessions_summary(
                 connection=connection,
             )
 
+            city_daily_dates = update_daily_city_sessions_summary_from_shopifyql(
+                brand_index=brand_index,
+                brand_name=brand_name,
+                shop_name=shop_name,
+                api_version=api_version,
+                access_token=access_token,
+                tz=tz,
+                cursor=cursor,
+                connection=connection,
+            )
+
+            city_hourly_dates = update_hourly_city_sessions_summary_from_shopifyql(
+                brand_index=brand_index,
+                brand_name=brand_name,
+                shop_name=shop_name,
+                api_version=api_version,
+                access_token=access_token,
+                tz=tz,
+                cursor=cursor,
+                connection=connection,
+            )
+
             ci_start_dt = datetime.now(tz).date() - timedelta(days=1)
             ci_end_dt = datetime.now(tz).date()
             if is_backfill_active_for(brand_index) and BACKFILL_START_IST and BACKFILL_END_IST:
@@ -6181,6 +6932,15 @@ def update_sessions_summary(
             update_hour_wise_sales_incremental(
                 cursor, connection, brand_name, {today_str}
             )
+
+            city_target_dates = city_daily_dates | city_hourly_dates
+            if city_target_dates:
+                update_daily_citywise_summary_incremental(
+                    cursor, connection, brand_name, city_target_dates
+                )
+                update_hourly_citywise_summary_incremental(
+                    cursor, connection, brand_name, city_target_dates
+                )
 
     except Exception as e:
         logger.error(f"❌ Error updating sessions for {brand_name}: {e}")
