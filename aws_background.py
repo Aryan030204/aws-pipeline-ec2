@@ -3699,6 +3699,7 @@ def ensure_summary_tables(cursor, connection):
                 date DATE NOT NULL,
                 city VARCHAR(100) NOT NULL,
                 total_orders INT DEFAULT 0,
+                total_revenue DECIMAL(12,2) DEFAULT 0,
                 cod_orders INT DEFAULT 0,
                 prepaid_orders INT DEFAULT 0,
                 partially_paid_orders INT DEFAULT 0,
@@ -3715,6 +3716,7 @@ def ensure_summary_tables(cursor, connection):
                 hour TINYINT UNSIGNED NOT NULL,
                 city VARCHAR(100) NOT NULL,
                 total_orders INT DEFAULT 0,
+                total_revenue DECIMAL(12,2) DEFAULT 0,
                 cod_orders INT DEFAULT 0,
                 prepaid_orders INT DEFAULT 0,
                 partially_paid_orders INT DEFAULT 0,
@@ -4384,7 +4386,7 @@ def update_daily_citywise_summary_incremental(
 
         sql = f"""
         INSERT INTO daily_citywise_summary_stage (
-            date, city, total_orders, cod_orders, prepaid_orders, partially_paid_orders,
+            date, city, total_orders, total_revenue, cod_orders, prepaid_orders, partially_paid_orders,
             sessions, atc_sessions
         )
         WITH OrderAgg AS (
@@ -4392,6 +4394,7 @@ def update_daily_citywise_summary_incremental(
                 STR_TO_DATE(created_date, '%Y-%m-%d') AS date,
                 {city_expr} AS city,
                 COUNT(DISTINCT order_id) AS total_orders,
+                SUM(COALESCE(total_price, 0)) AS total_revenue,
                 COUNT(DISTINCT CASE
                     WHEN (payment_gateway_names IS NULL
                       OR payment_gateway_names = ''
@@ -4432,6 +4435,7 @@ def update_daily_citywise_summary_incremental(
             ak.date,
             ak.city,
             COALESCE(oa.total_orders, 0) AS total_orders,
+            COALESCE(oa.total_revenue, 0) AS total_revenue,
             COALESCE(oa.cod_orders, 0) AS cod_orders,
             COALESCE(oa.prepaid_orders, 0) AS prepaid_orders,
             COALESCE(oa.partially_paid_orders, 0) AS partially_paid_orders,
@@ -4473,7 +4477,7 @@ def update_hourly_citywise_summary_incremental(
 
         sql = f"""
         INSERT INTO hourly_citywise_summary_stage (
-            date, hour, city, total_orders, cod_orders, prepaid_orders, partially_paid_orders,
+            date, hour, city, total_orders, total_revenue, cod_orders, prepaid_orders, partially_paid_orders,
             sessions, atc_sessions
         )
         WITH OrderAgg AS (
@@ -4482,6 +4486,7 @@ def update_hourly_citywise_summary_incremental(
                 HOUR(created_time) AS hour,
                 {city_expr} AS city,
                 COUNT(DISTINCT order_id) AS total_orders,
+                SUM(COALESCE(total_price, 0)) AS total_revenue,
                 COUNT(DISTINCT CASE
                     WHEN (payment_gateway_names IS NULL
                       OR payment_gateway_names = ''
@@ -4525,6 +4530,7 @@ def update_hourly_citywise_summary_incremental(
             ak.hour,
             ak.city,
             COALESCE(oa.total_orders, 0) AS total_orders,
+            COALESCE(oa.total_revenue, 0) AS total_revenue,
             COALESCE(oa.cod_orders, 0) AS cod_orders,
             COALESCE(oa.prepaid_orders, 0) AS prepaid_orders,
             COALESCE(oa.partially_paid_orders, 0) AS partially_paid_orders,
