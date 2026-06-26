@@ -3728,6 +3728,33 @@ def ensure_summary_tables(cursor, connection):
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
 
+        try:
+            citywise_migrations = {
+                "daily_citywise_summary": {
+                    "total_revenue": "DECIMAL(12,2) DEFAULT 0 AFTER total_orders",
+                },
+                "hourly_citywise_summary": {
+                    "total_revenue": "DECIMAL(12,2) DEFAULT 0 AFTER total_orders",
+                },
+            }
+
+            for table_name, columns in citywise_migrations.items():
+                cursor.execute(f"SHOW COLUMNS FROM {table_name}")
+                rows = cursor.fetchall()
+                existing_cols = {
+                    row["Field"] if isinstance(row, dict) else row[0] for row in rows
+                }
+
+                for col, definition in columns.items():
+                    if col not in existing_cols:
+                        cursor.execute(
+                            f"ALTER TABLE {table_name} ADD COLUMN {col} {definition}"
+                        )
+
+            connection.commit()
+        except Exception as e:
+            logger.warning(f"⚠️ Migration check for citywise summary tables failed: {e}")
+
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS overall_summary (
                 date DATE PRIMARY KEY,
