@@ -3286,6 +3286,16 @@ CI_EVENTS_BRANDS = {
     "shyle",
 }
 
+CI_EVENTS_MONGO_SHOP_NAME_MAP = {
+    "ajmal": "AJMAL_IN",
+    "tmc": "tmc",
+    "pts": "pts",
+    "bbb": "bbb",
+    "vama": "vama",
+    "3tenx": "3tenx",
+    "shyle": "shyle",
+}
+
 
 def is_ci_events_brand(
     brand_name: Optional[str], brand_key: Optional[str] = None
@@ -3295,6 +3305,19 @@ def is_ci_events_brand(
         _normalize_brand_token(brand_key),
     }
     return any(token in CI_EVENTS_BRANDS for token in normalized_tokens)
+
+
+def get_ci_events_mongo_shop_name(
+    brand_name: Optional[str], brand_key: Optional[str] = None
+) -> Optional[str]:
+    normalized_tokens = (
+        _normalize_brand_token(brand_key),
+        _normalize_brand_token(brand_name),
+    )
+    for token in normalized_tokens:
+        if token in CI_EVENTS_MONGO_SHOP_NAME_MAP:
+            return CI_EVENTS_MONGO_SHOP_NAME_MAP[token]
+    return None
 
 
 def _resolve_mongo_sessions_collection():
@@ -3319,7 +3342,10 @@ def _ist_date_range_to_utc_bounds(
 
 
 def fetch_checkout_initiated_hourly_counts_from_mongo(
-    start_date: date, end_date: date, tz: ZoneInfo = IST
+    start_date: date,
+    end_date: date,
+    mongo_shop_name: str,
+    tz: ZoneInfo = IST,
 ) -> List[Dict[str, Any]]:
     start_utc, end_utc = _ist_date_range_to_utc_bounds(start_date, end_date, tz)
     client = None
@@ -3328,6 +3354,7 @@ def fetch_checkout_initiated_hourly_counts_from_mongo(
         cursor = collection.find(
             {
                 "event_type": "checkout_initiated",
+                "shop_name": mongo_shop_name,
                 "createdAt": {"$gte": start_utc, "$lt": end_utc},
             },
             {"createdAt": 1},
@@ -3404,9 +3431,21 @@ def sync_checkout_initiated_ci_events(
         )
         return
 
+    mongo_shop_name = get_ci_events_mongo_shop_name(brand_name, brand_key)
+    if not mongo_shop_name:
+        logger.info(
+            f"Skipping checkout-initiated Mongo sync for {brand_name}: no Mongo shop_name mapping"
+        )
+        return
+
     tz = get_brand_timezone(brand_index)
     try:
-        results = fetch_checkout_initiated_hourly_counts_from_mongo(start_date, end_date, tz)
+        results = fetch_checkout_initiated_hourly_counts_from_mongo(
+            start_date=start_date,
+            end_date=end_date,
+            mongo_shop_name=mongo_shop_name,
+            tz=tz,
+        )
     except Exception as e:
         logger.error(
             f"❌ Error fetching checkout-initiated Mongo events for {brand_name}: {e}"
