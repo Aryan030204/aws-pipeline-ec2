@@ -42,8 +42,10 @@ def backfill_brand(brand_index: int, start_dt: datetime, end_dt: datetime):
     brand_name = os.environ.get(f"BRAND_NAME_{brand_index}", f"Brand_{brand_index}")
     brand_key = os.environ.get(f"BRAND_TAG_{brand_index}")
 
-    if not aws_background.is_ajmal_brand(brand_name, brand_key):
-        logger.info(f"Skipping {brand_name}: only AJMAL is in scope for ci_events backfill.")
+    if not aws_background.is_ci_events_brand(brand_name, brand_key):
+        logger.info(
+            f"Skipping {brand_name}: brand not enabled for ci_events backfill."
+        )
         return
 
     aws_background.ensure_ci_events_column(brand_index, "hourly_sessions_summary_shopify")

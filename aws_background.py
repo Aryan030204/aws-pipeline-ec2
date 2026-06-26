@@ -3276,12 +3276,25 @@ def _normalize_brand_token(value: Optional[str]) -> str:
     return re.sub(r"[^a-z0-9]+", "", (value or "").strip().lower())
 
 
-def is_ajmal_brand(brand_name: Optional[str], brand_key: Optional[str] = None) -> bool:
+CI_EVENTS_BRANDS = {
+    "ajmal",
+    "tmc",
+    "pts",
+    "bbb",
+    "vama",
+    "3tenx",
+    "shyle",
+}
+
+
+def is_ci_events_brand(
+    brand_name: Optional[str], brand_key: Optional[str] = None
+) -> bool:
     normalized_tokens = {
         _normalize_brand_token(brand_name),
         _normalize_brand_token(brand_key),
     }
-    return "ajmal" in normalized_tokens
+    return any(token in CI_EVENTS_BRANDS for token in normalized_tokens)
 
 
 def _resolve_mongo_sessions_collection():
@@ -3385,9 +3398,9 @@ def sync_checkout_initiated_ci_events(
     cursor=None,
     connection=None,
 ):
-    if not is_ajmal_brand(brand_name, brand_key):
+    if not is_ci_events_brand(brand_name, brand_key):
         logger.info(
-            f"Skipping checkout-initiated Mongo sync for {brand_name}: non-AJMAL brand"
+            f"Skipping checkout-initiated Mongo sync for {brand_name}: brand not enabled for ci_events"
         )
         return
 
