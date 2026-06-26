@@ -4406,10 +4406,10 @@ def update_daily_citywise_summary_incremental(
     with timed(
         f"[{brand_name}] daily_citywise_summary incremental ({len(params)} date(s))"
     ):
+        cursor.execute("DROP TABLE IF EXISTS daily_citywise_summary_stage")
         cursor.execute(
-            "CREATE TABLE IF NOT EXISTS daily_citywise_summary_stage LIKE daily_citywise_summary"
+            "CREATE TABLE daily_citywise_summary_stage LIKE daily_citywise_summary"
         )
-        cursor.execute("TRUNCATE TABLE daily_citywise_summary_stage")
 
         sql = f"""
         INSERT INTO daily_citywise_summary_stage (
@@ -4497,10 +4497,10 @@ def update_hourly_citywise_summary_incremental(
     with timed(
         f"[{brand_name}] hourly_citywise_summary incremental ({len(params)} date(s))"
     ):
+        cursor.execute("DROP TABLE IF EXISTS hourly_citywise_summary_stage")
         cursor.execute(
-            "CREATE TABLE IF NOT EXISTS hourly_citywise_summary_stage LIKE hourly_citywise_summary"
+            "CREATE TABLE hourly_citywise_summary_stage LIKE hourly_citywise_summary"
         )
-        cursor.execute("TRUNCATE TABLE hourly_citywise_summary_stage")
 
         sql = f"""
         INSERT INTO hourly_citywise_summary_stage (
