@@ -3287,7 +3287,7 @@ CI_EVENTS_BRANDS = {
 }
 
 CI_EVENTS_MONGO_SHOP_NAME_MAP = {
-    "ajmal": "AJMAL_IN",
+    "ajmal": "Ajmal_IN",
     "tmc": "tmc",
     "pts": "pts",
     "bbb": "bbb",
