@@ -17,7 +17,9 @@ if PROJECT_ROOT not in sys.path:
 
 try:
     import aws_background
-except ImportError:
+except ImportError as e:
+    import traceback
+    traceback.print_exc()
     print("Error: Could not import aws_background.py. Run this script from the repo environment.")
     sys.exit(1)
 
@@ -48,18 +50,8 @@ def backfill_brand(brand_index: int, start_dt: datetime, end_dt: datetime):
         )
         return
 
-    with aws_background.get_db_cursor(brand_index) as (cursor, connection):
-        aws_background.ensure_summary_tables(cursor, connection)
-        
     aws_background.ensure_ci_events_column(brand_index, "hourly_sessions_summary_shopify")
     aws_background.sync_checkout_initiated_ci_events(
-        brand_index=brand_index,
-        brand_name=brand_name,
-        brand_key=brand_key,
-        start_date=start_dt.date(),
-        end_date=end_dt.date(),
-    )
-    aws_background.sync_checkout_initiated_variant_events(
         brand_index=brand_index,
         brand_name=brand_name,
         brand_key=brand_key,
