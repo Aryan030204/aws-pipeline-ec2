@@ -3467,6 +3467,155 @@ def sync_checkout_initiated_ci_events(
         logger.error(f"❌ Error updating checkout-initiated ci_events for {brand_name}: {e}")
 
 
+def fetch_checkout_initiated_variant_counts_from_mongo(
+    start_date: date,
+    end_date: date,
+    mongo_shop_name: str,
+    tz: ZoneInfo = IST,
+) -> List[Dict[str, Any]]:
+    start_utc, end_utc = _ist_date_range_to_utc_bounds(start_date, end_date, tz)
+    client = None
+    try:
+        client, collection = _resolve_mongo_sessions_collection()
+        cursor = collection.find(
+            {
+                "event_type": "checkout_initiated",
+                "shop_name": mongo_shop_name,
+                "createdAt": {"$gte": start_utc, "$lt": end_utc},
+            },
+            {"createdAt": 1, "variantId": 1},
+        )
+
+        counts: Dict[Tuple[date, str], int] = {}
+        for doc in cursor:
+            created_at = doc.get("createdAt")
+            if not isinstance(created_at, datetime):
+                continue
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+
+            created_at_store = created_at.astimezone(tz)
+            event_date = created_at_store.date()
+            
+            variant_val = doc.get("variantId")
+            if variant_val is None:
+                continue
+            
+            variant_ids = []
+            if isinstance(variant_val, list):
+                variant_ids = [str(v).strip() for v in variant_val if v is not None]
+            elif isinstance(variant_val, (int, float)):
+                variant_ids = [str(int(variant_val)).strip()]
+            else:
+                val_str = str(variant_val).strip()
+                if val_str:
+                    variant_ids = [v.strip() for v in val_str.split(",") if v.strip()]
+            
+            unique_variant_ids = sorted(list(set(variant_ids)))
+            for vid in unique_variant_ids:
+                if vid:
+                    key = (event_date, vid)
+                    counts[key] = counts.get(key, 0) + 1
+
+        return [
+            {
+                "date": bucket_date,
+                "variant_id": vid,
+                "checkout_initiated_count": count,
+            }
+            for (bucket_date, vid), count in sorted(counts.items())
+        ]
+    finally:
+        if client is not None:
+            client.close()
+
+
+def _do_upsert_checkout_initiated_variant_events(
+    results: List[Dict[str, Any]],
+    cursor,
+    connection,
+    brand_name: str,
+    start_date: date,
+    end_date: date,
+):
+    cursor.execute(
+        """
+        DELETE FROM daily_ci_events_summary
+        WHERE date BETWEEN %s AND %s
+        """,
+        (start_date, end_date),
+    )
+
+    for row in results:
+        cursor.execute(
+            """
+            INSERT INTO daily_ci_events_summary (date, variant_id, checkout_initiated_count)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                checkout_initiated_count = VALUES(checkout_initiated_count)
+            """,
+            (row["date"], row["variant_id"], row["checkout_initiated_count"]),
+        )
+
+    connection.commit()
+    logger.info(
+        f"✅ Checkout-initiated variant events updated for {brand_name} "
+        f"({len(results)} variant-date rows, {start_date}..{end_date})"
+    )
+
+
+def sync_checkout_initiated_variant_events(
+    brand_index: int,
+    brand_name: str,
+    start_date: date,
+    end_date: date,
+    brand_key: Optional[str] = None,
+    cursor=None,
+    connection=None,
+):
+    if not is_ci_events_brand(brand_name, brand_key):
+        logger.info(
+            f"Skipping checkout-initiated variant Mongo sync for {brand_name}: brand not enabled for ci_events"
+        )
+        return
+
+    mongo_shop_name = get_ci_events_mongo_shop_name(brand_name, brand_key)
+    if not mongo_shop_name:
+        logger.info(
+            f"Skipping checkout-initiated variant Mongo sync for {brand_name}: no Mongo shop_name mapping"
+        )
+        return
+
+    tz = get_brand_timezone(brand_index)
+    try:
+        results = fetch_checkout_initiated_variant_counts_from_mongo(
+            start_date=start_date,
+            end_date=end_date,
+            mongo_shop_name=mongo_shop_name,
+            tz=tz,
+        )
+    except Exception as e:
+        logger.error(
+            f"❌ Error fetching checkout-initiated variant Mongo events for {brand_name}: {e}"
+        )
+        return
+
+    if cursor is not None:
+        _do_upsert_checkout_initiated_variant_events(
+            results, cursor, connection, brand_name, start_date, end_date
+        )
+        return
+
+    try:
+        with get_db_cursor(brand_index) as (c, conn):
+            _do_upsert_checkout_initiated_variant_events(
+                results, c, conn, brand_name, start_date, end_date
+            )
+    except Exception as e:
+        logger.error(f"❌ Error updating checkout-initiated variant events for {brand_name}: {e}")
+
+
+
 def load_data_to_sql_optimized(
     df: pd.DataFrame,
     brand_index: int,
@@ -3909,6 +4058,18 @@ def ensure_summary_tables(cursor, connection):
         except mysql.connector.Error:
             # Column may already exist; ignore error
             pass
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS daily_ci_events_summary (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                date DATE NOT NULL,
+                variant_id VARCHAR(255) NOT NULL,
+                checkout_initiated_count INT DEFAULT 0,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY idx_date_variant (date, variant_id),
+                KEY idx_date (date)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
 
         connection.commit()
 
@@ -7000,6 +7161,16 @@ def update_sessions_summary(
                 ci_end_dt = BACKFILL_END_IST.astimezone(tz).date()
 
             sync_checkout_initiated_ci_events(
+                brand_index=brand_index,
+                brand_name=brand_name,
+                brand_key=os.environ.get(f"BRAND_TAG_{brand_index}"),
+                start_date=ci_start_dt,
+                end_date=ci_end_dt,
+                cursor=cursor,
+                connection=connection,
+            )
+
+            sync_checkout_initiated_variant_events(
                 brand_index=brand_index,
                 brand_name=brand_name,
                 brand_key=os.environ.get(f"BRAND_TAG_{brand_index}"),
