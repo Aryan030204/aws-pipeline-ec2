@@ -1690,7 +1690,7 @@ async def fetch_orders_async(
 
     # Ensure refunds/cancel snapshots are present
     fields = (
-        "id,name,tags,created_at,updated_at,cancelled_at,total_price,financial_status,"
+        "id,name,tags,created_at,updated_at,cancelled_at,cancel_reason,total_price,financial_status,"
         "payment_gateway_names,app_id,currency,discount_codes,discount_applications,landing_site,"
         "refunds,refunds/created_at,refunds/transactions,"
         "refunds/transactions/amount,refunds/transactions/kind,refunds/transactions/status,"
@@ -2132,11 +2132,25 @@ def _ensure_returns_fact(cursor, connection):
           order_id     BIGINT        NOT NULL,
           event_date   DATE          NOT NULL,
           event_type   ENUM('CANCEL','REFUND') NOT NULL,
+          order_created_date DATE NULL,
+          cancelled_at DATETIME NULL,
+          cancel_reason VARCHAR(255) NULL,
           amount       DECIMAL(12,2) NOT NULL,
           PRIMARY KEY (order_id, event_type, event_date),
           KEY idx_event_date (event_date)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """)
+    cursor.execute("SHOW COLUMNS FROM returns_fact")
+    rows = cursor.fetchall()
+    existing_cols = {row["Field"] if isinstance(row, dict) else row[0] for row in rows}
+    migrations = {
+        "order_created_date": "DATE NULL AFTER event_type",
+        "cancelled_at": "DATETIME NULL AFTER order_created_date",
+        "cancel_reason": "VARCHAR(255) NULL AFTER cancelled_at",
+    }
+    for col, definition in migrations.items():
+        if col not in existing_cols:
+            cursor.execute(f"ALTER TABLE returns_fact ADD COLUMN {col} {definition}")
     connection.commit()
 
 
@@ -2150,13 +2164,48 @@ def _parse_iso_to_store_date(iso_ts: Optional[str], tz: ZoneInfo) -> Optional[st
         return None
 
 
+def get_cancellation_transition_details(
+    orders_list: List[Dict],
+    previous_state_by_order_id: Optional[Dict[str, Dict[str, Any]]],
+    tz: ZoneInfo,
+) -> Tuple[Set[str], Set[str]]:
+    transition_order_ids: Set[str] = set()
+    created_dates: Set[str] = set()
+
+    previous_state_by_order_id = previous_state_by_order_id or {}
+    for order in orders_list or []:
+        order_id = str(order.get("id")) if order.get("id") else None
+        if not order_id:
+            continue
+
+        current_cancelled_at = order.get("cancelled_at")
+        previous_cancelled_at = (
+            previous_state_by_order_id.get(order_id, {}) or {}
+        ).get("cancelled_at")
+        if not current_cancelled_at or previous_cancelled_at:
+            continue
+
+        transition_order_ids.add(order_id)
+        created_date = _parse_iso_to_store_date(order.get("created_at"), tz)
+        if not created_date:
+            prev_created_date = (
+                previous_state_by_order_id.get(order_id, {}) or {}
+            ).get("created_date")
+            if prev_created_date:
+                created_date = str(prev_created_date)
+        if created_date:
+            created_dates.add(created_date)
+
+    return transition_order_ids, created_dates
+
+
 def upsert_returns_fact_from_orders(
     brand_index: int, orders_list: List[Dict], cursor=None, connection=None
 ) -> Set[str]:
     """Idempotently upsert CANCEL and REFUND events per order per day.
 
     Returns:
-      Set of IST event_date strings that were actually inserted/changed.
+      Set of refund event_date strings that were actually inserted/changed.
     """
     if not orders_list:
         return set()
@@ -2171,7 +2220,7 @@ def upsert_returns_fact_from_orders(
         _ensure_returns_fact(cursor, connection)
         tz = get_brand_timezone(brand_index)
 
-        agg: Dict[Tuple[str, str, str], float] = {}
+        agg: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
 
         for o in orders_list:
             oid = str(o.get("id")) if o.get("id") else None
@@ -2179,12 +2228,21 @@ def upsert_returns_fact_from_orders(
                 continue
 
             cancelled_at = o.get("cancelled_at")
+            order_created_date = _parse_iso_to_store_date(o.get("created_at"), tz)
+            cancel_reason = (o.get("cancel_reason") or None)
             if cancelled_at:
                 d = _parse_iso_to_store_date(cancelled_at, tz)
                 if d:
                     amt = float(o.get("total_price") or 0.0)
                     key = (oid, "CANCEL", d)
-                    agg[key] = max(agg.get(key, 0.0), amt)
+                    existing = agg.get(key)
+                    if existing is None or amt >= float(existing["amount"] or 0.0):
+                        agg[key] = {
+                            "amount": amt,
+                            "order_created_date": order_created_date,
+                            "cancelled_at": format_datetime(cancelled_at),
+                            "cancel_reason": cancel_reason,
+                        }
 
             refunds = o.get("refunds") or []
             for rf in refunds:
@@ -2203,7 +2261,13 @@ def upsert_returns_fact_from_orders(
                             continue
                 if refund_sum > 0:
                     key = (oid, "REFUND", rdate)
-                    agg[key] = agg.get(key, 0.0) + refund_sum
+                    existing = agg.get(key)
+                    agg[key] = {
+                        "amount": (existing["amount"] if existing else 0.0) + refund_sum,
+                        "order_created_date": order_created_date,
+                        "cancelled_at": None,
+                        "cancel_reason": None,
+                    }
 
         if not agg:
             return set()
@@ -2249,16 +2313,43 @@ def upsert_returns_fact_from_orders(
                     r_amount
                 )
 
-        for key, new_amount in agg.items():
+        for key, payload in agg.items():
             old_amount = existing_amounts.get(key)
-            if old_amount is None or abs(float(old_amount) - float(new_amount)) > 0.009:
+            new_amount = float(payload["amount"] or 0.0)
+            if (
+                key[1] == "REFUND"
+                and (old_amount is None or abs(float(old_amount) - new_amount) > 0.009)
+            ):
                 changed_dates.add(key[2])
 
-        rows = [(int(k[0]), k[2], k[1], round(v, 2)) for k, v in agg.items()]
+        rows = [
+            (
+                int(k[0]),
+                k[2],
+                k[1],
+                payload.get("order_created_date"),
+                payload.get("cancelled_at"),
+                payload.get("cancel_reason"),
+                round(float(payload["amount"] or 0.0), 2),
+            )
+            for k, payload in agg.items()
+        ]
         insert_sql = """
-            INSERT INTO returns_fact (order_id, event_date, event_type, amount)
-            VALUES (%s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE amount = VALUES(amount);
+            INSERT INTO returns_fact (
+                order_id,
+                event_date,
+                event_type,
+                order_created_date,
+                cancelled_at,
+                cancel_reason,
+                amount
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                order_created_date = VALUES(order_created_date),
+                cancelled_at = VALUES(cancelled_at),
+                cancel_reason = VALUES(cancel_reason),
+                amount = VALUES(amount);
         """
         executemany_chunked(cursor, connection, insert_sql, rows)
 
@@ -3025,28 +3116,47 @@ def get_affected_dates_updates(
     orders_list: List[Dict],
     tz: ZoneInfo,
     extra_event_dates: Optional[Set[str]] = None,
+    previous_state_by_order_id: Optional[Dict[str, Dict[str, Any]]] = None,
+    cancellation_transition_order_ids: Optional[Set[str]] = None,
+    cancellation_created_dates: Optional[Set[str]] = None,
 ) -> Set[str]:
     """Return the set of store dates whose summaries are affected by UPDATED orders.
 
     Sources:
-      - updated_at date for orders that can affect summaries
-        (not-paid/pending, or cancelled, or has refunds).
-      - extra_event_dates from returns_fact upsert deltas (only event_dates
-        whose amount actually changed or were newly inserted).
+      - updated_at date for non-cancellation order updates that still affect
+        existing summaries.
+      - extra_event_dates from returns_fact refund upsert deltas.
+      - cancellation_created_dates for first-time cancellations so late-arriving
+        cancellations refresh only the original order created_date row.
 
     Passing a *set* (not a min/max range) downstream is what keeps the
     summary rebuild sparse: a 2016 refund correction only rebuilds the
     2016-04-08 summary row, not the entire 2016→today span.
     """
     dates: Set[str] = set(extra_event_dates or set())
+    dates.update(cancellation_created_dates or set())
+    previous_state_by_order_id = previous_state_by_order_id or {}
+    cancellation_transition_order_ids = cancellation_transition_order_ids or set()
     for o in orders_list or []:
+        order_id = str(o.get("id")) if o.get("id") else None
         financial_status = (o.get("financial_status") or "").lower()
         refunds = o.get("refunds") or []
         cancelled_at = o.get("cancelled_at")
+        previous_cancelled_at = (
+            previous_state_by_order_id.get(order_id, {}) or {}
+        ).get("cancelled_at")
+
+        if order_id in cancellation_transition_order_ids:
+            continue
+
+        if cancelled_at and previous_cancelled_at:
+            # Already-cancelled orders can keep arriving in UPDATED due to other
+            # field changes; those should not rebuild summaries again unless a
+            # refund delta already contributed an event_date above.
+            continue
 
         affects_summaries = (
             financial_status not in ("paid", "pending")
-            or cancelled_at is not None
             or len(refunds) > 0
         )
         if not affects_summaries:
@@ -3113,6 +3223,102 @@ def get_last_order(brand_index: int, table_name: str, cursor=None) -> Optional[D
         return None
 
 
+def get_shopify_orders_previous_state_map(
+    order_ids: Iterable[str], cursor
+) -> Dict[str, Dict[str, Any]]:
+    """Fetch previous business-state fields from shopify_orders in batched IN queries."""
+    unique_ids = sorted({str(order_id) for order_id in order_ids if order_id})
+    if not unique_ids:
+        return {}
+
+    state_map: Dict[str, Dict[str, Any]] = {}
+    for i in range(0, len(unique_ids), 500):
+        chunk = unique_ids[i : i + 500]
+        placeholders = ",".join(["%s"] * len(chunk))
+        cursor.execute(
+            f"""
+            SELECT
+                order_id,
+                MAX(cancelled_at) AS cancelled_at,
+                MAX(cancel_reason) AS cancel_reason,
+                MAX(created_date) AS created_date
+            FROM shopify_orders
+            WHERE order_id IN ({placeholders})
+            GROUP BY order_id
+            """,
+            tuple(chunk),
+        )
+        for row in cursor.fetchall():
+            if isinstance(row, dict):
+                order_id = str(row.get("order_id"))
+                created_date = row.get("created_date")
+                cancelled_at = row.get("cancelled_at")
+                cancel_reason = row.get("cancel_reason")
+            else:
+                order_id = str(row[0])
+                cancelled_at = row[1]
+                cancel_reason = row[2]
+                created_date = row[3]
+
+            state_map[order_id] = {
+                "cancelled_at": cancelled_at,
+                "cancel_reason": cancel_reason,
+                "created_date": (
+                    created_date.isoformat()
+                    if hasattr(created_date, "isoformat")
+                    else str(created_date)
+                    if created_date is not None
+                    else None
+                ),
+            }
+    return state_map
+
+
+def sync_shopify_orders_cancellation_fields_from_orders(
+    orders_list: List[Dict], cursor, connection, brand_name: str
+) -> int:
+    rows: List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], str]] = []
+    seen: Set[str] = set()
+
+    for order in orders_list or []:
+        order_id = str(order.get("id")) if order.get("id") else None
+        if not order_id or order_id in seen:
+            continue
+        seen.add(order_id)
+
+        updated_at_raw = order.get("updated_at")
+        updated_date, updated_time = extract_date_time(updated_at_raw)
+        rows.append(
+            (
+                format_datetime(order.get("cancelled_at")),
+                (order.get("cancel_reason") or None),
+                format_datetime(updated_at_raw),
+                updated_date,
+                updated_time,
+                order_id,
+            )
+        )
+
+    if not rows:
+        return 0
+
+    update_sql = """
+        UPDATE shopify_orders
+        SET
+            cancelled_at = %s,
+            cancel_reason = %s,
+            updated_at = %s,
+            updated_date = %s,
+            updated_time = %s
+        WHERE order_id = %s
+    """
+    executemany_chunked(cursor, connection, update_sql, rows)
+    logger.info(
+        f"✅ [{brand_name}] Synced cancellation metadata to shopify_orders for {len(rows)} order(s)"
+    )
+    return len(rows)
+
+
 def ensure_user_agent_column(brand_index: int, table_name: str):
     """
     Ensure user_agent column exists in the specific table.
@@ -3159,6 +3365,67 @@ def ensure_customer_tag_column(brand_index: int, table_name: str):
             except Exception as e:
                 if "Duplicate column name" in str(e):
                     pass
+    except Exception:
+        pass
+
+
+def ensure_shopify_order_cancellation_columns(brand_index: int):
+    engine = sqlalchemy_engines.get(brand_index)
+    if not engine:
+        return
+
+    try:
+        with engine.connect() as conn:
+            for sql in (
+                "ALTER TABLE shopify_orders ADD COLUMN cancelled_at DATETIME NULL",
+                "ALTER TABLE shopify_orders ADD COLUMN cancel_reason VARCHAR(255) NULL",
+            ):
+                try:
+                    conn.execute(text(sql))
+                    conn.commit()
+                except Exception as e:
+                    if "Duplicate column name" in str(e):
+                        continue
+    except Exception:
+        pass
+
+
+def ensure_returns_fact_cancellation_columns(brand_index: int):
+    engine = sqlalchemy_engines.get(brand_index)
+    if not engine:
+        return
+
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS returns_fact (
+                        order_id BIGINT NOT NULL,
+                        event_date DATE NOT NULL,
+                        event_type ENUM('CANCEL','REFUND') NOT NULL,
+                        order_created_date DATE NULL,
+                        cancelled_at DATETIME NULL,
+                        cancel_reason VARCHAR(255) NULL,
+                        amount DECIMAL(12,2) NOT NULL,
+                        PRIMARY KEY (order_id, event_type, event_date),
+                        KEY idx_event_date (event_date)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    """
+                )
+            )
+            conn.commit()
+            for sql in (
+                "ALTER TABLE returns_fact ADD COLUMN order_created_date DATE NULL AFTER event_type",
+                "ALTER TABLE returns_fact ADD COLUMN cancelled_at DATETIME NULL AFTER order_created_date",
+                "ALTER TABLE returns_fact ADD COLUMN cancel_reason VARCHAR(255) NULL AFTER cancelled_at",
+            ):
+                try:
+                    conn.execute(text(sql))
+                    conn.commit()
+                except Exception as e:
+                    if "Duplicate column name" in str(e):
+                        continue
     except Exception:
         pass
 
@@ -4300,100 +4567,80 @@ def update_order_summary_incremental(
             overall_cod_orders, overall_prepaid_orders, overall_partially_paid_orders
         )
         SELECT
-            date,
-            SUM(orders_created) AS number_of_orders_created,
-            SUM(orders_returned) AS number_of_orders_returned,
-            SUM(orders_created) - SUM(orders_returned) AS actual_number_of_orders,
-            SUM(cod_created) - SUM(cod_returned) AS cod_orders,
-            SUM(prepaid_created) - SUM(prepaid_returned) AS prepaid_orders,
-            SUM(partially_paid_created) - SUM(partially_paid_returned) AS partially_paid_orders,
-            SUM(cod_created) AS overall_cod_orders,
-            SUM(prepaid_created) AS overall_prepaid_orders,
-            SUM(partially_paid_created) AS overall_partially_paid_orders
+            created.date,
+            created.orders_created AS number_of_orders_created,
+            COALESCE(cancelled.orders_returned, 0) AS number_of_orders_returned,
+            created.orders_created - COALESCE(cancelled.orders_returned, 0) AS actual_number_of_orders,
+            created.cod_created - COALESCE(cancelled.cod_returned, 0) AS cod_orders,
+            created.prepaid_created - COALESCE(cancelled.prepaid_returned, 0) AS prepaid_orders,
+            created.partially_paid_created - COALESCE(cancelled.partially_paid_returned, 0) AS partially_paid_orders,
+            created.cod_created AS overall_cod_orders,
+            created.prepaid_created AS overall_prepaid_orders,
+            created.partially_paid_created AS overall_partially_paid_orders
         FROM (
-            SELECT 
+            SELECT
                 STR_TO_DATE(created_date, '%Y-%m-%d') AS date,
                 COUNT(DISTINCT order_id) AS orders_created,
-                0 AS orders_returned,
-
-                -- COD created: includes NULL, empty, and COD keywords
-                COUNT(DISTINCT CASE 
-                    WHEN (payment_gateway_names IS NULL 
-                      OR payment_gateway_names = '' 
-                      OR payment_gateway_names LIKE '%Cash on Delivery (COD)%' 
+                COUNT(DISTINCT CASE
+                    WHEN (payment_gateway_names IS NULL
+                      OR payment_gateway_names = ''
+                      OR payment_gateway_names LIKE '%Cash on Delivery (COD)%'
                       OR payment_gateway_names LIKE '%cash_on_delivery%')
                       AND (payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR payment_gateway_names IS NULL)
                     THEN order_id END) AS cod_created,
-
-                0 AS cod_returned,
-
-                -- Prepaid created: exclude COD, blank, and Gokwik PPCOD
-                COUNT(DISTINCT CASE 
-                    WHEN payment_gateway_names IS NOT NULL 
-                      AND payment_gateway_names != '' 
+                COUNT(DISTINCT CASE
+                    WHEN payment_gateway_names IS NOT NULL
+                      AND payment_gateway_names != ''
                       AND NOT (payment_gateway_names LIKE '%Cash on Delivery (COD)%'
                           OR payment_gateway_names LIKE '%cash_on_delivery%'
                           OR payment_gateway_names LIKE '%Gokwik PPCOD%')
                     THEN order_id END) AS prepaid_created,
-
-                0 AS prepaid_returned,
-
-                -- Partially paid created (Gokwik PPCOD)
-                COUNT(DISTINCT CASE 
-                    WHEN payment_gateway_names LIKE '%Gokwik PPCOD%' 
-                    THEN order_id END) AS partially_paid_created,
-
-                0 AS partially_paid_returned
-
+                COUNT(DISTINCT CASE
+                    WHEN payment_gateway_names LIKE '%Gokwik PPCOD%'
+                    THEN order_id END) AS partially_paid_created
             FROM shopify_orders
             WHERE created_date IN ({placeholders})
             GROUP BY created_date
-
-            UNION ALL
-
-            SELECT 
-                STR_TO_DATE(updated_date, '%Y-%m-%d') AS date,
-                0 AS orders_created,
-                COUNT(DISTINCT order_id) AS orders_returned,
-
-                0 AS cod_created,
-
-                -- COD returned: includes NULL, empty, and COD keywords
-                COUNT(DISTINCT CASE 
-                    WHEN (payment_gateway_names IS NULL 
-                      OR payment_gateway_names = '' 
-                      OR payment_gateway_names LIKE '%Cash on Delivery (COD)%' 
-                      OR payment_gateway_names LIKE '%cash_on_delivery%')
-                      AND (payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR payment_gateway_names IS NULL)
-                    THEN order_id END) AS cod_returned,
-
-                0 AS prepaid_created,
-
-                -- Prepaid returned
-                COUNT(DISTINCT CASE 
-                    WHEN payment_gateway_names IS NOT NULL 
-                      AND payment_gateway_names != '' 
-                      AND NOT (payment_gateway_names LIKE '%Cash on Delivery (COD)%'
-                          OR payment_gateway_names LIKE '%cash_on_delivery%'
-                          OR payment_gateway_names LIKE '%Gokwik PPCOD%')
-                    THEN order_id END) AS prepaid_returned,
-
-                0 AS partially_paid_created,
-
-                -- Partially paid returned
-                COUNT(DISTINCT CASE 
-                    WHEN payment_gateway_names LIKE '%Gokwik PPCOD%' 
-                    THEN order_id END) AS partially_paid_returned
-
-            FROM shopify_orders_update
-            WHERE financial_status NOT IN ('paid', 'pending')
-              AND updated_date IN ({placeholders})
-            GROUP BY updated_date
-        ) AS combined
-        WHERE date IS NOT NULL
-        GROUP BY date
+        ) AS created
+        LEFT JOIN (
+            SELECT
+                rf.order_created_date AS date,
+                COUNT(DISTINCT rf.order_id) AS orders_returned,
+                COUNT(DISTINCT CASE
+                    WHEN (ob.payment_gateway_names IS NULL
+                      OR ob.payment_gateway_names = ''
+                      OR ob.payment_gateway_names LIKE '%Cash on Delivery (COD)%'
+                      OR ob.payment_gateway_names LIKE '%cash_on_delivery%')
+                      AND (ob.payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR ob.payment_gateway_names IS NULL)
+                    THEN rf.order_id END) AS cod_returned,
+                COUNT(DISTINCT CASE
+                    WHEN ob.payment_gateway_names IS NOT NULL
+                      AND ob.payment_gateway_names != ''
+                      AND NOT (ob.payment_gateway_names LIKE '%Cash on Delivery (COD)%'
+                          OR ob.payment_gateway_names LIKE '%cash_on_delivery%'
+                          OR ob.payment_gateway_names LIKE '%Gokwik PPCOD%')
+                    THEN rf.order_id END) AS prepaid_returned,
+                COUNT(DISTINCT CASE
+                    WHEN ob.payment_gateway_names LIKE '%Gokwik PPCOD%'
+                    THEN rf.order_id END) AS partially_paid_returned
+            FROM returns_fact rf
+            LEFT JOIN (
+                SELECT
+                    order_id,
+                    MAX(payment_gateway_names) AS payment_gateway_names
+                FROM shopify_orders
+                WHERE created_date IN ({placeholders})
+                GROUP BY order_id
+            ) AS ob
+                ON ob.order_id = CAST(rf.order_id AS CHAR)
+            WHERE rf.event_type = 'CANCEL'
+              AND rf.order_created_date IN ({placeholders})
+            GROUP BY rf.order_created_date
+        ) AS cancelled
+            ON cancelled.date = created.date
+        WHERE created.date IS NOT NULL
         """
-        cursor.execute(sql, params + params)
+        cursor.execute(sql, params + params + params)
         connection.commit()
 
         # STEP 4 & 5: Fetch affected dates and merge
@@ -7255,6 +7502,8 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
     ensure_user_agent_column(brand_index, "shopify_orders")
     ensure_user_agent_column(brand_index, "shopify_orders_update")
     ensure_customer_tag_column(brand_index, "shopify_orders")
+    ensure_shopify_order_cancellation_columns(brand_index)
+    ensure_returns_fact_cancellation_columns(brand_index)
     ensure_bundle_property_columns(brand_index, "shopify_orders")
     ensure_bundle_property_columns(brand_index, "shopify_orders_update")
     ensure_device_summary_columns(brand_index, "hourly_sessions_summary")
@@ -7362,6 +7611,23 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
                 f"Fetched {original_count}, removed {original_count - len(filtered)} duplicates. Processing {len(filtered)} orders."
             )
 
+            previous_state_by_order_id: Dict[str, Dict[str, Any]] = {}
+            cancellation_transition_order_ids: Set[str] = set()
+            cancellation_created_dates: Set[str] = set()
+            if process["type"] == "UPDATED":
+                previous_state_by_order_id = get_shopify_orders_previous_state_map(
+                    (str(order.get("id")) for order in filtered),
+                    cursor,
+                )
+                (
+                    cancellation_transition_order_ids,
+                    cancellation_created_dates,
+                ) = get_cancellation_transition_details(
+                    filtered,
+                    previous_state_by_order_id,
+                    tz,
+                )
+
             # Track affected dates for NEW orders before load
             if process["type"] == "NEW":
                 new_dates = get_affected_dates_new_orders(filtered, tz)
@@ -7381,6 +7647,9 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
             load_data_to_sql_optimized(
                 df, brand_index, brand_name, process["table"], batch_size
             )
+            sync_shopify_orders_cancellation_fields_from_orders(
+                filtered, cursor, connection, brand_name
+            )
 
             if process["type"] == "NEW":
                 discount_fact_dates = upsert_dashboard_order_discount_fact_from_orders(
@@ -7390,7 +7659,7 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
                     affected_dates.update(discount_fact_dates)
 
             # Upsert returns_fact from the same filtered snapshots
-            changed_return_dates = upsert_returns_fact_from_orders(
+            changed_refund_dates = upsert_returns_fact_from_orders(
                 brand_index, filtered, cursor=cursor, connection=connection
             )
 
@@ -7410,7 +7679,10 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
                 upd_dates = get_affected_dates_updates(
                     filtered,
                     tz,
-                    extra_event_dates=changed_return_dates,
+                    extra_event_dates=changed_refund_dates,
+                    previous_state_by_order_id=previous_state_by_order_id,
+                    cancellation_transition_order_ids=cancellation_transition_order_ids,
+                    cancellation_created_dates=cancellation_created_dates,
                 )
                 rto_upd_dates = set()
                 if get_rto_tag_for_brand(brand_index, brand_name):
