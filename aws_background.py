@@ -4183,6 +4183,17 @@ def ensure_summary_tables(cursor, connection):
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS product_traffic_split (
+                date DATE NOT NULL,
+                product_id VARCHAR(50) NOT NULL,
+                utm_source JSON NOT NULL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (date, product_id),
+                KEY idx_product_date (product_id, date)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+
         try:
             citywise_migrations = {
                 "daily_citywise_summary": {
@@ -7138,6 +7149,153 @@ def process_and_upload_utm_summary(
         )
 
 
+def _normalize_product_traffic_source(raw_source: Any) -> str:
+    value = (str(raw_source).strip() if raw_source is not None else "")
+    if not value or value.lower() in {"none", "null"}:
+        return "direct"
+    return value
+
+
+def update_product_traffic_split_incremental(
+    cursor,
+    connection,
+    brand_name: str,
+    target_dates: Iterable[str],
+):
+    placeholders, params = _dates_in_clause(target_dates)
+    if not params:
+        logger.debug(f"[{brand_name}] product_traffic_split: no dates to rebuild")
+        return
+
+    with timed(
+        f"[{brand_name}] product_traffic_split incremental ({len(params)} date(s))"
+    ):
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS product_traffic_split_stage LIKE product_traffic_split"
+        )
+        cursor.execute("TRUNCATE TABLE product_traffic_split_stage")
+
+        cursor.execute(
+            f"""
+            SELECT
+                `date`,
+                product_id,
+                utm_source,
+                SUM(COALESCE(sessions, 0)) AS sessions,
+                SUM(COALESCE(sessions_with_cart_additions, 0)) AS atc_sessions
+            FROM product_sessions_snapshot
+            WHERE `date` IN ({placeholders})
+              AND product_id IS NOT NULL
+              AND TRIM(product_id) <> ''
+            GROUP BY `date`, product_id, utm_source
+            """,
+            params,
+        )
+        source_rows = cursor.fetchall()
+
+        aggregated: Dict[Tuple[str, str], Dict[str, Dict[str, int]]] = {}
+        for row in source_rows:
+            if isinstance(row, dict):
+                date_val = row.get("date")
+                product_id = row.get("product_id")
+                utm_source = row.get("utm_source")
+                sessions = row.get("sessions")
+                atc_sessions = row.get("atc_sessions")
+            else:
+                date_val, product_id, utm_source, sessions, atc_sessions = row
+
+            if not date_val or not product_id:
+                continue
+
+            key = (str(date_val), str(product_id).strip())
+            normalized_source = _normalize_product_traffic_source(utm_source)
+            product_sources = aggregated.setdefault(key, {})
+            stats = product_sources.setdefault(
+                normalized_source,
+                {
+                    "utm_name": normalized_source,
+                    "sessions": 0,
+                    "atc_sessions": 0,
+                },
+            )
+            stats["sessions"] += int(sessions or 0)
+            stats["atc_sessions"] += int(atc_sessions or 0)
+
+        stage_rows = []
+        for (date_str, product_id), source_map in aggregated.items():
+            sorted_sources = sorted(
+                source_map.values(),
+                key=lambda item: (-item["sessions"], item["utm_name"]),
+            )
+            stage_rows.append((date_str, product_id, json.dumps(sorted_sources)))
+
+        if stage_rows:
+            executemany_chunked(
+                cursor,
+                connection,
+                """
+                INSERT INTO product_traffic_split_stage (date, product_id, utm_source)
+                VALUES (%s, %s, %s)
+                """,
+                stage_rows,
+                commit_between_chunks=False,
+            )
+        else:
+            connection.commit()
+
+        cursor.execute("START TRANSACTION")
+        cursor.execute(
+            f"DELETE FROM product_traffic_split WHERE date IN ({placeholders})",
+            params,
+        )
+        if stage_rows:
+            cursor.execute(
+                f"""
+                INSERT INTO product_traffic_split (date, product_id, utm_source)
+                SELECT date, product_id, utm_source
+                FROM product_traffic_split_stage
+                WHERE date IN ({placeholders})
+                """,
+                params,
+            )
+        connection.commit()
+        logger.info(
+            f"âœ… Updated product_traffic_split for {brand_name} ({len(stage_rows)} rows across {len(params)} date(s))"
+        )
+
+
+def refresh_product_traffic_split_for_window(
+    brand_index: int,
+    brand_name: str,
+    min_date: str,
+    max_date: str,
+):
+    with get_db_cursor(brand_index) as (cursor, connection):
+        ensure_summary_tables(cursor, connection)
+        cursor.execute(
+            """
+            SELECT DISTINCT `date`
+            FROM product_sessions_snapshot
+            WHERE `date` BETWEEN %s AND %s
+            ORDER BY `date`
+            """,
+            (min_date, max_date),
+        )
+        rows = cursor.fetchall()
+        target_dates = set()
+        for row in rows:
+            value = row.get("date") if isinstance(row, dict) else row[0]
+            if value:
+                target_dates.add(str(value))
+
+        update_product_traffic_split_incremental(
+            cursor,
+            connection,
+            brand_name,
+            target_dates,
+        )
+
+
 def fetch_shopify_referrer_sessions_daily(
     shop_name: str,
     access_token: str,
@@ -7789,7 +7947,7 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
             u_max = BACKFILL_END_IST.date().isoformat()
 
         logger.info(
-            f"📊 Refreshing UTM & Referrer summaries for {brand_name} ({u_min} to {u_max})"
+            f"Refreshing UTM, product traffic split, and Referrer summaries for {brand_name} ({u_min} to {u_max})"
         )
 
         # 1. UTM
@@ -7800,7 +7958,20 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
         except Exception as e:
             logger.error(f"❌ Error updating UTM summary for {brand_name}: {e}")
 
-        # 2. Referrer
+        # 2. Product traffic split
+        try:
+            refresh_product_traffic_split_for_window(
+                brand_index,
+                brand_name,
+                str(u_min),
+                str(u_max),
+            )
+        except Exception as e:
+            logger.error(
+                f"Error updating product traffic split for {brand_name}: {e}"
+            )
+
+        # 3. Referrer
         try:
             process_and_upload_referrer_summary(
                 brand_index, brand_name, shop_name, access_token, str(u_min), str(u_max)
