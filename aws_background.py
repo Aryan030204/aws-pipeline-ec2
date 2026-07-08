@@ -2126,17 +2126,34 @@ def transform_orders_to_df_optimized(
 # ---------------------------
 # Returns fact helpers
 # ---------------------------
+RETURN_EVENT_CANCEL = "CANCEL"
+RETURN_EVENT_CANCEL_RTO = "CANCEL (RTO)"
+RETURN_EVENT_REFUND = "REFUND"
+
+
 def _ensure_returns_fact(cursor, connection):
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS returns_fact (
           order_id     BIGINT        NOT NULL,
           event_date   DATE          NOT NULL,
-          event_type   ENUM('CANCEL','REFUND') NOT NULL,
+          event_type   ENUM('CANCEL','CANCEL (RTO)','REFUND') NOT NULL,
           amount       DECIMAL(12,2) NOT NULL,
           PRIMARY KEY (order_id, event_type, event_date),
           KEY idx_event_date (event_date)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """)
+    try:
+        cursor.execute("SHOW COLUMNS FROM returns_fact LIKE 'event_type'")
+        row = cursor.fetchone()
+        if row:
+            type_value = row.get("Type") if isinstance(row, dict) else row[1]
+            if "CANCEL (RTO)" not in str(type_value):
+                cursor.execute("""
+                    ALTER TABLE returns_fact
+                    MODIFY COLUMN event_type ENUM('CANCEL','CANCEL (RTO)','REFUND') NOT NULL
+                """)
+    except Exception as e:
+        logger.warning(f"⚠️ returns_fact event_type migration check failed: {e}")
     connection.commit()
 
 
@@ -2170,6 +2187,7 @@ def upsert_returns_fact_from_orders(
     try:
         _ensure_returns_fact(cursor, connection)
         tz = get_brand_timezone(brand_index)
+        rto_tag = get_rto_tag_for_brand(brand_index)
 
         agg: Dict[Tuple[str, str, str], float] = {}
 
@@ -2183,7 +2201,12 @@ def upsert_returns_fact_from_orders(
                 d = _parse_iso_to_store_date(cancelled_at, tz)
                 if d:
                     amt = float(o.get("total_price") or 0.0)
-                    key = (oid, "CANCEL", d)
+                    cancel_event_type = (
+                        RETURN_EVENT_CANCEL_RTO
+                        if _tags_csv_contains_exact_tag(o.get("tags"), rto_tag)
+                        else RETURN_EVENT_CANCEL
+                    )
+                    key = (oid, cancel_event_type, d)
                     agg[key] = max(agg.get(key, 0.0), amt)
 
             refunds = o.get("refunds") or []
@@ -2202,7 +2225,7 @@ def upsert_returns_fact_from_orders(
                         except Exception:
                             continue
                 if refund_sum > 0:
-                    key = (oid, "REFUND", rdate)
+                    key = (oid, RETURN_EVENT_REFUND, rdate)
                     agg[key] = agg.get(key, 0.0) + refund_sum
 
         if not agg:
@@ -2253,6 +2276,18 @@ def upsert_returns_fact_from_orders(
             old_amount = existing_amounts.get(key)
             if old_amount is None or abs(float(old_amount) - float(new_amount)) > 0.009:
                 changed_dates.add(key[2])
+
+        stale_keys = [key for key in existing_amounts.keys() if key not in agg]
+        for key in stale_keys:
+            changed_dates.add(key[2])
+
+        if stale_keys:
+            delete_sql = """
+                DELETE FROM returns_fact
+                WHERE order_id = %s AND event_type = %s AND event_date = %s
+            """
+            delete_rows = [(int(k[0]), k[1], k[2]) for k in stale_keys]
+            executemany_chunked(cursor, connection, delete_sql, delete_rows)
 
         rows = [(int(k[0]), k[2], k[1], round(v, 2)) for k, v in agg.items()]
         insert_sql = """
@@ -2995,6 +3030,32 @@ def get_rto_tag_for_brand(brand_index: int, brand_name: Optional[str] = None) ->
 def _build_mysql_regex_for_exact_tag(tag_value: str) -> str:
     escaped_tag = re.escape(tag_value.strip().lower()).replace(r"\ ", " ")
     return rf"(^|,)[[:space:]]*{escaped_tag}[[:space:]]*(,|$)"
+
+
+def _tags_csv_contains_exact_tag(raw_tags: Optional[str], tag_value: Optional[str]) -> bool:
+    if not raw_tags or not tag_value:
+        return False
+
+    target = tag_value.strip().lower()
+    if not target:
+        return False
+
+    return any(tag.strip().lower() == target for tag in str(raw_tags).split(","))
+
+
+def _get_rto_tag_sql_filters(
+    brand_index: int, brand_name: Optional[str], tag_column: str = "tags"
+) -> Tuple[str, str, List[str]]:
+    rto_tag = get_rto_tag_for_brand(brand_index, brand_name)
+    if not rto_tag:
+        return "1=1", "0=1", []
+
+    regex_pattern = _build_mysql_regex_for_exact_tag(rto_tag)
+    non_rto_filter = (
+        f"({tag_column} IS NULL OR LOWER({tag_column}) NOT REGEXP %s)"
+    )
+    rto_filter = f"({tag_column} IS NOT NULL AND LOWER({tag_column}) REGEXP %s)"
+    return non_rto_filter, rto_filter, [regex_pattern]
 
 
 def get_rto_affected_dates_updates(orders_list: List[Dict], tz: ZoneInfo) -> Set[str]:
@@ -3774,12 +3835,23 @@ def ensure_summary_tables(cursor, connection):
                 actual_overall_sales_WO_hypd DECIMAL(12,2) DEFAULT 0,
                 overall_sales DECIMAL(12,2) DEFAULT 0,
                 overall_returns DECIMAL(12,2) DEFAULT 0,
+                rto_gokwik_returns DECIMAL(12,2) DEFAULT 0,
+                rto_kwik_engage_returns DECIMAL(12,2) DEFAULT 0,
+                rto_online_store_returns DECIMAL(12,2) DEFAULT 0,
+                rto_hypd_store_returns DECIMAL(12,2) DEFAULT 0,
+                rto_draft_order_returns DECIMAL(12,2) DEFAULT 0,
+                rto_dpanda_returns DECIMAL(12,2) DEFAULT 0,
+                rto_gkappbrew_returns DECIMAL(12,2) DEFAULT 0,
+                rto_buykaro_returns DECIMAL(12,2) DEFAULT 0,
+                rto_appbrewplus_returns DECIMAL(12,2) DEFAULT 0,
+                rto_shopflo_returns DECIMAL(12,2) DEFAULT 0,
+                rto_overall_returns_WO_hypd DECIMAL(12,2) DEFAULT 0,
                 actual_overall_sales DECIMAL(12,2) DEFAULT 0,
                 KEY idx_date (date)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
 
-        # --- Migration: Add Shopflo columns if they are missing from an existing table ---
+        # --- Migration: Add/align sales_summary columns if they are missing from an existing table ---
         try:
             cursor.execute("SHOW COLUMNS FROM sales_summary")
             rows = cursor.fetchall()
@@ -3791,6 +3863,17 @@ def ensure_summary_tables(cursor, connection):
                 "shopflo_sales": "DECIMAL(12,2) DEFAULT 0 AFTER actual_appbrewplus_sale",
                 "shopflo_returns": "DECIMAL(12,2) DEFAULT 0 AFTER shopflo_sales",
                 "actual_shopflo_sale": "DECIMAL(12,2) DEFAULT 0 AFTER shopflo_returns",
+                "rto_gokwik_returns": "DECIMAL(12,2) DEFAULT 0 AFTER overall_returns",
+                "rto_kwik_engage_returns": "DECIMAL(12,2) DEFAULT 0 AFTER rto_gokwik_returns",
+                "rto_online_store_returns": "DECIMAL(12,2) DEFAULT 0 AFTER rto_kwik_engage_returns",
+                "rto_hypd_store_returns": "DECIMAL(12,2) DEFAULT 0 AFTER rto_online_store_returns",
+                "rto_draft_order_returns": "DECIMAL(12,2) DEFAULT 0 AFTER rto_hypd_store_returns",
+                "rto_dpanda_returns": "DECIMAL(12,2) DEFAULT 0 AFTER rto_draft_order_returns",
+                "rto_gkappbrew_returns": "DECIMAL(12,2) DEFAULT 0 AFTER rto_dpanda_returns",
+                "rto_buykaro_returns": "DECIMAL(12,2) DEFAULT 0 AFTER rto_gkappbrew_returns",
+                "rto_appbrewplus_returns": "DECIMAL(12,2) DEFAULT 0 AFTER rto_buykaro_returns",
+                "rto_shopflo_returns": "DECIMAL(12,2) DEFAULT 0 AFTER rto_appbrewplus_returns",
+                "rto_overall_returns_WO_hypd": "DECIMAL(12,2) DEFAULT 0 AFTER rto_shopflo_returns",
             }
 
             for col, definition in migrations.items():
@@ -3815,19 +3898,59 @@ def ensure_summary_tables(cursor, connection):
                 overall_cod_orders INT DEFAULT 0,
                 overall_prepaid_orders INT DEFAULT 0,
                 overall_partially_paid_orders INT DEFAULT 0,
+                rto_number_of_orders_returned INT DEFAULT 0,
+                rto_cod_orders_returned INT DEFAULT 0,
+                rto_prepaid_orders_returned INT DEFAULT 0,
+                rto_partially_paid_orders_returned INT DEFAULT 0,
                 KEY idx_date (date)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
+
+        try:
+            cursor.execute("SHOW COLUMNS FROM order_summary")
+            rows = cursor.fetchall()
+            existing_cols = {
+                row["Field"] if isinstance(row, dict) else row[0] for row in rows
+            }
+            migrations = {
+                "rto_number_of_orders_returned": "INT DEFAULT 0 AFTER overall_partially_paid_orders",
+                "rto_cod_orders_returned": "INT DEFAULT 0 AFTER rto_number_of_orders_returned",
+                "rto_prepaid_orders_returned": "INT DEFAULT 0 AFTER rto_cod_orders_returned",
+                "rto_partially_paid_orders_returned": "INT DEFAULT 0 AFTER rto_prepaid_orders_returned",
+            }
+            for col, definition in migrations.items():
+                if col not in existing_cols:
+                    cursor.execute(
+                        f"ALTER TABLE order_summary ADD COLUMN {col} {definition}"
+                    )
+            connection.commit()
+        except Exception as e:
+            logger.warning(f"⚠️ Migration check for order_summary failed: {e}")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS discount_summary (
                 date DATE PRIMARY KEY,
                 total_discounts_given DECIMAL(12,2) DEFAULT 0,
                 total_discount_on_returns DECIMAL(12,2) DEFAULT 0,
+                rto_total_discount_on_returns DECIMAL(12,2) DEFAULT 0,
                 actual_discounts DECIMAL(12,2) DEFAULT 0,
                 KEY idx_date (date)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
+
+        try:
+            cursor.execute("SHOW COLUMNS FROM discount_summary")
+            rows = cursor.fetchall()
+            existing_cols = {
+                row["Field"] if isinstance(row, dict) else row[0] for row in rows
+            }
+            if "rto_total_discount_on_returns" not in existing_cols:
+                cursor.execute(
+                    "ALTER TABLE discount_summary ADD COLUMN rto_total_discount_on_returns DECIMAL(12,2) DEFAULT 0 AFTER total_discount_on_returns"
+                )
+            connection.commit()
+        except Exception as e:
+            logger.warning(f"⚠️ Migration check for discount_summary failed: {e}")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS gross_summary (
@@ -4152,22 +4275,22 @@ def merge_staging_to_main_by_date(
 
 
 def update_sales_summary_incremental(
-    cursor, connection, brand_name: str, target_dates: Iterable[str]
+    cursor, connection, brand_index: int, brand_name: str, target_dates: Iterable[str]
 ):
     """Update sales_summary for only the specific affected dates."""
     placeholders, params = _dates_in_clause(target_dates)
     if not params:
         logger.debug(f"[{brand_name}] sales_summary: no dates to rebuild")
         return
+    non_rto_filter, rto_filter, tag_params = _get_rto_tag_sql_filters(
+        brand_index, brand_name
+    )
     with timed(
         f"[{brand_name}] sales_summary incremental ({len(params)} date(s))"
     ):
         # STEP 1: Create staging table
-        cursor.execute(
-            "CREATE TABLE IF NOT EXISTS sales_summary_stage LIKE sales_summary"
-        )
-        # STEP 2: Clear staging table
-        cursor.execute("TRUNCATE TABLE sales_summary_stage")
+        cursor.execute("DROP TABLE IF EXISTS sales_summary_stage")
+        cursor.execute("CREATE TABLE sales_summary_stage LIKE sales_summary")
 
         # STEP 3: Populate staging table
         sql = f"""
@@ -4183,7 +4306,12 @@ def update_sales_summary_incremental(
             appbrewplus_sales, appbrewplus_returns, actual_appbrewplus_sale,
             shopflo_sales, shopflo_returns, actual_shopflo_sale,
             overall_sales_WO_hypd, overall_returns_WO_hypd, actual_overall_sales_WO_hypd,
-            overall_sales, overall_returns, actual_overall_sales
+            overall_sales, overall_returns,
+            rto_gokwik_returns, rto_kwik_engage_returns, rto_online_store_returns,
+            rto_hypd_store_returns, rto_draft_order_returns, rto_dpanda_returns,
+            rto_gkappbrew_returns, rto_buykaro_returns, rto_appbrewplus_returns,
+            rto_shopflo_returns, rto_overall_returns_WO_hypd,
+            actual_overall_sales
         )
         WITH SalesData AS (
             SELECT
@@ -4219,7 +4347,29 @@ def update_sales_summary_incremental(
                 SUM(CASE WHEN order_app_name = 'Shopflo' THEN total_price ELSE 0 END) AS shopflo_returns,
                 SUM(CASE WHEN order_app_name != 'HYPD_store' THEN total_price ELSE 0 END) AS global_returns_WO_hypd
             FROM shopify_orders_update
-            WHERE financial_status NOT IN ('paid', 'pending') AND updated_date IN ({placeholders})
+            WHERE financial_status NOT IN ('paid', 'pending')
+              AND updated_date IN ({placeholders})
+              AND {non_rto_filter}
+            GROUP BY date
+        ),
+        RtoReturnsData AS (
+            SELECT
+                STR_TO_DATE(updated_date, '%Y-%m-%d') AS date,
+                SUM(CASE WHEN order_app_name = 'GoKwik' THEN total_price ELSE 0 END) AS gokwik_returns,
+                SUM(CASE WHEN order_app_name = 'KwikEngage' THEN total_price ELSE 0 END) AS kwik_engage_returns,
+                SUM(CASE WHEN order_app_name = 'Online Store' THEN total_price ELSE 0 END) AS online_store_returns,
+                SUM(CASE WHEN order_app_name = 'HYPD_store' THEN total_price ELSE 0 END) AS hypd_store_returns,
+                SUM(CASE WHEN order_app_name = 'Draft Order' THEN total_price ELSE 0 END) AS draft_order_returns,
+                SUM(CASE WHEN order_app_name = 'Dpanda' THEN total_price ELSE 0 END) AS dpanda_returns,
+                SUM(CASE WHEN order_app_name = 'GKAppbrew' THEN total_price ELSE 0 END) AS gkappbrew_returns,
+                SUM(CASE WHEN order_app_name = 'BuyKaro' THEN total_price ELSE 0 END) AS buykaro_returns,
+                SUM(CASE WHEN order_app_name = 'AppbrewPlus' THEN total_price ELSE 0 END) AS appbrewplus_returns,
+                SUM(CASE WHEN order_app_name = 'Shopflo' THEN total_price ELSE 0 END) AS shopflo_returns,
+                SUM(CASE WHEN order_app_name != 'HYPD_store' THEN total_price ELSE 0 END) AS global_returns_WO_hypd
+            FROM shopify_orders_update
+            WHERE financial_status NOT IN ('paid', 'pending')
+              AND updated_date IN ({placeholders})
+              AND {rto_filter}
             GROUP BY date
         ),
         RefundsByDate AS (
@@ -4231,6 +4381,7 @@ def update_sales_summary_incremental(
         AllDates AS (
             SELECT DISTINCT date FROM SalesData
             UNION SELECT DISTINCT date FROM ReturnsData
+            UNION SELECT DISTINCT date FROM RtoReturnsData
             UNION SELECT DISTINCT date FROM RefundsByDate
         )
         SELECT
@@ -4271,14 +4422,29 @@ def update_sales_summary_incremental(
             
             COALESCE(s.global_overall_sales, 0),
             COALESCE(rfd.overall_returns, 0),
+            COALESCE(rr.gokwik_returns, 0),
+            COALESCE(rr.kwik_engage_returns, 0),
+            COALESCE(rr.online_store_returns, 0),
+            COALESCE(rr.hypd_store_returns, 0),
+            COALESCE(rr.draft_order_returns, 0),
+            COALESCE(rr.dpanda_returns, 0),
+            COALESCE(rr.gkappbrew_returns, 0),
+            COALESCE(rr.buykaro_returns, 0),
+            COALESCE(rr.appbrewplus_returns, 0),
+            COALESCE(rr.shopflo_returns, 0),
+            COALESCE(rr.global_returns_WO_hypd, 0),
             COALESCE(s.global_overall_sales, 0) - COALESCE(rfd.overall_returns, 0)
             
         FROM AllDates d
         LEFT JOIN SalesData s ON d.date = s.date
         LEFT JOIN ReturnsData r ON d.date = r.date
+        LEFT JOIN RtoReturnsData rr ON d.date = rr.date
         LEFT JOIN RefundsByDate rfd ON d.date = rfd.date
         """
-        cursor.execute(sql, params + params + params)
+        cursor.execute(
+            sql,
+            params + params + tag_params + params + tag_params + params,
+        )
         connection.commit()
 
         # STEP 4 & 5: Fetch affected dates and merge
@@ -4288,27 +4454,29 @@ def update_sales_summary_incremental(
 
 
 def update_order_summary_incremental(
-    cursor, connection, brand_name: str, target_dates: Iterable[str]
+    cursor, connection, brand_index: int, brand_name: str, target_dates: Iterable[str]
 ):
     """Update order_summary for only the specific affected dates."""
     placeholders, params = _dates_in_clause(target_dates)
     if not params:
         logger.debug(f"[{brand_name}] order_summary: no dates to rebuild")
         return
+    non_rto_filter, rto_filter, tag_params = _get_rto_tag_sql_filters(
+        brand_index, brand_name
+    )
     with timed(f"[{brand_name}] order_summary incremental ({len(params)} date(s))"):
         # STEP 1: Create staging table
-        cursor.execute(
-            "CREATE TABLE IF NOT EXISTS order_summary_stage LIKE order_summary"
-        )
-        # STEP 2: Clear staging table
-        cursor.execute("TRUNCATE TABLE order_summary_stage")
+        cursor.execute("DROP TABLE IF EXISTS order_summary_stage")
+        cursor.execute("CREATE TABLE order_summary_stage LIKE order_summary")
 
         # STEP 3: Populate staging table
         sql = f"""
         INSERT INTO order_summary_stage (
             date, number_of_orders_created, number_of_orders_returned, actual_number_of_orders,
             cod_orders, prepaid_orders, partially_paid_orders,
-            overall_cod_orders, overall_prepaid_orders, overall_partially_paid_orders
+            overall_cod_orders, overall_prepaid_orders, overall_partially_paid_orders,
+            rto_number_of_orders_returned, rto_cod_orders_returned,
+            rto_prepaid_orders_returned, rto_partially_paid_orders_returned
         )
         SELECT
             date,
@@ -4320,7 +4488,11 @@ def update_order_summary_incremental(
             SUM(partially_paid_created) - SUM(partially_paid_returned) AS partially_paid_orders,
             SUM(cod_created) AS overall_cod_orders,
             SUM(prepaid_created) AS overall_prepaid_orders,
-            SUM(partially_paid_created) AS overall_partially_paid_orders
+            SUM(partially_paid_created) AS overall_partially_paid_orders,
+            SUM(rto_orders_returned) AS rto_number_of_orders_returned,
+            SUM(rto_cod_returned) AS rto_cod_orders_returned,
+            SUM(rto_prepaid_returned) AS rto_prepaid_orders_returned,
+            SUM(rto_partially_paid_returned) AS rto_partially_paid_orders_returned
         FROM (
             SELECT 
                 STR_TO_DATE(created_date, '%Y-%m-%d') AS date,
@@ -4354,7 +4526,11 @@ def update_order_summary_incremental(
                     WHEN payment_gateway_names LIKE '%Gokwik PPCOD%' 
                     THEN order_id END) AS partially_paid_created,
 
-                0 AS partially_paid_returned
+                0 AS partially_paid_returned,
+                0 AS rto_orders_returned,
+                0 AS rto_cod_returned,
+                0 AS rto_prepaid_returned,
+                0 AS rto_partially_paid_returned
 
             FROM shopify_orders
             WHERE created_date IN ({placeholders})
@@ -4395,16 +4571,61 @@ def update_order_summary_incremental(
                 COUNT(DISTINCT CASE 
                     WHEN payment_gateway_names LIKE '%Gokwik PPCOD%' 
                     THEN order_id END) AS partially_paid_returned
+                ,
+                0 AS rto_orders_returned,
+                0 AS rto_cod_returned,
+                0 AS rto_prepaid_returned,
+                0 AS rto_partially_paid_returned
 
             FROM shopify_orders_update
             WHERE financial_status NOT IN ('paid', 'pending')
               AND updated_date IN ({placeholders})
+              AND {non_rto_filter}
+            GROUP BY updated_date
+
+            UNION ALL
+
+            SELECT
+                STR_TO_DATE(updated_date, '%Y-%m-%d') AS date,
+                0 AS orders_created,
+                0 AS orders_returned,
+                0 AS cod_created,
+                0 AS cod_returned,
+                0 AS prepaid_created,
+                0 AS prepaid_returned,
+                0 AS partially_paid_created,
+                0 AS partially_paid_returned,
+                COUNT(DISTINCT order_id) AS rto_orders_returned,
+                COUNT(DISTINCT CASE
+                    WHEN (payment_gateway_names IS NULL
+                      OR payment_gateway_names = ''
+                      OR payment_gateway_names LIKE '%Cash on Delivery (COD)%'
+                      OR payment_gateway_names LIKE '%cash_on_delivery%')
+                      AND (payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR payment_gateway_names IS NULL)
+                    THEN order_id END) AS rto_cod_returned,
+                COUNT(DISTINCT CASE
+                    WHEN payment_gateway_names IS NOT NULL
+                      AND payment_gateway_names != ''
+                      AND NOT (payment_gateway_names LIKE '%Cash on Delivery (COD)%'
+                          OR payment_gateway_names LIKE '%cash_on_delivery%'
+                          OR payment_gateway_names LIKE '%Gokwik PPCOD%')
+                    THEN order_id END) AS rto_prepaid_returned,
+                COUNT(DISTINCT CASE
+                    WHEN payment_gateway_names LIKE '%Gokwik PPCOD%'
+                    THEN order_id END) AS rto_partially_paid_returned
+            FROM shopify_orders_update
+            WHERE financial_status NOT IN ('paid', 'pending')
+              AND updated_date IN ({placeholders})
+              AND {rto_filter}
             GROUP BY updated_date
         ) AS combined
         WHERE date IS NOT NULL
         GROUP BY date
         """
-        cursor.execute(sql, params + params)
+        cursor.execute(
+            sql,
+            params + params + tag_params + params + tag_params,
+        )
         connection.commit()
 
         # STEP 4 & 5: Fetch affected dates and merge
@@ -4414,26 +4635,29 @@ def update_order_summary_incremental(
 
 
 def update_discount_summary_incremental(
-    cursor, connection, brand_name: str, target_dates: Iterable[str]
+    cursor, connection, brand_index: int, brand_name: str, target_dates: Iterable[str]
 ):
     """Update discount_summary for only the specific affected dates."""
     placeholders, params = _dates_in_clause(target_dates)
     if not params:
         logger.debug(f"[{brand_name}] discount_summary: no dates to rebuild")
         return
+    non_rto_filter, rto_filter, tag_params = _get_rto_tag_sql_filters(
+        brand_index, brand_name
+    )
     with timed(
         f"[{brand_name}] discount_summary incremental ({len(params)} date(s))"
     ):
         # STEP 1: Create staging table
-        cursor.execute(
-            "CREATE TABLE IF NOT EXISTS discount_summary_stage LIKE discount_summary"
-        )
-        # STEP 2: Clear staging table
-        cursor.execute("TRUNCATE TABLE discount_summary_stage")
+        cursor.execute("DROP TABLE IF EXISTS discount_summary_stage")
+        cursor.execute("CREATE TABLE discount_summary_stage LIKE discount_summary")
 
         # STEP 3: Populate staging table
         sql = f"""
-        INSERT INTO discount_summary_stage (date, total_discounts_given, total_discount_on_returns, actual_discounts)
+        INSERT INTO discount_summary_stage (
+            date, total_discounts_given, total_discount_on_returns,
+            rto_total_discount_on_returns, actual_discounts
+        )
         WITH DiscountsGiven AS (
             SELECT
                 STR_TO_DATE(created_date, '%Y-%m-%d') AS date,
@@ -4447,24 +4671,40 @@ def update_discount_summary_incremental(
                 STR_TO_DATE(updated_date, '%Y-%m-%d') AS date,
                 SUM(COALESCE(discount_amount, 0)) AS total_discount_on_returns
             FROM shopify_orders_update
-            WHERE financial_status NOT IN ('paid', 'pending') AND updated_date IN ({placeholders})
+            WHERE financial_status NOT IN ('paid', 'pending')
+              AND updated_date IN ({placeholders})
+              AND {non_rto_filter}
+            GROUP BY date
+        ),
+        RtoDiscountsReturned AS (
+            SELECT
+                STR_TO_DATE(updated_date, '%Y-%m-%d') AS date,
+                SUM(COALESCE(discount_amount, 0)) AS total_discount_on_returns
+            FROM shopify_orders_update
+            WHERE financial_status NOT IN ('paid', 'pending')
+              AND updated_date IN ({placeholders})
+              AND {rto_filter}
             GROUP BY date
         ),
         AllDates AS (
             SELECT DISTINCT date FROM DiscountsGiven
             UNION
             SELECT DISTINCT date FROM DiscountsReturned
+            UNION
+            SELECT DISTINCT date FROM RtoDiscountsReturned
         )
         SELECT
             d.date, 
             COALESCE(dg.total_discounts_given, 0) AS total_discounts_given,
             COALESCE(dr.total_discount_on_returns, 0) AS total_discount_on_returns,
+            COALESCE(rdr.total_discount_on_returns, 0) AS rto_total_discount_on_returns,
             (COALESCE(dg.total_discounts_given, 0) - COALESCE(dr.total_discount_on_returns, 0)) AS actual_discounts
         FROM AllDates d
         LEFT JOIN DiscountsGiven dg ON d.date = dg.date
         LEFT JOIN DiscountsReturned dr ON d.date = dr.date
+        LEFT JOIN RtoDiscountsReturned rdr ON d.date = rdr.date
         """
-        cursor.execute(sql, params + params)
+        cursor.execute(sql, params + params + tag_params + params + tag_params)
         connection.commit()
 
         # STEP 4 & 5: Fetch affected dates and merge
@@ -5065,7 +5305,7 @@ def update_rto_summary_incremental(
     rto_tag = get_rto_tag_for_brand(brand_index, brand_name)
     if not rto_tag:
         logger.info(
-            f"[{brand_name}] RTO summary skipped: brand not present in RTO_MAPPINGS"
+            f"[{brand_name}] RTO summary skipped: no active RTO tag from Mongo rto_tags or RTO_MAPPINGS"
         )
         return
 
@@ -5415,13 +5655,13 @@ def execute_summary_queries_incremental(
             # Update each summary incrementally
             if dates_set:
                 update_sales_summary_incremental(
-                    cursor, connection, brand_name, dates_set
+                    cursor, connection, brand_index, brand_name, dates_set
                 )
                 update_order_summary_incremental(
-                    cursor, connection, brand_name, dates_set
+                    cursor, connection, brand_index, brand_name, dates_set
                 )
                 update_discount_summary_incremental(
-                    cursor, connection, brand_name, dates_set
+                    cursor, connection, brand_index, brand_name, dates_set
                 )
                 update_gross_summary_incremental(
                     cursor, connection, brand_name, dates_set
