@@ -232,6 +232,9 @@ scheduler = BackgroundScheduler(timezone=IST)
 app = Flask(__name__)
 PIPELINE_AUTH_HEADER = os.environ.get("PIPELINE_AUTH_HEADER", "pipeline@nosecret123")
 SELF_RUN = os.environ.get("SELF_RUN", "true").strip().lower() == "true"
+FIRST_RUN_AFTERSTART = (
+    os.environ.get("FIRST_RUN_AFTERSTART", "false").strip().lower() == "true"
+)
 MANAGER_STARTED_ENDPOINT = os.environ.get("MANAGER_STARTED_ENDPOINT")
 MANAGER_COMPLETED_ENDPOINT = os.environ.get("MANAGER_COMPLETED_ENDPOINT")
 MANAGER_FAILED_ENDPOINT = os.environ.get("MANAGER_FAILED_ENDPOINT")
@@ -3333,6 +3336,21 @@ def ensure_ci_events_column(
         pass
 
 
+def run_brand_preflight_schema_migrations(brand_index: int) -> None:
+    brand_name = os.environ.get(f"BRAND_NAME_{brand_index}", f"Brand_{brand_index}")
+    logger.info(f"🧱 Running preflight schema migrations for {brand_name}")
+    ensure_user_agent_column(brand_index, "shopify_orders")
+    ensure_user_agent_column(brand_index, "shopify_orders_update")
+    ensure_customer_tag_column(brand_index, "shopify_orders")
+    ensure_bundle_property_columns(brand_index, "shopify_orders")
+    ensure_bundle_property_columns(brand_index, "shopify_orders_update")
+    ensure_device_summary_columns(brand_index, "hourly_sessions_summary")
+    ensure_device_summary_columns(brand_index, "hourly_sessions_summary_shopify")
+    ensure_ci_events_column(brand_index, "hourly_sessions_summary_shopify")
+    ensure_utm_names_column(brand_index, "overall_utm_summary")
+    logger.info(f"✅ Preflight schema migrations complete for {brand_name}")
+
+
 def _normalize_brand_token(value: Optional[str]) -> str:
     return re.sub(r"[^a-z0-9]+", "", (value or "").strip().lower())
 
@@ -3684,10 +3702,6 @@ def load_data_to_sql_optimized(
     table_name: str,
     batch_size: int = 1000,
 ):
-    if df.empty:
-        logger.info(f"DataFrame empty for {table_name}; nothing to load.")
-        return
-
     engine = sqlalchemy_engines.get(brand_index)
     if not engine:
         logger.error(f"No SQLAlchemy engine for brand {brand_index}")
@@ -3769,6 +3783,50 @@ def load_data_to_sql_optimized(
         metadata.create_all(engine, checkfirst=True)
     except SQLAlchemyError as e:
         logger.error(f"❌ Error creating table '{table_name}': {e}")
+        return
+
+    def _replace_backfill_window_if_needed() -> None:
+        if not (
+            is_backfill_active_for(brand_index)
+            and BACKFILL_START_IST
+            and BACKFILL_END_IST
+            and table_name in ("shopify_orders", "shopify_orders_update")
+        ):
+            return
+
+        tz = get_brand_timezone(brand_index)
+        window_start = BACKFILL_START_IST.astimezone(tz).date().isoformat()
+        window_end = BACKFILL_END_IST.astimezone(tz).date().isoformat()
+        date_column = "created_date" if table_name == "shopify_orders" else "updated_date"
+
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    f"""
+                    DELETE FROM {table_name}
+                    WHERE {date_column} >= :window_start
+                      AND {date_column} <= :window_end
+                    """
+                ),
+                {"window_start": window_start, "window_end": window_end},
+            )
+
+        logger.info(
+            f"🔁 [{brand_name}] Backfill replace-mode cleared {table_name} "
+            f"for {date_column} window {window_start}..{window_end}"
+        )
+
+    try:
+        _replace_backfill_window_if_needed()
+    except Exception as e:
+        logger.error(
+            f"❌ Error clearing backfill window in '{table_name}' for {brand_name}: {e}"
+        )
+        traceback.print_exc()
+        return
+
+    if df.empty:
+        logger.info(f"DataFrame empty for {table_name}; nothing to load.")
         return
 
     try:
@@ -7649,17 +7707,6 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
     # Optional: also log a short hash/length to catch truncation/mis-set envs
     logger.info(f"APP_ID_MAPPING_{brand_index} length={len(app_id_mapping_str)}")
 
-    # --- Pre-flight Schema Migration (Avoid Locks) ---
-    ensure_user_agent_column(brand_index, "shopify_orders")
-    ensure_user_agent_column(brand_index, "shopify_orders_update")
-    ensure_customer_tag_column(brand_index, "shopify_orders")
-    ensure_bundle_property_columns(brand_index, "shopify_orders")
-    ensure_bundle_property_columns(brand_index, "shopify_orders_update")
-    ensure_device_summary_columns(brand_index, "hourly_sessions_summary")
-    ensure_device_summary_columns(brand_index, "hourly_sessions_summary_shopify")
-    ensure_ci_events_column(brand_index, "hourly_sessions_summary_shopify")
-    ensure_utm_names_column(brand_index, "overall_utm_summary")
-
     # Sessions
     update_sessions_summary(
         brand_index,
@@ -8012,6 +8059,16 @@ def run_data_pipeline():
             logger.warning("No active brands match the current filters. Nothing to do.")
             return
 
+        logger.info("🧱 Running serial preflight schema migrations before brand workers...")
+        for idx in target_indices:
+            try:
+                run_brand_preflight_schema_migrations(idx)
+            except Exception as e:
+                brand_name = os.environ.get(f"BRAND_NAME_{idx}", f"Brand_{idx}")
+                logger.error(f"❌ Preflight schema migration failed for {brand_name}: {e}")
+                traceback.print_exc()
+                raise
+
         # Cap per-run concurrency to protect RDS I/O. The per-brand pipeline is
         # heavy (multi-table JOINs, summary rebuilds, session upserts); running
         # all brands at once drives EBSByteBalance% to 0. Override with env
@@ -8212,6 +8269,21 @@ if __name__ == "__main__":
         )
 
     scheduler.start()
+
+    if FIRST_RUN_AFTERSTART:
+        try:
+            job = scheduler.get_job("pipeline_job")
+            if job is not None:
+                job.modify(next_run_time=datetime.now(IST))
+                logger.info(
+                    "🚀 FIRST_RUN_AFTERSTART=true :: scheduled immediate pipeline run after startup"
+                )
+            else:
+                logger.warning(
+                    "FIRST_RUN_AFTERSTART=true but pipeline_job was not found after scheduler startup"
+                )
+        except Exception as e:
+            logger.error(f"❌ Failed to schedule FIRST_RUN_AFTERSTART job: {e}")
 
     logger.info("✅ Optimized Shopify ETL worker started (WITH MANUAL TRIGGER API)")
     
