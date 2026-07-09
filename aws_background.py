@@ -3045,17 +3045,17 @@ def _tags_csv_contains_exact_tag(raw_tags: Optional[str], tag_value: Optional[st
 
 def _get_rto_tag_sql_filters(
     brand_index: int, brand_name: Optional[str], tag_column: str = "tags"
-) -> Tuple[str, str, List[str]]:
+) -> Tuple[str, str, Tuple[str, ...]]:
     rto_tag = get_rto_tag_for_brand(brand_index, brand_name)
     if not rto_tag:
-        return "1=1", "0=1", []
+        return "1=1", "0=1", ()
 
     regex_pattern = _build_mysql_regex_for_exact_tag(rto_tag)
     non_rto_filter = (
         f"({tag_column} IS NULL OR LOWER({tag_column}) NOT REGEXP %s)"
     )
     rto_filter = f"({tag_column} IS NOT NULL AND LOWER({tag_column}) REGEXP %s)"
-    return non_rto_filter, rto_filter, [regex_pattern]
+    return non_rto_filter, rto_filter, (regex_pattern,)
 
 
 def get_rto_affected_dates_updates(orders_list: List[Dict], tz: ZoneInfo) -> Set[str]:
