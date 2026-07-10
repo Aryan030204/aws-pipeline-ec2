@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html>
+<body style="margin:0;padding:0;background:#f4f6f9;font-family:Arial,Helvetica,sans-serif;color:#333;">
+
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f6f9;padding:30px 0;">
+<tr>
+<td align="center">
+
+<table width="700" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:8px;border:1px solid #dddddd;overflow:hidden;">
+
+<!-- HEADER -->
+
+<tr>
+<td style="background:#c62828;padding:22px 30px;">
+
+<table width="100%">
+<tr>
+
+<td>
+
+<div style="font-size:22px;font-weight:bold;color:white;">
+🚨 DATUM HEALTH ALERT
+</div>
+
+<div style="margin-top:6px;font-size:13px;color:#ffd9d9;">
+CRITICAL INCIDENT DETECTED
+</div>
+
+</td>
+
+<td align="right">
+
+<div style="display:inline-block;background:white;color:#c62828;font-weight:bold;padding:8px 18px;border-radius:30px;font-size:14px;">
+CRITICAL
+</div>
+
+</td>
+
+</tr>
+</table>
+
+</td>
+</tr>
+
+<!-- SUMMARY -->
+
+<tr>
+<td style="padding:28px 30px;">
+
+<div style="font-size:20px;font-weight:bold;color:#222;">
+Alert Dispatch Pipeline Failed
+</div>
+
+<div style="margin-top:8px;color:#666;font-size:15px;">
+alerts-service returned HTTP 503 while processing the health monitor probe.
+</div>
+
+</td>
+</tr>
+
+<!-- QUICK INFO -->
+
+<tr>
+<td style="padding:0 30px 30px 30px;">
+
+<table width="100%" cellpadding="10" cellspacing="0" style="border-collapse:collapse;">
+
+<tr>
+
+<td width="35%" style="background:#fafafa;border:1px solid #e6e6e6;font-weight:bold;">
+Service
+</td>
+
+<td style="border:1px solid #e6e6e6;">
+alerts-service
+</td>
+
+</tr>
+
+<tr>
+
+<td style="background:#fafafa;border:1px solid #e6e6e6;font-weight:bold;">
+Endpoint
+</td>
+
+<td style="border:1px solid #e6e6e6;">
+GET /health
+</td>
+
+</tr>
+
+<tr>
+
+<td style="background:#fafafa;border:1px solid #e6e6e6;font-weight:bold;">
+Detected At
+</td>
+
+<td style="border:1px solid #e6e6e6;">
+09 Jul 2026 • 11:13 UTC
+</td>
+
+</tr>
+
+<tr>
+
+<td style="background:#fafafa;border:1px solid #e6e6e6;font-weight:bold;">
+HTTP Status
+</td>
+
+<td style="border:1px solid #e6e6e6;">
+503 Service Unavailable
+</td>
+
+</tr>
+
+<tr>
+
+<td style="background:#fafafa;border:1px solid #e6e6e6;font-weight:bold;">
+Incident ID
+</td>
+
+<td style="border:1px solid #e6e6e6;">
+alerts-service-GET-health-1783595603674
+</td>
+
+</tr>
+
+</table>
+
+</td>
+</tr>
+
+<!-- FAILURE DETAILS -->
+
+<tr>
+
+<td style="padding:0 30px 25px 30px;">
+
+<div style="font-size:17px;font-weight:bold;margin-bottom:12px;">
+Failure Details
+</div>
+
+<table width="100%" cellpadding="10" cellspacing="0" style="border-collapse:collapse;">
+
+<tr>
+
+<td width="35%" style="background:#fafafa;border:1px solid #e6e6e6;font-weight:bold;">
+Failure Type
+</td>
+
+<td style="border:1px solid #e6e6e6;">
+Application Exception
+</td>
+
+</tr>
+
+<tr>
+
+<td style="background:#fafafa;border:1px solid #e6e6e6;font-weight:bold;">
+Subsystem
+</td>
+
+<td style="border:1px solid #e6e6e6;">
+Notification Dispatch
+</td>
+
+</tr>
+
+<tr>
+
+<td style="background:#fafafa;border:1px solid #e6e6e6;font-weight:bold;">
+Failure Stage
+</td>
+
+<td style="border:1px solid #e6e6e6;">
+Fan-out to Channels
+</td>
+
+</tr>
+
+<tr>
+
+<td style="background:#fafafa;border:1px solid #e6e6e6;font-weight:bold;">
+Retryable
+</td>
+
+<td style="border:1px solid #e6e6e6;">
+Yes
+</td>
+
+</tr>
+
+<tr>
+
+<td style="background:#fafafa;border:1px solid #e6e6e6;font-weight:bold;">
+Summary
+</td>
+
+<td style="border:1px solid #e6e6e6;">
+Intentional test failure: alert dispatch pipeline is failing after dependency validation.
+</td>
+
+</tr>
+
+</table>
+
+</td>
+
+</tr>
+
+<!-- DEPENDENCIES -->
+
+<tr>
+
+<td style="padding:0 30px 25px 30px;">
+
+<div style="font-size:17px;font-weight:bold;margin-bottom:10px;">
+Dependency Status
+</div>
+
+<table width="100%" cellpadding="8" cellspacing="0">
+
+<tr>
+
+<td style="border:1px solid #dddddd;">
+🟢 Mongo
+</td>
+
+<td style="border:1px solid #dddddd;">
+Connected
+</td>
+
+</tr>
+
+<tr>
+
+<td style="border:1px solid #dddddd;">
+🟢 Redis
+</td>
+
+<td style="border:1px solid #dddddd;">
+Connected
+</td>
+
+</tr>
+
+</table>
+
+</td>
+
+</tr>
+
+<!-- LOGS -->
+
+<tr>
+
+<td style="padding:0 30px 30px 30px;">
+
+<div style="font-size:17px;font-weight:bold;margin-bottom:10px;">
+Recent Logs
+</div>
+
+<div style="background:#1e1e1e;color:#dddddd;padding:18px;border-radius:6px;font-family:Consolas,monospace;font-size:13px;line-height:1.5;white-space:pre-wrap;">
+
+[FCM ERROR]
+Failed to initialize Firebase Admin
+
+Cannot find module:
+/app/firebase-service-account.json
+
+Require stack:
+
+/app/utils/fcm.js
+/app/app.js
+
+</div>
+
+</td>
+
+</tr>
+
+<!-- FOOTER -->
+
+<tr>
+
+<td style="background:#fafafa;padding:20px 30px;border-top:1px solid #dddddd;">
+
+<div style="font-size:13px;color:#777;line-height:1.7;">
+
+<b>Recommended Action</b><br>
+
+Investigate the <b>alerts-service</b> application logs and verify the notification dispatch pipeline.
+Dependencies appear healthy, indicating the failure is likely within the application logic.
+
+</div>
+
+</td>
+
+</tr>
+
+</table>
+
+</td>
+</tr>
+</table>
+
+</body>
+</html>
