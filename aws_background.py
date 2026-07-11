@@ -234,9 +234,6 @@ scheduler = BackgroundScheduler(timezone=IST)
 app = Flask(__name__)
 PIPELINE_AUTH_HEADER = os.environ.get("PIPELINE_AUTH_HEADER", "pipeline@nosecret123")
 SELF_RUN = os.environ.get("SELF_RUN", "true").strip().lower() == "true"
-FIRST_RUN_AFTERSTART = (
-    os.environ.get("FIRST_RUN_AFTERSTART", "false").strip().lower() == "true"
-)
 MANAGER_STARTED_ENDPOINT = os.environ.get("MANAGER_STARTED_ENDPOINT")
 MANAGER_COMPLETED_ENDPOINT = os.environ.get("MANAGER_COMPLETED_ENDPOINT")
 MANAGER_FAILED_ENDPOINT = os.environ.get("MANAGER_FAILED_ENDPOINT")
@@ -8592,35 +8589,16 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
                     )
                     continue
                 last_ts = last_order[timestamp_col]
-                last_ts_aware = _db_timestamp_to_aware_utc(last_ts)
-                if last_ts_aware is None:
+                if last_ts is None:
                     logger.warning(
                         f"🛑 Last {timestamp_col} watermark is missing for {brand_name}. Skipping."
                     )
                     continue
-                # Re-fetch the boundary timestamp inclusively so orders created in
-                # the same second as the last stored row are not skipped.
-                boundary_ts = last_ts_aware.astimezone(tz)
-                start_date = convert_to_desired_format(boundary_ts, tz)
+                # Advance by one second because the Shopify start boundary is inclusive.
+                next_ts = last_ts + timedelta(seconds=1)
+                start_date = convert_to_desired_format(next_ts, tz)
                 end_date = convert_to_desired_format(datetime.now(tz), tz)
-                logger.info(
-                    f"Fetching orders from inclusive boundary: {last_ts_aware} "
-                    f"(API start: {boundary_ts})"
-                )
-
-                # Filter already-loaded order_ids at the boundary timestamp because
-                # the API start is inclusive while MySQL stores only second precision.
-                existing_ids = get_orders_with_same_timestamp(
-                    brand_index,
-                    process["table"],
-                    last_ts,
-                    timestamp_field=timestamp_col,
-                    cursor=cursor,
-                )
-                if existing_ids:
-                    logger.info(
-                        f"Found {len(existing_ids)} existing orders at {last_ts} (will filter duplicates)"
-                    )
+                logger.info(f"Fetching orders after: {last_ts} (API start: {next_ts})")
 
             orders_list = fetch_orders(
                 api_base_url, access_token, start_date, end_date, process["date_field"]
@@ -9108,21 +9086,6 @@ if __name__ == "__main__":
         )
 
     scheduler.start()
-
-    if FIRST_RUN_AFTERSTART:
-        try:
-            job = scheduler.get_job("pipeline_job")
-            if job is not None:
-                job.modify(next_run_time=datetime.now(IST))
-                logger.info(
-                    "🚀 FIRST_RUN_AFTERSTART=true :: scheduled immediate pipeline run after startup"
-                )
-            else:
-                logger.warning(
-                    "FIRST_RUN_AFTERSTART=true but pipeline_job was not found after scheduler startup"
-                )
-        except Exception as e:
-            logger.error(f"❌ Failed to schedule FIRST_RUN_AFTERSTART job: {e}")
 
     logger.info("✅ Optimized Shopify ETL worker started (WITH MANUAL TRIGGER API)")
     
