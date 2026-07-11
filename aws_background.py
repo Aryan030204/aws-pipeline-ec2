@@ -6722,7 +6722,7 @@ def fetch_shopify_sessions_via_shopifyql(
     end_date: str = None,  # YYYY-MM-DD
 ) -> List[Dict[str, Any]]:
     """
-    Call Shopify Admin GraphQL -> shopifyqlQuery to get today's sessions.
+    Call Shopify Admin GraphQL -> shopifyqlQuery to get daily sessions rows.
 
     Uses ShopifyQL:
 
@@ -6735,15 +6735,16 @@ def fetch_shopify_sessions_via_shopifyql(
       VISUALIZE sessions, sessions_with_cart_additions TYPE list_with_dimension_values
 
     Returns:
-      (total_sessions, total_sessions_with_cart_additions)
-      as integers. Falls back to (0, 0) on errors.
+      A list of rows shaped like
+      {"date": "YYYY-MM-DD", "sessions": int, "atc_sessions": int}.
+      Falls back to [] on errors or empty responses.
     """
 
     if not shop_name or not api_version or not access_token:
         logger.warning(
             "ShopifyQL sessions fetch skipped: missing shop_name/api_version/access_token"
         )
-        return 0, 0
+        return []
 
     # Construct Date Range
     if start_date and end_date:
@@ -6826,20 +6827,20 @@ def fetch_shopify_sessions_via_shopifyql(
 
         if last_exc is not None:
             logger.error(f"❌ ShopifyQL sessions failed after 3 attempts: {last_exc}")
-            return 0, 0
+            return []
 
         if resp.status_code != 200:
             logger.error(
                 f"❌ ShopifyQL sessions API error: HTTP {resp.status_code} - {resp.text[:500]}"
             )
-            return 0, 0
+            return []
 
         body = resp.json()
 
         # Top-level GraphQL errors
         if body.get("errors"):
             logger.error(f"❌ ShopifyQL GraphQL errors: {json.dumps(body['errors'])}")
-            return 0, 0
+            return []
 
         ql_result = (body.get("data") or {}).get("shopifyqlQuery") or {}
 
@@ -6847,17 +6848,17 @@ def fetch_shopify_sessions_via_shopifyql(
         parse_errors = ql_result.get("parseErrors") or []
         if parse_errors:
             logger.error(f"❌ ShopifyQL parse errors: {parse_errors}")
-            return 0, 0
+            return []
 
         table_data = ql_result.get("tableData")
         if not table_data:
             logger.warning("ShopifyQL sessions: no tableData in response")
-            return 0, 0
+            return []
 
         rows = _format_shopifyql_table(table_data)
         if not rows:
             logger.info("ShopifyQL sessions: 0 rows returned for today")
-            return 0, 0
+            return []
 
         results = []
         for row in rows:
@@ -7749,6 +7750,17 @@ def update_sessions_summary_from_shopifyql(
 
 
 def _do_upsert_sessions_from_shopifyql(results, cursor, connection, brand_name):
+    normalized_results = [r for r in results if isinstance(r, dict)]
+    if len(normalized_results) != len(results):
+        logger.warning(
+            f"⚠️ ShopifyQL daily sessions returned unexpected row shapes for {brand_name}; "
+            f"using {len(normalized_results)}/{len(results)} valid rows"
+        )
+
+    if not normalized_results:
+        logger.info(f"No valid ShopifyQL daily sessions rows to upsert for {brand_name}")
+        return
+
     # Ensure table exists
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sessions_summary (
@@ -7757,7 +7769,7 @@ def _do_upsert_sessions_from_shopifyql(results, cursor, connection, brand_name):
             number_of_atc_sessions INT DEFAULT 0
         );
     """)
-    for r in results:
+    for r in normalized_results:
         cursor.execute(
             """
             INSERT INTO sessions_summary (date, number_of_sessions, number_of_atc_sessions)
@@ -7770,7 +7782,7 @@ def _do_upsert_sessions_from_shopifyql(results, cursor, connection, brand_name):
         )
     connection.commit()
     logger.info(
-        f"✅ ShopifyQL daily sessions updated for {brand_name} ({len(results)} rows)"
+        f"✅ ShopifyQL daily sessions updated for {brand_name} ({len(normalized_results)} rows)"
     )
 
 
