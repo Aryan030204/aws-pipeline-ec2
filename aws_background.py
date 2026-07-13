@@ -3469,7 +3469,7 @@ CI_EVENTS_BRANDS = {
     "bbb",
     "vama",
     "3tenx",
-    "shyle",
+    "shylenew",
 }
 
 CI_EVENTS_MONGO_SHOP_NAME_MAP = {
@@ -3479,7 +3479,7 @@ CI_EVENTS_MONGO_SHOP_NAME_MAP = {
     "bbb": "bbb",
     "vama": "vama",
     "3tenx": "3tenx",
-    "shyle": "shylenew",
+    "shylenew": "shyle",
 }
 
 WEB_VITALS_METADATA_KEY = "last_web_vitals_created_at"
