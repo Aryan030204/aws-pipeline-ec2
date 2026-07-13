@@ -3470,10 +3470,10 @@ CI_EVENTS_BRANDS = {
     "vama",
     "3tenx",
     "shylenew",
-    "ajmal_ksa",
-    "ajmal_uk",
-    "ajmal_us",
-    "ajmal_bh"
+    "ajmalksa",
+    "ajmaluk",
+    "ajmalus",
+    "ajmalbh"
 }
 
 CI_EVENTS_MONGO_SHOP_NAME_MAP = {
