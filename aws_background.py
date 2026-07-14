@@ -52,7 +52,6 @@ import pandas as pd
 import numpy as np
 import os
 import json
-import ast
 import time
 import logging
 import re
@@ -251,61 +250,14 @@ DB_RETRY_BASE_DELAY_S = float(os.environ.get("DB_RETRY_BASE_DELAY_S", "0.5"))
 DB_TEST_ON_STARTUP = os.environ.get("DB_TEST_ON_STARTUP", "false").strip().lower() == "true"
 REQUIRE_RDS_PROXY = os.environ.get("REQUIRE_RDS_PROXY", "true").strip().lower() == "true"
 EXPECTED_RDS_PROXY_HOST = os.environ.get("EXPECTED_RDS_PROXY_HOST", "").strip()
-RTO_LOOKUP_MONGO = (
-    os.environ.get("RTO_LOOKUP_MONGO", "false").strip().lower() == "true"
-)
-
-
-def _parse_jsonish_string_map(
-    raw_value: str, env_name: str
-) -> Dict[str, str]:
-    raw = (raw_value or "").strip()
-    if not raw:
-        return {}
-
-    parsed: Any = None
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        quoted_keys = re.sub(r'([{,]\s*)([A-Za-z0-9_]+)\s*:', r'\1"\2":', raw)
-        try:
-            parsed = json.loads(quoted_keys)
-        except json.JSONDecodeError:
-            try:
-                parsed = ast.literal_eval(quoted_keys)
-            except (ValueError, SyntaxError) as exc:
-                logger.warning(
-                    "Invalid %s value; RTO processing will be skipped: %s",
-                    env_name,
-                    exc,
-                )
-                return {}
-
-    if not isinstance(parsed, dict):
-        logger.warning(
-            "Invalid %s value; expected an object map, got %s. RTO processing will be skipped.",
-            env_name,
-            type(parsed).__name__,
-        )
-        return {}
-
-    normalized: Dict[str, str] = {}
-    for key, value in parsed.items():
-        if key is None or value is None:
-            continue
-
-        key_str = str(key).strip()
-        value_str = str(value).strip()
-        if key_str and value_str:
-            normalized[key_str.lower()] = value_str
-
-    return normalized
-
-
-RTO_MAPPINGS = _parse_jsonish_string_map(
-    os.environ.get("RTO_MAPPINGS", ""),
-    "RTO_MAPPINGS",
-)
+try:
+    RTO_ASSUMPTION_PERIOD = int(os.environ.get("RTO_ASSUMPTION_PERIOD", "7").strip())
+except ValueError:
+    logger.warning(
+        "Invalid RTO_ASSUMPTION_PERIOD value %r; defaulting to 7 days.",
+        os.environ.get("RTO_ASSUMPTION_PERIOD"),
+    )
+    RTO_ASSUMPTION_PERIOD = 7
 
 _db_metrics_lock = threading.Lock()
 _db_shutdown_lock = threading.Lock()
@@ -2289,7 +2241,6 @@ def upsert_returns_fact_from_orders(
     try:
         _ensure_returns_fact(cursor, connection)
         tz = get_brand_timezone(brand_index)
-        rto_tag = get_rto_tag_for_brand(brand_index)
 
         agg: Dict[Tuple[str, str, str], float] = {}
 
@@ -2305,7 +2256,13 @@ def upsert_returns_fact_from_orders(
                     amt = float(o.get("total_price") or 0.0)
                     cancel_event_type = (
                         RETURN_EVENT_CANCEL_RTO
-                        if _tags_csv_contains_exact_tag(o.get("tags"), rto_tag)
+                        if _is_order_rto_cancel(
+                            brand_index=brand_index,
+                            created_at=o.get("created_at"),
+                            cancelled_at=cancelled_at,
+                            tags=o.get("tags"),
+                            tz=tz,
+                        )
                         else RETURN_EVENT_CANCEL
                     )
                     key = (oid, cancel_event_type, d)
@@ -3100,14 +3057,7 @@ def _build_rto_db_database_map() -> Dict[str, str]:
         if not db_name:
             continue
 
-        mapped_tag: Optional[str] = None
-        if RTO_LOOKUP_MONGO:
-            mapped_tag = brand_rto_tags_by_index.get(brand_index)
-        else:
-            config_brand_name = os.environ.get(f"BRAND_NAME_{brand_index}")
-            if config_brand_name:
-                mapped_tag = RTO_MAPPINGS.get(_normalize_rto_key(config_brand_name))
-
+        mapped_tag = brand_rto_tags_by_index.get(brand_index)
         if mapped_tag:
             resolved[_normalize_rto_key(db_name)] = mapped_tag
 
@@ -3123,10 +3073,7 @@ def get_rto_tag_for_brand(brand_index: int, brand_name: Optional[str] = None) ->
         if mapped_tag:
             return mapped_tag
 
-    if not RTO_LOOKUP_MONGO and brand_name:
-        return RTO_MAPPINGS.get(_normalize_rto_key(brand_name))
-
-    return None
+    return brand_rto_tags_by_index.get(brand_index)
 
 
 def _build_mysql_regex_for_exact_tag(tag_value: str) -> str:
@@ -3145,23 +3092,71 @@ def _tags_csv_contains_exact_tag(raw_tags: Optional[str], tag_value: Optional[st
     return any(tag.strip().lower() == target for tag in str(raw_tags).split(","))
 
 
-def _get_rto_tag_sql_filters(
-    brand_index: int, brand_name: Optional[str], tag_column: str = "tags"
-) -> Tuple[str, str, Tuple[str, ...]]:
-    rto_tag = get_rto_tag_for_brand(brand_index, brand_name)
-    if not rto_tag:
-        return "1=1", "0=1", ()
+def _is_order_rto_cancel(
+    brand_index: int,
+    created_at: Optional[str],
+    cancelled_at: Optional[str],
+    tags: Optional[str],
+    tz: ZoneInfo,
+    brand_name: Optional[str] = None,
+) -> bool:
+    if not cancelled_at:
+        return False
 
-    regex_pattern = _build_mysql_regex_for_exact_tag(rto_tag)
+    rto_tag = get_rto_tag_for_brand(brand_index, brand_name)
+    if rto_tag:
+        return _tags_csv_contains_exact_tag(tags, rto_tag)
+
+    created_date = _parse_iso_to_store_date(created_at, tz)
+    cancelled_date = _parse_iso_to_store_date(cancelled_at, tz)
+    if not created_date or not cancelled_date:
+        return False
+
+    try:
+        created_day = date.fromisoformat(created_date)
+        cancelled_day = date.fromisoformat(cancelled_date)
+    except ValueError:
+        return False
+
+    return (cancelled_day - created_day).days > RTO_ASSUMPTION_PERIOD
+
+
+def _build_store_date_sql_expr(column_name: str) -> str:
+    return f"STR_TO_DATE({column_name}, '%Y-%m-%d')"
+
+
+def _get_rto_sql_filters(
+    brand_index: int,
+    brand_name: Optional[str],
+    tag_column: str = "tags",
+    created_date_column: str = "created_date",
+    updated_date_column: str = "updated_date",
+) -> Tuple[str, str, Tuple[Any, ...]]:
+    rto_tag = get_rto_tag_for_brand(brand_index, brand_name)
+    if rto_tag:
+        regex_pattern = _build_mysql_regex_for_exact_tag(rto_tag)
+        non_rto_filter = (
+            f"({tag_column} IS NULL OR LOWER({tag_column}) NOT REGEXP %s)"
+        )
+        rto_filter = f"({tag_column} IS NOT NULL AND LOWER({tag_column}) REGEXP %s)"
+        return non_rto_filter, rto_filter, (regex_pattern,)
+
+    created_date_expr = _build_store_date_sql_expr(created_date_column)
+    updated_date_expr = _build_store_date_sql_expr(updated_date_column)
+    date_diff_expr = f"DATEDIFF({updated_date_expr}, {created_date_expr})"
     non_rto_filter = (
-        f"({tag_column} IS NULL OR LOWER({tag_column}) NOT REGEXP %s)"
+        f"({created_date_expr} IS NULL OR {updated_date_expr} IS NULL "
+        f"OR {date_diff_expr} <= %s)"
     )
-    rto_filter = f"({tag_column} IS NOT NULL AND LOWER({tag_column}) REGEXP %s)"
-    return non_rto_filter, rto_filter, (regex_pattern,)
+    rto_filter = (
+        f"({created_date_expr} IS NOT NULL AND {updated_date_expr} IS NOT NULL "
+        f"AND {date_diff_expr} > %s)"
+    )
+    return non_rto_filter, rto_filter, (RTO_ASSUMPTION_PERIOD,)
 
 
 def get_rto_affected_dates_updates(orders_list: List[Dict], tz: ZoneInfo) -> Set[str]:
-    """Return created_date values for UPDATED orders so tag-only changes can rebuild RTO."""
+    """Return created_date values for UPDATED orders so RTO metrics can rebuild."""
     dates: Set[str] = set()
     for order in orders_list or []:
         if order.get("created_at"):
@@ -5152,7 +5147,7 @@ def update_sales_summary_incremental(
     if not params:
         logger.debug(f"[{brand_name}] sales_summary: no dates to rebuild")
         return
-    non_rto_filter, rto_filter, tag_params = _get_rto_tag_sql_filters(
+    non_rto_filter, rto_filter, rto_filter_params = _get_rto_sql_filters(
         brand_index, brand_name
     )
     with timed(
@@ -5313,7 +5308,7 @@ def update_sales_summary_incremental(
         """
         cursor.execute(
             sql,
-            params + params + tag_params + params + tag_params + params,
+            params + params + rto_filter_params + params + rto_filter_params + params,
         )
         connection.commit()
 
@@ -5331,7 +5326,7 @@ def update_order_summary_incremental(
     if not params:
         logger.debug(f"[{brand_name}] order_summary: no dates to rebuild")
         return
-    non_rto_filter, rto_filter, tag_params = _get_rto_tag_sql_filters(
+    non_rto_filter, rto_filter, rto_filter_params = _get_rto_sql_filters(
         brand_index, brand_name
     )
     with timed(f"[{brand_name}] order_summary incremental ({len(params)} date(s))"):
@@ -5494,7 +5489,7 @@ def update_order_summary_incremental(
         """
         cursor.execute(
             sql,
-            params + params + tag_params + params + tag_params,
+            params + params + rto_filter_params + params + rto_filter_params,
         )
         connection.commit()
 
@@ -5512,7 +5507,7 @@ def update_discount_summary_incremental(
     if not params:
         logger.debug(f"[{brand_name}] discount_summary: no dates to rebuild")
         return
-    non_rto_filter, rto_filter, tag_params = _get_rto_tag_sql_filters(
+    non_rto_filter, rto_filter, rto_filter_params = _get_rto_sql_filters(
         brand_index, brand_name
     )
     with timed(
@@ -5574,7 +5569,10 @@ def update_discount_summary_incremental(
         LEFT JOIN DiscountsReturned dr ON d.date = dr.date
         LEFT JOIN RtoDiscountsReturned rdr ON d.date = rdr.date
         """
-        cursor.execute(sql, params + params + tag_params + params + tag_params)
+        cursor.execute(
+            sql,
+            params + params + rto_filter_params + params + rto_filter_params,
+        )
         connection.commit()
 
         # STEP 4 & 5: Fetch affected dates and merge
@@ -6173,48 +6171,79 @@ def update_rto_summary_incremental(
 ):
     """Update rto_summary for only the specific affected dates."""
     rto_tag = get_rto_tag_for_brand(brand_index, brand_name)
-    if not rto_tag:
-        logger.info(
-            f"[{brand_name}] RTO summary skipped: no active RTO tag from Mongo rto_tags or RTO_MAPPINGS"
-        )
-        return
 
     placeholders, params = _dates_in_clause(target_dates)
     if not params:
         logger.debug(f"[{brand_name}] rto_summary: no dates to rebuild")
         return
 
-    regex_pattern = _build_mysql_regex_for_exact_tag(rto_tag)
-
     with timed(f"[{brand_name}] rto_summary incremental ({len(params)} date(s))"):
         cursor.execute("CREATE TABLE IF NOT EXISTS rto_summary_stage LIKE rto_summary")
         cursor.execute("TRUNCATE TABLE rto_summary_stage")
 
-        sql = f"""
-        INSERT INTO rto_summary_stage (
-            summary_date, total_orders, rto_orders, rto_percentage
-        )
-        SELECT
-            summary_date,
-            total_orders,
-            rto_orders,
-            ROUND(COALESCE(rto_orders * 100.0 / NULLIF(total_orders, 0), 0), 2) AS rto_percentage
-        FROM (
+        if rto_tag:
+            regex_pattern = _build_mysql_regex_for_exact_tag(rto_tag)
+            sql = f"""
+            INSERT INTO rto_summary_stage (
+                summary_date, total_orders, rto_orders, rto_percentage
+            )
             SELECT
-                STR_TO_DATE(created_date, '%Y-%m-%d') AS summary_date,
-                COUNT(DISTINCT order_id) AS total_orders,
-                COUNT(
-                    DISTINCT CASE
-                        WHEN tags IS NOT NULL AND LOWER(tags) REGEXP %s THEN order_id
-                    END
-                ) AS rto_orders
-            FROM shopify_orders
-            WHERE created_date IN ({placeholders})
-            GROUP BY created_date
-        ) AS rto_daily
-        WHERE summary_date IS NOT NULL
-        """
-        cursor.execute(sql, (regex_pattern, *params))
+                summary_date,
+                total_orders,
+                rto_orders,
+                ROUND(COALESCE(rto_orders * 100.0 / NULLIF(total_orders, 0), 0), 2) AS rto_percentage
+            FROM (
+                SELECT
+                    STR_TO_DATE(s.created_date, '%Y-%m-%d') AS summary_date,
+                    COUNT(DISTINCT s.order_id) AS total_orders,
+                    COUNT(
+                        DISTINCT CASE
+                            WHEN s.tags IS NOT NULL AND LOWER(s.tags) REGEXP %s THEN s.order_id
+                        END
+                    ) AS rto_orders
+                FROM shopify_orders s
+                WHERE s.created_date IN ({placeholders})
+                GROUP BY s.created_date
+            ) AS rto_daily
+            WHERE summary_date IS NOT NULL
+            """
+            sql_params: Tuple[Any, ...] = (regex_pattern, *params)
+        else:
+            created_date_expr = _build_store_date_sql_expr("s.created_date")
+            updated_date_expr = _build_store_date_sql_expr("su.updated_date")
+            date_diff_expr = f"DATEDIFF({updated_date_expr}, {created_date_expr})"
+            sql = f"""
+            INSERT INTO rto_summary_stage (
+                summary_date, total_orders, rto_orders, rto_percentage
+            )
+            SELECT
+                summary_date,
+                total_orders,
+                rto_orders,
+                ROUND(COALESCE(rto_orders * 100.0 / NULLIF(total_orders, 0), 0), 2) AS rto_percentage
+            FROM (
+                SELECT
+                    STR_TO_DATE(s.created_date, '%Y-%m-%d') AS summary_date,
+                    COUNT(DISTINCT s.order_id) AS total_orders,
+                    COUNT(
+                        DISTINCT CASE
+                            WHEN su.financial_status NOT IN ('paid', 'pending')
+                              AND {updated_date_expr} IS NOT NULL
+                              AND {created_date_expr} IS NOT NULL
+                              AND {date_diff_expr} > %s
+                            THEN s.order_id
+                        END
+                    ) AS rto_orders
+                FROM shopify_orders s
+                LEFT JOIN shopify_orders_update su ON su.order_id = s.order_id
+                WHERE s.created_date IN ({placeholders})
+                GROUP BY s.created_date
+            ) AS rto_daily
+            WHERE summary_date IS NOT NULL
+            """
+            sql_params = (RTO_ASSUMPTION_PERIOD, *params)
+
+        cursor.execute(sql, sql_params)
         connection.commit()
 
         merge_staging_to_main_by_date(
@@ -8651,8 +8680,7 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
                 new_dates = get_affected_dates_new_orders(filtered, tz)
                 if new_dates:
                     affected_dates.update(new_dates)
-                    if get_rto_tag_for_brand(brand_index, brand_name):
-                        rto_affected_dates.update(new_dates)
+                    rto_affected_dates.update(new_dates)
                     logger.info(
                         f"📅 Affected dates for {process['type']}: "
                         f"{len(new_dates)} date(s) ({min(new_dates)}..{max(new_dates)})"
@@ -8696,11 +8724,9 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
                     tz,
                     extra_event_dates=changed_return_dates,
                 )
-                rto_upd_dates = set()
-                if get_rto_tag_for_brand(brand_index, brand_name):
-                    rto_upd_dates = get_rto_affected_dates_updates(filtered, tz)
-                    if rto_upd_dates:
-                        rto_affected_dates.update(rto_upd_dates)
+                rto_upd_dates = get_rto_affected_dates_updates(filtered, tz)
+                if rto_upd_dates:
+                    rto_affected_dates.update(rto_upd_dates)
                 if upd_dates:
                     affected_dates.update(upd_dates)
                     logger.info(
