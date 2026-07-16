@@ -5348,7 +5348,7 @@ def update_sales_summary_incremental(
         """
         cursor.execute(
             sql,
-            params + params + params + params,
+            params + params + params + params + params,
         )
         connection.commit()
 
