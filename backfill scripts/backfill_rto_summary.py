@@ -24,11 +24,9 @@ logger = logging.getLogger(__name__)
 
 try:
     from aws_background import (
-        RTO_MAPPINGS,
         active_brand_indices,
         ensure_summary_tables,
         get_db_cursor,
-        get_rto_tag_for_brand,
         initialize_brand_configs,
         update_rto_summary_incremental,
     )
@@ -81,10 +79,6 @@ def run_backfill():
         logger.error("BACKFILL_MODE is false. Exiting.")
         return
 
-    if not RTO_MAPPINGS:
-        logger.warning("RTO_MAPPINGS is empty or invalid. Nothing to backfill.")
-        return
-
     target_indices_str = os.getenv("BACKFILL_BRAND_INDICES", "")
     target_indices = []
     if target_indices_str:
@@ -117,9 +111,6 @@ def run_backfill():
     processed_count = 0
     for brand_index in indices_to_process:
         brand_name = os.environ.get(f"BRAND_NAME_{brand_index}", f"Brand_{brand_index}")
-        if not get_rto_tag_for_brand(brand_index, brand_name):
-            logger.info(f"[{brand_name}] Skipping RTO backfill: brand not present in RTO_MAPPINGS")
-            continue
 
         try:
             with get_db_cursor(brand_index, dictionary=False) as (cursor, connection):
@@ -145,7 +136,7 @@ def run_backfill():
             traceback.print_exc()
 
     logger.info(
-        f"RTO summary backfill complete. Processed {processed_count} mapped brand(s)."
+        f"RTO summary backfill complete. Processed {processed_count} brand(s)."
     )
 
 

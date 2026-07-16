@@ -52,7 +52,6 @@ import pandas as pd
 import numpy as np
 import os
 import json
-import ast
 import time
 import logging
 import re
@@ -251,61 +250,14 @@ DB_RETRY_BASE_DELAY_S = float(os.environ.get("DB_RETRY_BASE_DELAY_S", "0.5"))
 DB_TEST_ON_STARTUP = os.environ.get("DB_TEST_ON_STARTUP", "false").strip().lower() == "true"
 REQUIRE_RDS_PROXY = os.environ.get("REQUIRE_RDS_PROXY", "true").strip().lower() == "true"
 EXPECTED_RDS_PROXY_HOST = os.environ.get("EXPECTED_RDS_PROXY_HOST", "").strip()
-RTO_LOOKUP_MONGO = (
-    os.environ.get("RTO_LOOKUP_MONGO", "false").strip().lower() == "true"
-)
-
-
-def _parse_jsonish_string_map(
-    raw_value: str, env_name: str
-) -> Dict[str, str]:
-    raw = (raw_value or "").strip()
-    if not raw:
-        return {}
-
-    parsed: Any = None
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        quoted_keys = re.sub(r'([{,]\s*)([A-Za-z0-9_]+)\s*:', r'\1"\2":', raw)
-        try:
-            parsed = json.loads(quoted_keys)
-        except json.JSONDecodeError:
-            try:
-                parsed = ast.literal_eval(quoted_keys)
-            except (ValueError, SyntaxError) as exc:
-                logger.warning(
-                    "Invalid %s value; RTO processing will be skipped: %s",
-                    env_name,
-                    exc,
-                )
-                return {}
-
-    if not isinstance(parsed, dict):
-        logger.warning(
-            "Invalid %s value; expected an object map, got %s. RTO processing will be skipped.",
-            env_name,
-            type(parsed).__name__,
-        )
-        return {}
-
-    normalized: Dict[str, str] = {}
-    for key, value in parsed.items():
-        if key is None or value is None:
-            continue
-
-        key_str = str(key).strip()
-        value_str = str(value).strip()
-        if key_str and value_str:
-            normalized[key_str.lower()] = value_str
-
-    return normalized
-
-
-RTO_MAPPINGS = _parse_jsonish_string_map(
-    os.environ.get("RTO_MAPPINGS", ""),
-    "RTO_MAPPINGS",
-)
+try:
+    RTO_ASSUMPTION_PERIOD = int(os.environ.get("RTO_ASSUMPTION_PERIOD", "7").strip())
+except ValueError:
+    logger.warning(
+        "Invalid RTO_ASSUMPTION_PERIOD value %r; defaulting to 7 days.",
+        os.environ.get("RTO_ASSUMPTION_PERIOD"),
+    )
+    RTO_ASSUMPTION_PERIOD = 7
 
 _db_metrics_lock = threading.Lock()
 _db_shutdown_lock = threading.Lock()
@@ -2238,10 +2190,12 @@ def _ensure_returns_fact(cursor, connection):
         CREATE TABLE IF NOT EXISTS returns_fact (
           order_id     BIGINT        NOT NULL,
           event_date   DATE          NOT NULL,
+          order_created_date DATE    NULL,
           event_type   ENUM('CANCEL','CANCEL (RTO)','REFUND') NOT NULL,
           amount       DECIMAL(12,2) NOT NULL,
           PRIMARY KEY (order_id, event_type, event_date),
-          KEY idx_event_date (event_date)
+          KEY idx_event_date (event_date),
+          KEY idx_order_created_date_event_type (order_created_date, event_type)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """)
     try:
@@ -2254,6 +2208,27 @@ def _ensure_returns_fact(cursor, connection):
                     ALTER TABLE returns_fact
                     MODIFY COLUMN event_type ENUM('CANCEL','CANCEL (RTO)','REFUND') NOT NULL
                 """)
+        cursor.execute("SHOW COLUMNS FROM returns_fact LIKE 'order_created_date'")
+        created_date_row = cursor.fetchone()
+        if not created_date_row:
+            cursor.execute("""
+                ALTER TABLE returns_fact
+                ADD COLUMN order_created_date DATE NULL AFTER event_date
+            """)
+        cursor.execute("""
+            SELECT 1
+            FROM information_schema.statistics
+            WHERE table_schema = DATABASE()
+              AND table_name = 'returns_fact'
+              AND index_name = 'idx_order_created_date_event_type'
+            LIMIT 1
+        """)
+        index_row = cursor.fetchone()
+        if not index_row:
+            cursor.execute("""
+                ALTER TABLE returns_fact
+                ADD INDEX idx_order_created_date_event_type (order_created_date, event_type)
+            """)
     except Exception as e:
         logger.warning(f"⚠️ returns_fact event_type migration check failed: {e}")
     connection.commit()
@@ -2289,9 +2264,8 @@ def upsert_returns_fact_from_orders(
     try:
         _ensure_returns_fact(cursor, connection)
         tz = get_brand_timezone(brand_index)
-        rto_tag = get_rto_tag_for_brand(brand_index)
 
-        agg: Dict[Tuple[str, str, str], float] = {}
+        agg: Dict[Tuple[str, str, str], Tuple[float, Optional[str]]] = {}
 
         for o in orders_list:
             oid = str(o.get("id")) if o.get("id") else None
@@ -2301,15 +2275,23 @@ def upsert_returns_fact_from_orders(
             cancelled_at = o.get("cancelled_at")
             if cancelled_at:
                 d = _parse_iso_to_store_date(cancelled_at, tz)
+                created_date = _parse_iso_to_store_date(o.get("created_at"), tz)
                 if d:
                     amt = float(o.get("total_price") or 0.0)
                     cancel_event_type = (
                         RETURN_EVENT_CANCEL_RTO
-                        if _tags_csv_contains_exact_tag(o.get("tags"), rto_tag)
+                        if _is_order_rto_cancel(
+                            brand_index=brand_index,
+                            created_at=o.get("created_at"),
+                            cancelled_at=cancelled_at,
+                            tags=o.get("tags"),
+                            tz=tz,
+                        )
                         else RETURN_EVENT_CANCEL
                     )
                     key = (oid, cancel_event_type, d)
-                    agg[key] = max(agg.get(key, 0.0), amt)
+                    old_amount, _ = agg.get(key, (0.0, created_date))
+                    agg[key] = (max(old_amount, amt), created_date)
 
             refunds = o.get("refunds") or []
             for rf in refunds:
@@ -2328,7 +2310,8 @@ def upsert_returns_fact_from_orders(
                             continue
                 if refund_sum > 0:
                     key = (oid, RETURN_EVENT_REFUND, rdate)
-                    agg[key] = agg.get(key, 0.0) + refund_sum
+                    old_amount, _ = agg.get(key, (0.0, None))
+                    agg[key] = (old_amount + refund_sum, None)
 
         if not agg:
             return set()
@@ -2336,7 +2319,7 @@ def upsert_returns_fact_from_orders(
         # Compare against existing values first so callers can use only true deltas
         # for affected range expansion.
         changed_dates: Set[str] = set()
-        existing_amounts: Dict[Tuple[str, str, str], float] = {}
+        existing_values: Dict[Tuple[str, str, str], Tuple[float, Optional[str]]] = {}
         order_ids = sorted({int(k[0]) for k in agg.keys()})
 
         def _chunked(values: List[int], size: int = 500):
@@ -2347,7 +2330,7 @@ def upsert_returns_fact_from_orders(
             placeholders = ",".join(["%s"] * len(chunk))
             cursor.execute(
                 f"""
-                SELECT order_id, event_type, event_date, amount
+                SELECT order_id, event_type, event_date, amount, order_created_date
                 FROM returns_fact
                 WHERE order_id IN ({placeholders})
                 """,
@@ -2359,29 +2342,61 @@ def upsert_returns_fact_from_orders(
                     r_event_type = row.get("event_type")
                     r_event_date = row.get("event_date")
                     r_amount = float(row.get("amount") or 0.0)
+                    r_order_created_date = row.get("order_created_date")
                 else:
                     r_order_id = str(row[0])
                     r_event_type = row[1]
                     r_event_date = row[2]
                     r_amount = float(row[3] or 0.0)
+                    r_order_created_date = row[4]
 
                 r_event_date_str = (
                     r_event_date.isoformat()
                     if hasattr(r_event_date, "isoformat")
                     else str(r_event_date)
                 )
-                existing_amounts[(r_order_id, r_event_type, r_event_date_str)] = (
-                    r_amount
+                r_order_created_date_str = (
+                    r_order_created_date.isoformat()
+                    if hasattr(r_order_created_date, "isoformat")
+                    else (str(r_order_created_date) if r_order_created_date else None)
+                )
+                existing_values[(r_order_id, r_event_type, r_event_date_str)] = (
+                    r_amount,
+                    r_order_created_date_str,
                 )
 
-        for key, new_amount in agg.items():
-            old_amount = existing_amounts.get(key)
-            if old_amount is None or abs(float(old_amount) - float(new_amount)) > 0.009:
-                changed_dates.add(key[2])
+        def _summary_attribution_date(
+            event_type: str,
+            event_date: str,
+            order_created_date: Optional[str],
+        ) -> Optional[str]:
+            if event_type in (RETURN_EVENT_CANCEL, RETURN_EVENT_CANCEL_RTO):
+                return order_created_date or event_date
+            return event_date
 
-        stale_keys = [key for key in existing_amounts.keys() if key not in agg]
+        for key, (new_amount, new_order_created_date) in agg.items():
+            old_value = existing_values.get(key)
+            old_amount = old_value[0] if old_value else None
+            old_order_created_date = old_value[1] if old_value else None
+            if (
+                old_value is None
+                or abs(float(old_amount) - float(new_amount)) > 0.009
+                or old_order_created_date != new_order_created_date
+            ):
+                attribution_date = _summary_attribution_date(
+                    key[1], key[2], new_order_created_date
+                )
+                if attribution_date:
+                    changed_dates.add(attribution_date)
+
+        stale_keys = [key for key in existing_values.keys() if key not in agg]
         for key in stale_keys:
-            changed_dates.add(key[2])
+            _, old_order_created_date = existing_values[key]
+            attribution_date = _summary_attribution_date(
+                key[1], key[2], old_order_created_date
+            )
+            if attribution_date:
+                changed_dates.add(attribution_date)
 
         if stale_keys:
             delete_sql = """
@@ -2391,11 +2406,17 @@ def upsert_returns_fact_from_orders(
             delete_rows = [(int(k[0]), k[1], k[2]) for k in stale_keys]
             executemany_chunked(cursor, connection, delete_sql, delete_rows)
 
-        rows = [(int(k[0]), k[2], k[1], round(v, 2)) for k, v in agg.items()]
+        rows = [
+            (int(k[0]), k[2], created_date, k[1], round(value[0], 2))
+            for k, value in agg.items()
+            for created_date in [value[1]]
+        ]
         insert_sql = """
-            INSERT INTO returns_fact (order_id, event_date, event_type, amount)
-            VALUES (%s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE amount = VALUES(amount);
+            INSERT INTO returns_fact (order_id, event_date, order_created_date, event_type, amount)
+            VALUES (%s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                order_created_date = VALUES(order_created_date),
+                amount = VALUES(amount);
         """
         executemany_chunked(cursor, connection, insert_sql, rows)
 
@@ -3100,14 +3121,7 @@ def _build_rto_db_database_map() -> Dict[str, str]:
         if not db_name:
             continue
 
-        mapped_tag: Optional[str] = None
-        if RTO_LOOKUP_MONGO:
-            mapped_tag = brand_rto_tags_by_index.get(brand_index)
-        else:
-            config_brand_name = os.environ.get(f"BRAND_NAME_{brand_index}")
-            if config_brand_name:
-                mapped_tag = RTO_MAPPINGS.get(_normalize_rto_key(config_brand_name))
-
+        mapped_tag = brand_rto_tags_by_index.get(brand_index)
         if mapped_tag:
             resolved[_normalize_rto_key(db_name)] = mapped_tag
 
@@ -3123,10 +3137,7 @@ def get_rto_tag_for_brand(brand_index: int, brand_name: Optional[str] = None) ->
         if mapped_tag:
             return mapped_tag
 
-    if not RTO_LOOKUP_MONGO and brand_name:
-        return RTO_MAPPINGS.get(_normalize_rto_key(brand_name))
-
-    return None
+    return brand_rto_tags_by_index.get(brand_index)
 
 
 def _build_mysql_regex_for_exact_tag(tag_value: str) -> str:
@@ -3145,26 +3156,40 @@ def _tags_csv_contains_exact_tag(raw_tags: Optional[str], tag_value: Optional[st
     return any(tag.strip().lower() == target for tag in str(raw_tags).split(","))
 
 
-def _get_rto_tag_sql_filters(
-    brand_index: int, brand_name: Optional[str], tag_column: str = "tags"
-) -> Tuple[str, str, Tuple[str, ...]]:
-    rto_tag = get_rto_tag_for_brand(brand_index, brand_name)
-    if not rto_tag:
-        return "1=1", "0=1", ()
+def _is_order_rto_cancel(
+    brand_index: int,
+    created_at: Optional[str],
+    cancelled_at: Optional[str],
+    tags: Optional[str],
+    tz: ZoneInfo,
+    brand_name: Optional[str] = None,
+) -> bool:
+    if not cancelled_at:
+        return False
 
-    regex_pattern = _build_mysql_regex_for_exact_tag(rto_tag)
-    non_rto_filter = (
-        f"({tag_column} IS NULL OR LOWER({tag_column}) NOT REGEXP %s)"
-    )
-    rto_filter = f"({tag_column} IS NOT NULL AND LOWER({tag_column}) REGEXP %s)"
-    return non_rto_filter, rto_filter, (regex_pattern,)
+    rto_tag = get_rto_tag_for_brand(brand_index, brand_name)
+    if rto_tag:
+        return _tags_csv_contains_exact_tag(tags, rto_tag)
+
+    created_date = _parse_iso_to_store_date(created_at, tz)
+    cancelled_date = _parse_iso_to_store_date(cancelled_at, tz)
+    if not created_date or not cancelled_date:
+        return False
+
+    try:
+        created_day = date.fromisoformat(created_date)
+        cancelled_day = date.fromisoformat(cancelled_date)
+    except ValueError:
+        return False
+
+    return (cancelled_day - created_day).days > RTO_ASSUMPTION_PERIOD
 
 
 def get_rto_affected_dates_updates(orders_list: List[Dict], tz: ZoneInfo) -> Set[str]:
-    """Return created_date values for UPDATED orders so tag-only changes can rebuild RTO."""
+    """Return created_date values for cancelled orders that can affect RTO metrics."""
     dates: Set[str] = set()
     for order in orders_list or []:
-        if order.get("created_at"):
+        if order.get("cancelled_at") and order.get("created_at"):
             created_date = _parse_iso_to_store_date(order["created_at"], tz)
             if created_date:
                 dates.add(created_date)
@@ -5152,9 +5177,6 @@ def update_sales_summary_incremental(
     if not params:
         logger.debug(f"[{brand_name}] sales_summary: no dates to rebuild")
         return
-    non_rto_filter, rto_filter, tag_params = _get_rto_tag_sql_filters(
-        brand_index, brand_name
-    )
     with timed(
         f"[{brand_name}] sales_summary incremental ({len(params)} date(s))"
     ):
@@ -5202,44 +5224,57 @@ def update_sales_summary_incremental(
             WHERE created_date IN ({placeholders})
             GROUP BY date
         ),
+        OrderHeaders AS (
+            SELECT
+                order_id,
+                created_date,
+                MAX(order_app_name) AS order_app_name
+            FROM shopify_orders
+            WHERE created_date IN ({placeholders})
+            GROUP BY order_id, created_date
+        ),
         ReturnsData AS (
             SELECT
-                STR_TO_DATE(updated_date, '%Y-%m-%d') AS date,
-                SUM(CASE WHEN order_app_name = 'GoKwik' THEN total_price ELSE 0 END) AS gokwik_returns,
-                SUM(CASE WHEN order_app_name = 'KwikEngage' THEN total_price ELSE 0 END) AS kwik_engage_returns,
-                SUM(CASE WHEN order_app_name = 'Online Store' THEN total_price ELSE 0 END) AS online_store_returns,
-                SUM(CASE WHEN order_app_name = 'HYPD_store' THEN total_price ELSE 0 END) AS hypd_store_returns,
-                SUM(CASE WHEN order_app_name = 'Draft Order' THEN total_price ELSE 0 END) AS draft_order_returns,
-                SUM(CASE WHEN order_app_name = 'Dpanda' THEN total_price ELSE 0 END) AS dpanda_returns,
-                SUM(CASE WHEN order_app_name = 'GKAppbrew' THEN total_price ELSE 0 END) AS gkappbrew_returns,
-                SUM(CASE WHEN order_app_name = 'BuyKaro' THEN total_price ELSE 0 END) AS buykaro_returns,
-                SUM(CASE WHEN order_app_name = 'AppbrewPlus' THEN total_price ELSE 0 END) AS appbrewplus_returns,
-                SUM(CASE WHEN order_app_name = 'Shopflo' THEN total_price ELSE 0 END) AS shopflo_returns,
-                SUM(CASE WHEN order_app_name != 'HYPD_store' THEN total_price ELSE 0 END) AS global_returns_WO_hypd
-            FROM shopify_orders_update
-            WHERE financial_status NOT IN ('paid', 'pending')
-              AND updated_date IN ({placeholders})
-              AND {non_rto_filter}
+                rf.order_created_date AS date,
+                SUM(CASE WHEN h.order_app_name = 'GoKwik' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS gokwik_returns,
+                SUM(CASE WHEN h.order_app_name = 'KwikEngage' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS kwik_engage_returns,
+                SUM(CASE WHEN h.order_app_name = 'Online Store' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS online_store_returns,
+                SUM(CASE WHEN h.order_app_name = 'HYPD_store' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS hypd_store_returns,
+                SUM(CASE WHEN h.order_app_name = 'Draft Order' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS draft_order_returns,
+                SUM(CASE WHEN h.order_app_name = 'Dpanda' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS dpanda_returns,
+                SUM(CASE WHEN h.order_app_name = 'GKAppbrew' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS gkappbrew_returns,
+                SUM(CASE WHEN h.order_app_name = 'BuyKaro' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS buykaro_returns,
+                SUM(CASE WHEN h.order_app_name = 'AppbrewPlus' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS appbrewplus_returns,
+                SUM(CASE WHEN h.order_app_name = 'Shopflo' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS shopflo_returns,
+                SUM(CASE WHEN h.order_app_name != 'HYPD_store' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS global_returns_WO_hypd
+            FROM returns_fact rf
+            INNER JOIN OrderHeaders h
+                ON h.order_id = CAST(rf.order_id AS CHAR)
+               AND h.created_date = DATE_FORMAT(rf.order_created_date, '%Y-%m-%d')
+            WHERE rf.event_type = 'CANCEL'
+              AND rf.order_created_date IN ({placeholders})
             GROUP BY date
         ),
         RtoReturnsData AS (
             SELECT
-                STR_TO_DATE(updated_date, '%Y-%m-%d') AS date,
-                SUM(CASE WHEN order_app_name = 'GoKwik' THEN total_price ELSE 0 END) AS gokwik_returns,
-                SUM(CASE WHEN order_app_name = 'KwikEngage' THEN total_price ELSE 0 END) AS kwik_engage_returns,
-                SUM(CASE WHEN order_app_name = 'Online Store' THEN total_price ELSE 0 END) AS online_store_returns,
-                SUM(CASE WHEN order_app_name = 'HYPD_store' THEN total_price ELSE 0 END) AS hypd_store_returns,
-                SUM(CASE WHEN order_app_name = 'Draft Order' THEN total_price ELSE 0 END) AS draft_order_returns,
-                SUM(CASE WHEN order_app_name = 'Dpanda' THEN total_price ELSE 0 END) AS dpanda_returns,
-                SUM(CASE WHEN order_app_name = 'GKAppbrew' THEN total_price ELSE 0 END) AS gkappbrew_returns,
-                SUM(CASE WHEN order_app_name = 'BuyKaro' THEN total_price ELSE 0 END) AS buykaro_returns,
-                SUM(CASE WHEN order_app_name = 'AppbrewPlus' THEN total_price ELSE 0 END) AS appbrewplus_returns,
-                SUM(CASE WHEN order_app_name = 'Shopflo' THEN total_price ELSE 0 END) AS shopflo_returns,
-                SUM(CASE WHEN order_app_name != 'HYPD_store' THEN total_price ELSE 0 END) AS global_returns_WO_hypd
-            FROM shopify_orders_update
-            WHERE financial_status NOT IN ('paid', 'pending')
-              AND updated_date IN ({placeholders})
-              AND {rto_filter}
+                rf.order_created_date AS date,
+                SUM(CASE WHEN h.order_app_name = 'GoKwik' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS gokwik_returns,
+                SUM(CASE WHEN h.order_app_name = 'KwikEngage' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS kwik_engage_returns,
+                SUM(CASE WHEN h.order_app_name = 'Online Store' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS online_store_returns,
+                SUM(CASE WHEN h.order_app_name = 'HYPD_store' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS hypd_store_returns,
+                SUM(CASE WHEN h.order_app_name = 'Draft Order' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS draft_order_returns,
+                SUM(CASE WHEN h.order_app_name = 'Dpanda' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS dpanda_returns,
+                SUM(CASE WHEN h.order_app_name = 'GKAppbrew' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS gkappbrew_returns,
+                SUM(CASE WHEN h.order_app_name = 'BuyKaro' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS buykaro_returns,
+                SUM(CASE WHEN h.order_app_name = 'AppbrewPlus' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS appbrewplus_returns,
+                SUM(CASE WHEN h.order_app_name = 'Shopflo' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS shopflo_returns,
+                SUM(CASE WHEN h.order_app_name != 'HYPD_store' THEN COALESCE(rf.amount, 0) ELSE 0 END) AS global_returns_WO_hypd
+            FROM returns_fact rf
+            INNER JOIN OrderHeaders h
+                ON h.order_id = CAST(rf.order_id AS CHAR)
+               AND h.created_date = DATE_FORMAT(rf.order_created_date, '%Y-%m-%d')
+            WHERE rf.event_type = 'CANCEL (RTO)'
+              AND rf.order_created_date IN ({placeholders})
             GROUP BY date
         ),
         RefundsByDate AS (
@@ -5256,39 +5291,39 @@ def update_sales_summary_incremental(
         )
         SELECT
             d.date,
-            COALESCE(s.gokwik_sales, 0), COALESCE(r.gokwik_returns, 0),
-            COALESCE(s.gokwik_sales, 0) - COALESCE(r.gokwik_returns, 0),
+            COALESCE(s.gokwik_sales, 0), COALESCE(ar.gokwik_returns, 0) - COALESCE(rr.gokwik_returns, 0),
+            COALESCE(s.gokwik_sales, 0) - (COALESCE(ar.gokwik_returns, 0) - COALESCE(rr.gokwik_returns, 0)),
             
-            COALESCE(s.kwik_engage_sales, 0), COALESCE(r.kwik_engage_returns, 0),
-            COALESCE(s.kwik_engage_sales, 0) - COALESCE(r.kwik_engage_returns, 0),
+            COALESCE(s.kwik_engage_sales, 0), COALESCE(ar.kwik_engage_returns, 0) - COALESCE(rr.kwik_engage_returns, 0),
+            COALESCE(s.kwik_engage_sales, 0) - (COALESCE(ar.kwik_engage_returns, 0) - COALESCE(rr.kwik_engage_returns, 0)),
             
-            COALESCE(s.online_store_sales, 0), COALESCE(r.online_store_returns, 0),
-            COALESCE(s.online_store_sales, 0) - COALESCE(r.online_store_returns, 0),
+            COALESCE(s.online_store_sales, 0), COALESCE(ar.online_store_returns, 0) - COALESCE(rr.online_store_returns, 0),
+            COALESCE(s.online_store_sales, 0) - (COALESCE(ar.online_store_returns, 0) - COALESCE(rr.online_store_returns, 0)),
             
-            COALESCE(s.hypd_store_sales, 0), COALESCE(r.hypd_store_returns, 0),
-            COALESCE(s.hypd_store_sales, 0) - COALESCE(r.hypd_store_returns, 0),
+            COALESCE(s.hypd_store_sales, 0), COALESCE(ar.hypd_store_returns, 0) - COALESCE(rr.hypd_store_returns, 0),
+            COALESCE(s.hypd_store_sales, 0) - (COALESCE(ar.hypd_store_returns, 0) - COALESCE(rr.hypd_store_returns, 0)),
             
-            COALESCE(s.draft_order_sales, 0), COALESCE(r.draft_order_returns, 0),
-            COALESCE(s.draft_order_sales, 0) - COALESCE(r.draft_order_returns, 0),
+            COALESCE(s.draft_order_sales, 0), COALESCE(ar.draft_order_returns, 0) - COALESCE(rr.draft_order_returns, 0),
+            COALESCE(s.draft_order_sales, 0) - (COALESCE(ar.draft_order_returns, 0) - COALESCE(rr.draft_order_returns, 0)),
             
-            COALESCE(s.dpanda_sales, 0), COALESCE(r.dpanda_returns, 0),
-            COALESCE(s.dpanda_sales, 0) - COALESCE(r.dpanda_returns, 0),
+            COALESCE(s.dpanda_sales, 0), COALESCE(ar.dpanda_returns, 0) - COALESCE(rr.dpanda_returns, 0),
+            COALESCE(s.dpanda_sales, 0) - (COALESCE(ar.dpanda_returns, 0) - COALESCE(rr.dpanda_returns, 0)),
             
-            COALESCE(s.gkappbrew_sales, 0), COALESCE(r.gkappbrew_returns, 0),
-            COALESCE(s.gkappbrew_sales, 0) - COALESCE(r.gkappbrew_returns, 0),
+            COALESCE(s.gkappbrew_sales, 0), COALESCE(ar.gkappbrew_returns, 0) - COALESCE(rr.gkappbrew_returns, 0),
+            COALESCE(s.gkappbrew_sales, 0) - (COALESCE(ar.gkappbrew_returns, 0) - COALESCE(rr.gkappbrew_returns, 0)),
             
-            COALESCE(s.buykaro_sales, 0), COALESCE(r.buykaro_returns, 0),
-            COALESCE(s.buykaro_sales, 0) - COALESCE(r.buykaro_returns, 0),
+            COALESCE(s.buykaro_sales, 0), COALESCE(ar.buykaro_returns, 0) - COALESCE(rr.buykaro_returns, 0),
+            COALESCE(s.buykaro_sales, 0) - (COALESCE(ar.buykaro_returns, 0) - COALESCE(rr.buykaro_returns, 0)),
             
-            COALESCE(s.appbrewplus_sales, 0), COALESCE(r.appbrewplus_returns, 0),
-            COALESCE(s.appbrewplus_sales, 0) - COALESCE(r.appbrewplus_returns, 0),
+            COALESCE(s.appbrewplus_sales, 0), COALESCE(ar.appbrewplus_returns, 0) - COALESCE(rr.appbrewplus_returns, 0),
+            COALESCE(s.appbrewplus_sales, 0) - (COALESCE(ar.appbrewplus_returns, 0) - COALESCE(rr.appbrewplus_returns, 0)),
             
-            COALESCE(s.shopflo_sales, 0), COALESCE(r.shopflo_returns, 0),
-            COALESCE(s.shopflo_sales, 0) - COALESCE(r.shopflo_returns, 0),
+            COALESCE(s.shopflo_sales, 0), COALESCE(ar.shopflo_returns, 0) - COALESCE(rr.shopflo_returns, 0),
+            COALESCE(s.shopflo_sales, 0) - (COALESCE(ar.shopflo_returns, 0) - COALESCE(rr.shopflo_returns, 0)),
             
             COALESCE(s.global_sales_WO_hypd, 0), 
-            COALESCE(r.global_returns_WO_hypd, 0), 
-            COALESCE(s.global_sales_WO_hypd, 0) - COALESCE(r.global_returns_WO_hypd, 0),
+            COALESCE(ar.global_returns_WO_hypd, 0) - COALESCE(rr.global_returns_WO_hypd, 0), 
+            COALESCE(s.global_sales_WO_hypd, 0) - (COALESCE(ar.global_returns_WO_hypd, 0) - COALESCE(rr.global_returns_WO_hypd, 0)),
             
             COALESCE(s.global_overall_sales, 0),
             COALESCE(rfd.overall_returns, 0),
@@ -5307,13 +5342,13 @@ def update_sales_summary_incremental(
             
         FROM AllDates d
         LEFT JOIN SalesData s ON d.date = s.date
-        LEFT JOIN ReturnsData r ON d.date = r.date
+        LEFT JOIN ReturnsData ar ON d.date = ar.date
         LEFT JOIN RtoReturnsData rr ON d.date = rr.date
         LEFT JOIN RefundsByDate rfd ON d.date = rfd.date
         """
         cursor.execute(
             sql,
-            params + params + tag_params + params + tag_params + params,
+            params + params + params + params,
         )
         connection.commit()
 
@@ -5331,9 +5366,6 @@ def update_order_summary_incremental(
     if not params:
         logger.debug(f"[{brand_name}] order_summary: no dates to rebuild")
         return
-    non_rto_filter, rto_filter, tag_params = _get_rto_tag_sql_filters(
-        brand_index, brand_name
-    )
     with timed(f"[{brand_name}] order_summary incremental ({len(params)} date(s))"):
         # STEP 1: Create staging table
         cursor.execute("DROP TABLE IF EXISTS order_summary_stage")
@@ -5348,14 +5380,23 @@ def update_order_summary_incremental(
             rto_number_of_orders_returned, rto_cod_orders_returned,
             rto_prepaid_orders_returned, rto_partially_paid_orders_returned
         )
+        WITH OrderHeaders AS (
+            SELECT
+                order_id,
+                created_date,
+                MAX(payment_gateway_names) AS payment_gateway_names
+            FROM shopify_orders
+            WHERE created_date IN ({placeholders})
+            GROUP BY order_id, created_date
+        )
         SELECT
             date,
             SUM(orders_created) AS number_of_orders_created,
-            SUM(orders_returned) AS number_of_orders_returned,
-            SUM(orders_created) - SUM(orders_returned) AS actual_number_of_orders,
-            SUM(cod_created) - SUM(cod_returned) AS cod_orders,
-            SUM(prepaid_created) - SUM(prepaid_returned) AS prepaid_orders,
-            SUM(partially_paid_created) - SUM(partially_paid_returned) AS partially_paid_orders,
+            SUM(all_orders_returned) - SUM(rto_orders_returned) AS number_of_orders_returned,
+            SUM(orders_created) - (SUM(all_orders_returned) - SUM(rto_orders_returned)) AS actual_number_of_orders,
+            SUM(cod_created) - (SUM(all_cod_returned) - SUM(rto_cod_returned)) AS cod_orders,
+            SUM(prepaid_created) - (SUM(all_prepaid_returned) - SUM(rto_prepaid_returned)) AS prepaid_orders,
+            SUM(partially_paid_created) - (SUM(all_partially_paid_returned) - SUM(rto_partially_paid_returned)) AS partially_paid_orders,
             SUM(cod_created) AS overall_cod_orders,
             SUM(prepaid_created) AS overall_prepaid_orders,
             SUM(partially_paid_created) AS overall_partially_paid_orders,
@@ -5367,7 +5408,7 @@ def update_order_summary_incremental(
             SELECT 
                 STR_TO_DATE(created_date, '%Y-%m-%d') AS date,
                 COUNT(DISTINCT order_id) AS orders_created,
-                0 AS orders_returned,
+                0 AS all_orders_returned,
 
                 -- COD created: includes NULL, empty, and COD keywords
                 COUNT(DISTINCT CASE 
@@ -5378,7 +5419,7 @@ def update_order_summary_incremental(
                       AND (payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR payment_gateway_names IS NULL)
                     THEN order_id END) AS cod_created,
 
-                0 AS cod_returned,
+                0 AS all_cod_returned,
 
                 -- Prepaid created: exclude COD, blank, and Gokwik PPCOD
                 COUNT(DISTINCT CASE 
@@ -5389,14 +5430,14 @@ def update_order_summary_incremental(
                           OR payment_gateway_names LIKE '%Gokwik PPCOD%')
                     THEN order_id END) AS prepaid_created,
 
-                0 AS prepaid_returned,
+                0 AS all_prepaid_returned,
 
                 -- Partially paid created (Gokwik PPCOD)
                 COUNT(DISTINCT CASE 
                     WHEN payment_gateway_names LIKE '%Gokwik PPCOD%' 
                     THEN order_id END) AS partially_paid_created,
 
-                0 AS partially_paid_returned,
+                0 AS all_partially_paid_returned,
                 0 AS rto_orders_returned,
                 0 AS rto_cod_returned,
                 0 AS rto_prepaid_returned,
@@ -5409,92 +5450,85 @@ def update_order_summary_incremental(
             UNION ALL
 
             SELECT 
-                STR_TO_DATE(updated_date, '%Y-%m-%d') AS date,
+                rf.order_created_date AS date,
                 0 AS orders_created,
-                COUNT(DISTINCT order_id) AS orders_returned,
-
+                COUNT(*) AS all_orders_returned,
                 0 AS cod_created,
-
-                -- COD returned: includes NULL, empty, and COD keywords
-                COUNT(DISTINCT CASE 
-                    WHEN (payment_gateway_names IS NULL 
-                      OR payment_gateway_names = '' 
-                      OR payment_gateway_names LIKE '%Cash on Delivery (COD)%' 
-                      OR payment_gateway_names LIKE '%cash_on_delivery%')
-                      AND (payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR payment_gateway_names IS NULL)
-                    THEN order_id END) AS cod_returned,
-
+                COUNT(CASE
+                    WHEN (h.payment_gateway_names IS NULL
+                      OR h.payment_gateway_names = ''
+                      OR h.payment_gateway_names LIKE '%Cash on Delivery (COD)%'
+                      OR h.payment_gateway_names LIKE '%cash_on_delivery%')
+                      AND (h.payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR h.payment_gateway_names IS NULL)
+                    THEN 1 END) AS all_cod_returned,
                 0 AS prepaid_created,
-
-                -- Prepaid returned
-                COUNT(DISTINCT CASE 
-                    WHEN payment_gateway_names IS NOT NULL 
-                      AND payment_gateway_names != '' 
-                      AND NOT (payment_gateway_names LIKE '%Cash on Delivery (COD)%'
-                          OR payment_gateway_names LIKE '%cash_on_delivery%'
-                          OR payment_gateway_names LIKE '%Gokwik PPCOD%')
-                    THEN order_id END) AS prepaid_returned,
-
+                COUNT(CASE
+                    WHEN h.payment_gateway_names IS NOT NULL
+                      AND h.payment_gateway_names != ''
+                      AND NOT (h.payment_gateway_names LIKE '%Cash on Delivery (COD)%'
+                          OR h.payment_gateway_names LIKE '%cash_on_delivery%'
+                          OR h.payment_gateway_names LIKE '%Gokwik PPCOD%')
+                    THEN 1 END) AS all_prepaid_returned,
                 0 AS partially_paid_created,
-
-                -- Partially paid returned
-                COUNT(DISTINCT CASE 
-                    WHEN payment_gateway_names LIKE '%Gokwik PPCOD%' 
-                    THEN order_id END) AS partially_paid_returned
-                ,
+                COUNT(CASE
+                    WHEN h.payment_gateway_names LIKE '%Gokwik PPCOD%'
+                    THEN 1 END) AS all_partially_paid_returned,
                 0 AS rto_orders_returned,
                 0 AS rto_cod_returned,
                 0 AS rto_prepaid_returned,
                 0 AS rto_partially_paid_returned
-
-            FROM shopify_orders_update
-            WHERE financial_status NOT IN ('paid', 'pending')
-              AND updated_date IN ({placeholders})
-              AND {non_rto_filter}
-            GROUP BY updated_date
+            FROM returns_fact rf
+            INNER JOIN OrderHeaders h
+                ON h.order_id = CAST(rf.order_id AS CHAR)
+               AND h.created_date = DATE_FORMAT(rf.order_created_date, '%Y-%m-%d')
+            WHERE rf.event_type = 'CANCEL'
+              AND rf.order_created_date IN ({placeholders})
+            GROUP BY rf.order_created_date
 
             UNION ALL
 
-            SELECT
-                STR_TO_DATE(updated_date, '%Y-%m-%d') AS date,
+            SELECT 
+                rf.order_created_date AS date,
                 0 AS orders_created,
-                0 AS orders_returned,
+                0 AS all_orders_returned,
                 0 AS cod_created,
-                0 AS cod_returned,
+                0 AS all_cod_returned,
                 0 AS prepaid_created,
-                0 AS prepaid_returned,
+                0 AS all_prepaid_returned,
                 0 AS partially_paid_created,
-                0 AS partially_paid_returned,
-                COUNT(DISTINCT order_id) AS rto_orders_returned,
-                COUNT(DISTINCT CASE
-                    WHEN (payment_gateway_names IS NULL
-                      OR payment_gateway_names = ''
-                      OR payment_gateway_names LIKE '%Cash on Delivery (COD)%'
-                      OR payment_gateway_names LIKE '%cash_on_delivery%')
-                      AND (payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR payment_gateway_names IS NULL)
-                    THEN order_id END) AS rto_cod_returned,
-                COUNT(DISTINCT CASE
-                    WHEN payment_gateway_names IS NOT NULL
-                      AND payment_gateway_names != ''
-                      AND NOT (payment_gateway_names LIKE '%Cash on Delivery (COD)%'
-                          OR payment_gateway_names LIKE '%cash_on_delivery%'
-                          OR payment_gateway_names LIKE '%Gokwik PPCOD%')
-                    THEN order_id END) AS rto_prepaid_returned,
-                COUNT(DISTINCT CASE
-                    WHEN payment_gateway_names LIKE '%Gokwik PPCOD%'
-                    THEN order_id END) AS rto_partially_paid_returned
-            FROM shopify_orders_update
-            WHERE financial_status NOT IN ('paid', 'pending')
-              AND updated_date IN ({placeholders})
-              AND {rto_filter}
-            GROUP BY updated_date
+                0 AS all_partially_paid_returned,
+                COUNT(*) AS rto_orders_returned,
+                COUNT(CASE
+                    WHEN (h.payment_gateway_names IS NULL
+                      OR h.payment_gateway_names = ''
+                      OR h.payment_gateway_names LIKE '%Cash on Delivery (COD)%'
+                      OR h.payment_gateway_names LIKE '%cash_on_delivery%')
+                      AND (h.payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR h.payment_gateway_names IS NULL)
+                    THEN 1 END) AS rto_cod_returned,
+                COUNT(CASE
+                    WHEN h.payment_gateway_names IS NOT NULL
+                      AND h.payment_gateway_names != ''
+                      AND NOT (h.payment_gateway_names LIKE '%Cash on Delivery (COD)%'
+                          OR h.payment_gateway_names LIKE '%cash_on_delivery%'
+                          OR h.payment_gateway_names LIKE '%Gokwik PPCOD%')
+                    THEN 1 END) AS rto_prepaid_returned,
+                COUNT(CASE
+                    WHEN h.payment_gateway_names LIKE '%Gokwik PPCOD%'
+                    THEN 1 END) AS rto_partially_paid_returned
+            FROM returns_fact rf
+            INNER JOIN OrderHeaders h
+                ON h.order_id = CAST(rf.order_id AS CHAR)
+               AND h.created_date = DATE_FORMAT(rf.order_created_date, '%Y-%m-%d')
+            WHERE rf.event_type = 'CANCEL (RTO)'
+              AND rf.order_created_date IN ({placeholders})
+            GROUP BY rf.order_created_date
         ) AS combined
         WHERE date IS NOT NULL
         GROUP BY date
         """
         cursor.execute(
             sql,
-            params + params + tag_params + params + tag_params,
+            params + params + params + params,
         )
         connection.commit()
 
@@ -5512,9 +5546,6 @@ def update_discount_summary_incremental(
     if not params:
         logger.debug(f"[{brand_name}] discount_summary: no dates to rebuild")
         return
-    non_rto_filter, rto_filter, tag_params = _get_rto_tag_sql_filters(
-        brand_index, brand_name
-    )
     with timed(
         f"[{brand_name}] discount_summary incremental ({len(params)} date(s))"
     ):
@@ -5536,24 +5567,37 @@ def update_discount_summary_incremental(
             WHERE created_date IN ({placeholders})
             GROUP BY date
         ),
+        OrderHeaders AS (
+            SELECT
+                order_id,
+                created_date,
+                MAX(discount_amount) AS discount_amount
+            FROM shopify_orders
+            WHERE created_date IN ({placeholders})
+            GROUP BY order_id, created_date
+        ),
         DiscountsReturned AS (
             SELECT
-                STR_TO_DATE(updated_date, '%Y-%m-%d') AS date,
-                SUM(COALESCE(discount_amount, 0)) AS total_discount_on_returns
-            FROM shopify_orders_update
-            WHERE financial_status NOT IN ('paid', 'pending')
-              AND updated_date IN ({placeholders})
-              AND {non_rto_filter}
+                rf.order_created_date AS date,
+                SUM(COALESCE(h.discount_amount, 0)) AS total_discount_on_returns
+            FROM returns_fact rf
+            INNER JOIN OrderHeaders h
+                ON h.order_id = CAST(rf.order_id AS CHAR)
+               AND h.created_date = DATE_FORMAT(rf.order_created_date, '%Y-%m-%d')
+            WHERE rf.event_type = 'CANCEL'
+              AND rf.order_created_date IN ({placeholders})
             GROUP BY date
         ),
         RtoDiscountsReturned AS (
             SELECT
-                STR_TO_DATE(updated_date, '%Y-%m-%d') AS date,
-                SUM(COALESCE(discount_amount, 0)) AS total_discount_on_returns
-            FROM shopify_orders_update
-            WHERE financial_status NOT IN ('paid', 'pending')
-              AND updated_date IN ({placeholders})
-              AND {rto_filter}
+                rf.order_created_date AS date,
+                SUM(COALESCE(h.discount_amount, 0)) AS total_discount_on_returns
+            FROM returns_fact rf
+            INNER JOIN OrderHeaders h
+                ON h.order_id = CAST(rf.order_id AS CHAR)
+               AND h.created_date = DATE_FORMAT(rf.order_created_date, '%Y-%m-%d')
+            WHERE rf.event_type = 'CANCEL (RTO)'
+              AND rf.order_created_date IN ({placeholders})
             GROUP BY date
         ),
         AllDates AS (
@@ -5566,15 +5610,18 @@ def update_discount_summary_incremental(
         SELECT
             d.date, 
             COALESCE(dg.total_discounts_given, 0) AS total_discounts_given,
-            COALESCE(dr.total_discount_on_returns, 0) AS total_discount_on_returns,
+            (COALESCE(dr.total_discount_on_returns, 0) - COALESCE(rdr.total_discount_on_returns, 0)) AS total_discount_on_returns,
             COALESCE(rdr.total_discount_on_returns, 0) AS rto_total_discount_on_returns,
-            (COALESCE(dg.total_discounts_given, 0) - COALESCE(dr.total_discount_on_returns, 0)) AS actual_discounts
+            (COALESCE(dg.total_discounts_given, 0) - (COALESCE(dr.total_discount_on_returns, 0) - COALESCE(rdr.total_discount_on_returns, 0))) AS actual_discounts
         FROM AllDates d
         LEFT JOIN DiscountsGiven dg ON d.date = dg.date
         LEFT JOIN DiscountsReturned dr ON d.date = dr.date
         LEFT JOIN RtoDiscountsReturned rdr ON d.date = rdr.date
         """
-        cursor.execute(sql, params + params + tag_params + params + tag_params)
+        cursor.execute(
+            sql,
+            params + params + params + params,
+        )
         connection.commit()
 
         # STEP 4 & 5: Fetch affected dates and merge
@@ -6172,19 +6219,10 @@ def update_rto_summary_incremental(
     cursor, connection, brand_index: int, brand_name: str, target_dates: Iterable[str]
 ):
     """Update rto_summary for only the specific affected dates."""
-    rto_tag = get_rto_tag_for_brand(brand_index, brand_name)
-    if not rto_tag:
-        logger.info(
-            f"[{brand_name}] RTO summary skipped: no active RTO tag from Mongo rto_tags or RTO_MAPPINGS"
-        )
-        return
-
     placeholders, params = _dates_in_clause(target_dates)
     if not params:
         logger.debug(f"[{brand_name}] rto_summary: no dates to rebuild")
         return
-
-    regex_pattern = _build_mysql_regex_for_exact_tag(rto_tag)
 
     with timed(f"[{brand_name}] rto_summary incremental ({len(params)} date(s))"):
         cursor.execute("CREATE TABLE IF NOT EXISTS rto_summary_stage LIKE rto_summary")
@@ -6195,26 +6233,51 @@ def update_rto_summary_incremental(
             summary_date, total_orders, rto_orders, rto_percentage
         )
         SELECT
-            summary_date,
-            total_orders,
-            rto_orders,
-            ROUND(COALESCE(rto_orders * 100.0 / NULLIF(total_orders, 0), 0), 2) AS rto_percentage
+            d.summary_date,
+            COALESCE(t.total_orders, 0) AS total_orders,
+            COALESCE(r.rto_orders, 0) AS rto_orders,
+            ROUND(
+                COALESCE(
+                    COALESCE(r.rto_orders, 0) * 100.0 / NULLIF(COALESCE(t.total_orders, 0), 0),
+                    0
+                ),
+                2
+            ) AS rto_percentage
         FROM (
-            SELECT
-                STR_TO_DATE(created_date, '%Y-%m-%d') AS summary_date,
-                COUNT(DISTINCT order_id) AS total_orders,
-                COUNT(
-                    DISTINCT CASE
-                        WHEN tags IS NOT NULL AND LOWER(tags) REGEXP %s THEN order_id
-                    END
-                ) AS rto_orders
+            SELECT STR_TO_DATE(created_date, '%Y-%m-%d') AS summary_date
             FROM shopify_orders
             WHERE created_date IN ({placeholders})
             GROUP BY created_date
-        ) AS rto_daily
-        WHERE summary_date IS NOT NULL
+        ) AS d
+        LEFT JOIN (
+            SELECT
+                STR_TO_DATE(s.created_date, '%Y-%m-%d') AS summary_date,
+                COUNT(DISTINCT s.order_id) AS total_orders
+            FROM (
+                SELECT
+                    order_id,
+                    created_date
+                FROM shopify_orders
+                WHERE created_date IN ({placeholders})
+                GROUP BY order_id, created_date
+            ) AS s
+            GROUP BY s.created_date
+        ) AS t
+            ON d.summary_date = t.summary_date
+        LEFT JOIN (
+            SELECT
+                order_created_date AS summary_date,
+                COUNT(DISTINCT order_id) AS rto_orders
+            FROM returns_fact
+            WHERE event_type = 'CANCEL (RTO)'
+              AND order_created_date IN ({placeholders})
+            GROUP BY order_created_date
+        ) AS r
+            ON d.summary_date = r.summary_date
+        WHERE d.summary_date IS NOT NULL
         """
-        cursor.execute(sql, (regex_pattern, *params))
+
+        cursor.execute(sql, params + params + params)
         connection.commit()
 
         merge_staging_to_main_by_date(
@@ -8651,8 +8714,9 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
                 new_dates = get_affected_dates_new_orders(filtered, tz)
                 if new_dates:
                     affected_dates.update(new_dates)
-                    if get_rto_tag_for_brand(brand_index, brand_name):
-                        rto_affected_dates.update(new_dates)
+                    rto_new_dates = get_rto_affected_dates_updates(filtered, tz)
+                    if rto_new_dates:
+                        rto_affected_dates.update(rto_new_dates)
                     logger.info(
                         f"📅 Affected dates for {process['type']}: "
                         f"{len(new_dates)} date(s) ({min(new_dates)}..{max(new_dates)})"
@@ -8696,11 +8760,9 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
                     tz,
                     extra_event_dates=changed_return_dates,
                 )
-                rto_upd_dates = set()
-                if get_rto_tag_for_brand(brand_index, brand_name):
-                    rto_upd_dates = get_rto_affected_dates_updates(filtered, tz)
-                    if rto_upd_dates:
-                        rto_affected_dates.update(rto_upd_dates)
+                rto_upd_dates = get_rto_affected_dates_updates(filtered, tz)
+                if rto_upd_dates:
+                    rto_affected_dates.update(rto_upd_dates)
                 if upd_dates:
                     affected_dates.update(upd_dates)
                     logger.info(
