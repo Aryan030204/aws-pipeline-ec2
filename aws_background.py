@@ -6926,12 +6926,9 @@ def update_overall_summary_incremental(
     with timed(
         f"[{brand_name}] overall_summary incremental ({len(params)} date(s))"
     ):
-        # STEP 1: Create staging table
-        cursor.execute(
-            "CREATE TABLE IF NOT EXISTS overall_summary_stage LIKE overall_summary"
-        )
-        # STEP 2: Clear staging table
-        cursor.execute("TRUNCATE TABLE overall_summary_stage")
+        # Recreate the stage table so its schema always matches overall_summary.
+        cursor.execute("DROP TABLE IF EXISTS overall_summary_stage")
+        cursor.execute("CREATE TABLE overall_summary_stage LIKE overall_summary")
 
         # STEP 3: Populate staging table
         sql = f"""
