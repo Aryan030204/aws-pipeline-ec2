@@ -3977,24 +3977,79 @@ def _iter_counted_pair_events_from_mongo(
             client.close()
 
 
-def _fetch_daily_sliding_session_event_counts_from_mongo(
+def _iter_unique_daily_pair_events_from_mongo(
     start_date: date,
     end_date: date,
     mongo_shop_name: str,
     event_type: str,
     tz: ZoneInfo = IST,
-    dedupe_window_minutes: int = 30,
+) -> List[Dict[str, Any]]:
+    start_utc, end_utc = _ist_date_range_to_utc_bounds(start_date, end_date, tz)
+    client = None
+    try:
+        client, collection = _resolve_mongo_sessions_collection()
+        cursor = collection.find(
+            {
+                "event_type": event_type,
+                "shop_name": mongo_shop_name,
+                "createdAt": {"$gte": start_utc, "$lt": end_utc},
+            },
+            {"createdAt": 1, "session_id": 1, "cart_token": 1, "variantId": 1},
+        )
+
+        pair_events: Dict[Tuple[date, str, str], List[Dict[str, Any]]] = {}
+        for doc in cursor:
+            session_id = _extract_session_id(doc)
+            cart_token = _extract_cart_token(doc)
+            if not session_id or not cart_token:
+                continue
+
+            created_at = doc.get("createdAt")
+            if not isinstance(created_at, datetime):
+                continue
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+
+            local_created_at = created_at.astimezone(tz)
+            local_date = local_created_at.date()
+            if local_date < start_date or local_date > end_date:
+                continue
+
+            pair_key = (local_date, session_id, cart_token)
+            pair_events.setdefault(pair_key, []).append(
+                {
+                    "date": local_date,
+                    "variant_ids": _normalize_variant_ids(doc.get("variantId")),
+                }
+            )
+
+        unique_events: List[Dict[str, Any]] = []
+        for events in pair_events.values():
+            if len(events) == 1:
+                unique_events.append(events[0])
+
+        return unique_events
+    finally:
+        if client is not None:
+            client.close()
+
+
+def _fetch_daily_unique_pair_event_counts_from_mongo(
+    start_date: date,
+    end_date: date,
+    mongo_shop_name: str,
+    event_type: str,
+    tz: ZoneInfo = IST,
 ) -> Dict[date, int]:
     counts: Dict[date, int] = {}
-    counted_events = _iter_counted_pair_events_from_mongo(
+    unique_events = _iter_unique_daily_pair_events_from_mongo(
         start_date=start_date,
         end_date=end_date,
         mongo_shop_name=mongo_shop_name,
         event_type=event_type,
         tz=tz,
-        dedupe_window_minutes=dedupe_window_minutes,
     )
-    for event in counted_events:
+    for event in unique_events:
         event_date = event["date"]
         counts[event_date] = counts.get(event_date, 0) + 1
     return counts
@@ -4057,14 +4112,14 @@ def update_overall_summary_event_columns(
 
     tz = get_brand_timezone(brand_index)
     try:
-        ci_counts = _fetch_daily_sliding_session_event_counts_from_mongo(
+        ci_counts = _fetch_daily_unique_pair_event_counts_from_mongo(
             start_date=start_date,
             end_date=end_date,
             mongo_shop_name=mongo_shop_name,
             event_type="checkout_initiated",
             tz=tz,
         )
-        buy_now_counts = _fetch_daily_sliding_session_event_counts_from_mongo(
+        buy_now_counts = _fetch_daily_unique_pair_event_counts_from_mongo(
             start_date=start_date,
             end_date=end_date,
             mongo_shop_name=mongo_shop_name,
@@ -4331,7 +4386,7 @@ def _fetch_event_variant_counts_from_mongo(
     tz: ZoneInfo = IST,
 ) -> List[Dict[str, Any]]:
     counts: Dict[Tuple[date, str], int] = {}
-    counted_events = _iter_counted_pair_events_from_mongo(
+    counted_events = _iter_unique_daily_pair_events_from_mongo(
         start_date=start_date,
         end_date=end_date,
         mongo_shop_name=mongo_shop_name,
