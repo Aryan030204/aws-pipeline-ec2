@@ -3894,6 +3894,11 @@ def _extract_session_id(doc: Dict[str, Any]) -> Optional[str]:
     return session_id or None
 
 
+def _extract_cart_token(doc: Dict[str, Any]) -> Optional[str]:
+    cart_token = str(doc.get("cart_token") or "").strip()
+    return cart_token or None
+
+
 def _normalize_variant_ids(variant_val: Any) -> List[str]:
     variant_ids: List[str] = []
     if isinstance(variant_val, list):
@@ -3907,16 +3912,15 @@ def _normalize_variant_ids(variant_val: Any) -> List[str]:
     return sorted(set(variant_ids))
 
 
-def _fetch_daily_sliding_session_event_counts_from_mongo(
+def _iter_counted_pair_events_from_mongo(
     start_date: date,
     end_date: date,
     mongo_shop_name: str,
     event_type: str,
     tz: ZoneInfo = IST,
     dedupe_window_minutes: int = 30,
-) -> Dict[date, int]:
+) -> List[Dict[str, Any]]:
     start_utc, end_utc = _ist_date_range_to_utc_bounds(start_date, end_date, tz)
-    query_start_utc = start_utc - timedelta(minutes=dedupe_window_minutes)
     dedupe_window = timedelta(minutes=dedupe_window_minutes)
     client = None
     try:
@@ -3926,18 +3930,19 @@ def _fetch_daily_sliding_session_event_counts_from_mongo(
                 {
                     "event_type": event_type,
                     "shop_name": mongo_shop_name,
-                    "createdAt": {"$gte": query_start_utc, "$lt": end_utc},
+                    "createdAt": {"$gte": start_utc, "$lt": end_utc},
                 },
-                {"createdAt": 1, "session_id": 1},
+                {"createdAt": 1, "session_id": 1, "cart_token": 1, "variantId": 1},
             )
             .sort("createdAt", 1)
         )
 
-        counts: Dict[date, int] = {}
-        last_counted_at_by_session: Dict[str, datetime] = {}
+        counted_events: List[Dict[str, Any]] = []
+        last_counted_at_by_pair: Dict[Tuple[date, str, str], datetime] = {}
         for doc in cursor:
             session_id = _extract_session_id(doc)
-            if not session_id:
+            cart_token = _extract_cart_token(doc)
+            if not session_id or not cart_token:
                 continue
 
             created_at = doc.get("createdAt")
@@ -3946,23 +3951,53 @@ def _fetch_daily_sliding_session_event_counts_from_mongo(
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=timezone.utc)
 
-            last_counted_at = last_counted_at_by_session.get(session_id)
+            local_created_at = created_at.astimezone(tz)
+            local_date = local_created_at.date()
+            pair_key = (local_date, session_id, cart_token)
+
+            last_counted_at = last_counted_at_by_pair.get(pair_key)
             if last_counted_at is not None and created_at - last_counted_at <= dedupe_window:
                 continue
 
-            local_created_at = created_at.astimezone(tz)
-            local_date = local_created_at.date()
             if local_date < start_date or local_date > end_date:
-                last_counted_at_by_session[session_id] = created_at
                 continue
 
-            counts[local_date] = counts.get(local_date, 0) + 1
-            last_counted_at_by_session[session_id] = created_at
+            counted_events.append(
+                {
+                    "date": local_date,
+                    "hour": local_created_at.hour,
+                    "variant_ids": _normalize_variant_ids(doc.get("variantId")),
+                }
+            )
+            last_counted_at_by_pair[pair_key] = created_at
 
-        return counts
+        return counted_events
     finally:
         if client is not None:
             client.close()
+
+
+def _fetch_daily_sliding_session_event_counts_from_mongo(
+    start_date: date,
+    end_date: date,
+    mongo_shop_name: str,
+    event_type: str,
+    tz: ZoneInfo = IST,
+    dedupe_window_minutes: int = 30,
+) -> Dict[date, int]:
+    counts: Dict[date, int] = {}
+    counted_events = _iter_counted_pair_events_from_mongo(
+        start_date=start_date,
+        end_date=end_date,
+        mongo_shop_name=mongo_shop_name,
+        event_type=event_type,
+        tz=tz,
+        dedupe_window_minutes=dedupe_window_minutes,
+    )
+    for event in counted_events:
+        event_date = event["date"]
+        counts[event_date] = counts.get(event_date, 0) + 1
+    return counts
 
 
 def _upsert_overall_summary_event_totals(
@@ -4071,48 +4106,23 @@ def _fetch_event_hourly_counts_from_mongo(
     metric_key: str,
     tz: ZoneInfo = IST,
 ) -> List[Dict[str, Any]]:
-    start_utc, end_utc = _ist_date_range_to_utc_bounds(start_date, end_date, tz)
-    client = None
-    try:
-        client, collection = _resolve_mongo_sessions_collection()
-        cursor = collection.find(
-            {
-                "event_type": event_type,
-                "shop_name": mongo_shop_name,
-                "createdAt": {"$gte": start_utc, "$lt": end_utc},
-            },
-            {"createdAt": 1, "session_id": 1},
-        )
+    counts: Dict[Tuple[date, int], int] = {}
+    counted_events = _iter_counted_pair_events_from_mongo(
+        start_date=start_date,
+        end_date=end_date,
+        mongo_shop_name=mongo_shop_name,
+        event_type=event_type,
+        tz=tz,
+    )
 
-        counts: Dict[Tuple[date, int], int] = {}
-        seen_sessions: Set[Tuple[date, int, str]] = set()
-        for doc in cursor:
-            session_id = _extract_session_id(doc)
-            if not session_id:
-                continue
+    for event in counted_events:
+        bucket_key = (event["date"], event["hour"])
+        counts[bucket_key] = counts.get(bucket_key, 0) + 1
 
-            created_at = doc.get("createdAt")
-            if not isinstance(created_at, datetime):
-                continue
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=timezone.utc)
-
-            created_at_store = created_at.astimezone(tz)
-            bucket_key = (created_at_store.date(), created_at_store.hour)
-            dedupe_key = (bucket_key[0], bucket_key[1], session_id)
-            if dedupe_key in seen_sessions:
-                continue
-
-            seen_sessions.add(dedupe_key)
-            counts[bucket_key] = counts.get(bucket_key, 0) + 1
-
-        return [
-            {"date": bucket_date, "hour": bucket_hour, metric_key: count}
-            for (bucket_date, bucket_hour), count in sorted(counts.items())
-        ]
-    finally:
-        if client is not None:
-            client.close()
+    return [
+        {"date": bucket_date, "hour": bucket_hour, metric_key: count}
+        for (bucket_date, bucket_hour), count in sorted(counts.items())
+    ]
 
 
 def fetch_checkout_initiated_hourly_counts_from_mongo(
@@ -4320,59 +4330,29 @@ def _fetch_event_variant_counts_from_mongo(
     metric_key: str,
     tz: ZoneInfo = IST,
 ) -> List[Dict[str, Any]]:
-    start_utc, end_utc = _ist_date_range_to_utc_bounds(start_date, end_date, tz)
-    client = None
-    try:
-        client, collection = _resolve_mongo_sessions_collection()
-        cursor = collection.find(
-            {
-                "event_type": event_type,
-                "shop_name": mongo_shop_name,
-                "createdAt": {"$gte": start_utc, "$lt": end_utc},
-            },
-            {"createdAt": 1, "session_id": 1, "variantId": 1},
-        )
+    counts: Dict[Tuple[date, str], int] = {}
+    counted_events = _iter_counted_pair_events_from_mongo(
+        start_date=start_date,
+        end_date=end_date,
+        mongo_shop_name=mongo_shop_name,
+        event_type=event_type,
+        tz=tz,
+    )
 
-        counts: Dict[Tuple[date, str], int] = {}
-        seen_sessions: Set[Tuple[date, str, str]] = set()
-        for doc in cursor:
-            session_id = _extract_session_id(doc)
-            if not session_id:
-                continue
+    for event in counted_events:
+        event_date = event["date"]
+        for vid in event["variant_ids"]:
+            key = (event_date, vid)
+            counts[key] = counts.get(key, 0) + 1
 
-            created_at = doc.get("createdAt")
-            if not isinstance(created_at, datetime):
-                continue
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=timezone.utc)
-
-            created_at_store = created_at.astimezone(tz)
-            event_date = created_at_store.date()
-
-            variant_val = doc.get("variantId")
-            if variant_val is None:
-                continue
-
-            for vid in _normalize_variant_ids(variant_val):
-                dedupe_key = (event_date, vid, session_id)
-                if dedupe_key in seen_sessions:
-                    continue
-
-                seen_sessions.add(dedupe_key)
-                key = (event_date, vid)
-                counts[key] = counts.get(key, 0) + 1
-
-        return [
-            {
-                "date": bucket_date,
-                "variant_id": vid,
-                metric_key: count,
-            }
-            for (bucket_date, vid), count in sorted(counts.items())
-        ]
-    finally:
-        if client is not None:
-            client.close()
+    return [
+        {
+            "date": bucket_date,
+            "variant_id": vid,
+            metric_key: count,
+        }
+        for (bucket_date, vid), count in sorted(counts.items())
+    ]
 
 
 def fetch_checkout_initiated_variant_counts_from_mongo(
