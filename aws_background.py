@@ -3494,6 +3494,31 @@ def ensure_buy_now_events_column(
         pass
 
 
+def ensure_overall_summary_event_columns(brand_index: int) -> None:
+    """
+    Ensure ci_events and buy_now_events exist in overall_summary.
+    """
+    engine = sqlalchemy_engines.get(brand_index)
+    if not engine:
+        return
+
+    statements = (
+        "ALTER TABLE overall_summary ADD COLUMN ci_events INT DEFAULT 0",
+        "ALTER TABLE overall_summary ADD COLUMN buy_now_events INT DEFAULT 0",
+    )
+    try:
+        with engine.connect() as conn:
+            for sql in statements:
+                try:
+                    conn.execute(text(sql))
+                    conn.commit()
+                except Exception as e:
+                    if "Duplicate column name" in str(e):
+                        continue
+    except Exception:
+        pass
+
+
 def run_brand_preflight_schema_migrations(brand_index: int) -> None:
     brand_name = os.environ.get(f"BRAND_NAME_{brand_index}", f"Brand_{brand_index}")
     logger.info(f"🧱 Running preflight schema migrations for {brand_name}")
@@ -3506,6 +3531,7 @@ def run_brand_preflight_schema_migrations(brand_index: int) -> None:
     ensure_device_summary_columns(brand_index, "hourly_sessions_summary_shopify")
     ensure_ci_events_column(brand_index, "hourly_sessions_summary_shopify")
     ensure_buy_now_events_column(brand_index, "hourly_sessions_summary_shopify")
+    ensure_overall_summary_event_columns(brand_index)
     ensure_utm_names_column(brand_index, "overall_utm_summary")
     logger.info(f"✅ Preflight schema migrations complete for {brand_name}")
 
@@ -3879,6 +3905,162 @@ def _normalize_variant_ids(variant_val: Any) -> List[str]:
         if val_str:
             variant_ids = [v.strip() for v in val_str.split(",") if v.strip()]
     return sorted(set(variant_ids))
+
+
+def _fetch_daily_sliding_session_event_counts_from_mongo(
+    start_date: date,
+    end_date: date,
+    mongo_shop_name: str,
+    event_type: str,
+    tz: ZoneInfo = IST,
+    dedupe_window_minutes: int = 30,
+) -> Dict[date, int]:
+    start_utc, end_utc = _ist_date_range_to_utc_bounds(start_date, end_date, tz)
+    query_start_utc = start_utc - timedelta(minutes=dedupe_window_minutes)
+    dedupe_window = timedelta(minutes=dedupe_window_minutes)
+    client = None
+    try:
+        client, collection = _resolve_mongo_sessions_collection()
+        cursor = (
+            collection.find(
+                {
+                    "event_type": event_type,
+                    "shop_name": mongo_shop_name,
+                    "createdAt": {"$gte": query_start_utc, "$lt": end_utc},
+                },
+                {"createdAt": 1, "session_id": 1},
+            )
+            .sort("createdAt", 1)
+        )
+
+        counts: Dict[date, int] = {}
+        last_counted_at_by_session: Dict[str, datetime] = {}
+        for doc in cursor:
+            session_id = _extract_session_id(doc)
+            if not session_id:
+                continue
+
+            created_at = doc.get("createdAt")
+            if not isinstance(created_at, datetime):
+                continue
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+
+            last_counted_at = last_counted_at_by_session.get(session_id)
+            if last_counted_at is not None and created_at - last_counted_at <= dedupe_window:
+                continue
+
+            local_created_at = created_at.astimezone(tz)
+            local_date = local_created_at.date()
+            if local_date < start_date or local_date > end_date:
+                last_counted_at_by_session[session_id] = created_at
+                continue
+
+            counts[local_date] = counts.get(local_date, 0) + 1
+            last_counted_at_by_session[session_id] = created_at
+
+        return counts
+    finally:
+        if client is not None:
+            client.close()
+
+
+def _upsert_overall_summary_event_totals(
+    cursor,
+    connection,
+    start_date: date,
+    end_date: date,
+    ci_counts: Dict[date, int],
+    buy_now_counts: Dict[date, int],
+):
+    all_dates = []
+    current = start_date
+    while current <= end_date:
+        all_dates.append(current)
+        current += timedelta(days=1)
+
+    for bucket_date in all_dates:
+        cursor.execute(
+            """
+            INSERT INTO overall_summary (date, ci_events, buy_now_events)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                ci_events = VALUES(ci_events),
+                buy_now_events = VALUES(buy_now_events)
+            """,
+            (
+                bucket_date,
+                int(ci_counts.get(bucket_date, 0)),
+                int(buy_now_counts.get(bucket_date, 0)),
+            ),
+        )
+
+    connection.commit()
+
+
+def update_overall_summary_event_columns(
+    brand_index: int,
+    brand_name: str,
+    start_date: date,
+    end_date: date,
+    brand_key: Optional[str] = None,
+    cursor=None,
+    connection=None,
+):
+    if not is_ci_events_brand(brand_name, brand_key):
+        logger.info(
+            f"Skipping overall_summary event totals for {brand_name}: brand not enabled for Mongo event sync"
+        )
+        return
+
+    mongo_shop_name = get_ci_events_mongo_shop_name(brand_name, brand_key)
+    if not mongo_shop_name:
+        logger.info(
+            f"Skipping overall_summary event totals for {brand_name}: no Mongo shop_name mapping"
+        )
+        return
+
+    tz = get_brand_timezone(brand_index)
+    try:
+        ci_counts = _fetch_daily_sliding_session_event_counts_from_mongo(
+            start_date=start_date,
+            end_date=end_date,
+            mongo_shop_name=mongo_shop_name,
+            event_type="checkout_initiated",
+            tz=tz,
+        )
+        buy_now_counts = _fetch_daily_sliding_session_event_counts_from_mongo(
+            start_date=start_date,
+            end_date=end_date,
+            mongo_shop_name=mongo_shop_name,
+            event_type="buy_now",
+            tz=tz,
+        )
+    except Exception as e:
+        logger.error(
+            f"Error fetching overall_summary event totals from Mongo for {brand_name}: {e}"
+        )
+        return
+
+    if cursor is not None:
+        _upsert_overall_summary_event_totals(
+            cursor, connection, start_date, end_date, ci_counts, buy_now_counts
+        )
+        logger.info(
+            f"Updated overall_summary event totals for {brand_name} ({start_date}..{end_date})"
+        )
+        return
+
+    try:
+        with get_db_cursor(brand_index) as (c, conn):
+            _upsert_overall_summary_event_totals(
+                c, conn, start_date, end_date, ci_counts, buy_now_counts
+            )
+        logger.info(
+            f"Updated overall_summary event totals for {brand_name} ({start_date}..{end_date})"
+        )
+    except Exception as e:
+        logger.error(f"Error updating overall_summary event totals for {brand_name}: {e}")
 
 
 def _fetch_event_hourly_counts_from_mongo(
@@ -5498,6 +5680,8 @@ def ensure_summary_tables(cursor, connection):
                 total_sessions INT DEFAULT 0,
                 total_atc_sessions INT DEFAULT 0,
                 adjusted_total_sessions INT DEFAULT 0,
+                ci_events INT DEFAULT 0,
+                buy_now_events INT DEFAULT 0,
                 KEY idx_date (date)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
@@ -5598,6 +5782,22 @@ def ensure_summary_tables(cursor, connection):
             """)
         except mysql.connector.Error:
             # Column may already exist; ignore error
+            pass
+
+        try:
+            cursor.execute("""
+                ALTER TABLE overall_summary
+                ADD COLUMN ci_events INT DEFAULT 0
+            """)
+        except mysql.connector.Error:
+            pass
+
+        try:
+            cursor.execute("""
+                ALTER TABLE overall_summary
+                ADD COLUMN buy_now_events INT DEFAULT 0
+            """)
+        except mysql.connector.Error:
             pass
 
         cursor.execute("""
@@ -6711,6 +6911,7 @@ def update_dashboard_discount_payment_hourly_incremental(
 
 
 def update_overall_summary_incremental(
+    brand_index: int,
     cursor,
     connection,
     brand_key: Optional[str],
@@ -6782,6 +6983,17 @@ def update_overall_summary_incremental(
         # STEP 4 & 5: Fetch affected dates and merge
         merge_staging_to_main_by_date(
             cursor, connection, "overall_summary", "overall_summary_stage", brand_name
+        )
+
+        parsed_dates = sorted(date.fromisoformat(str(d)) for d in params)
+        update_overall_summary_event_columns(
+            brand_index=brand_index,
+            brand_name=brand_name,
+            brand_key=brand_key,
+            start_date=parsed_dates[0],
+            end_date=parsed_dates[-1],
+            cursor=cursor,
+            connection=connection,
         )
 
 
@@ -7191,7 +7403,7 @@ def execute_summary_queries_incremental(
                     cursor, connection, brand_name, dates_set
                 )
                 update_overall_summary_incremental(
-                    cursor, connection, brand_key, brand_name, dates_set
+                    brand_index, cursor, connection, brand_key, brand_name, dates_set
                 )
                 update_shopify_orders_utm_daily_incremental(
                     cursor, connection, brand_name, dates_set
