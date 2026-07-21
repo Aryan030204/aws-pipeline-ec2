@@ -346,6 +346,9 @@ def fetch_brand_config(brand_id: str) -> Optional[Dict[str, Any]]:
         logger.error(f"❌ Config fetch error for {brand_id}: {e}")
         return None
 
+def is_brand_config_active(config: Dict[str, Any]) -> bool:
+    return config.get("is_active") is True
+
 def initialize_brand_configs():
     import tempfile
     import certifi
@@ -556,6 +559,13 @@ def initialize_brand_configs():
             logger.info(f"🔍 Fetching API config for brand: {brand_tag_value} (brand_id={brand_id_key})")
             config = fetch_brand_config(brand_id_key)
             if not config: continue
+            if not is_brand_config_active(config):
+                logger.info(
+                    "⏭️ Skipping brand %s (brand_id=%s): tenant config is not active",
+                    config.get("brand_name", brand_tag_value),
+                    brand_id_key,
+                )
+                continue
 
             try:
                 # Use brand_id from the API response key (authoritative source)

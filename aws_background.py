@@ -1032,6 +1032,10 @@ def fetch_brand_config(brand_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def is_brand_config_active(config: Dict[str, Any]) -> bool:
+    return config.get("is_active") is True
+
+
 def _is_ssl_connection_error(exc: BaseException) -> bool:
     err_msg = str(exc).lower()
     return "ssl" in err_msg or "certificate verify failed" in err_msg
@@ -1387,6 +1391,13 @@ def initialize_brand_configs():
             )
             config = fetch_brand_config(brand_id_key)
             if not config:
+                continue
+            if not is_brand_config_active(config):
+                logger.info(
+                    "⏭️ Skipping brand %s (brand_id=%s): tenant config is not active",
+                    config.get("brand_name", brand_tag_value),
+                    brand_id_key,
+                )
                 continue
 
             try:
