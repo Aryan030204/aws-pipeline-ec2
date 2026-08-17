@@ -1,0 +1,360 @@
+import base64
+import logging
+import os
+import re
+import tempfile
+from collections import defaultdict
+from contextlib import contextmanager
+from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from zoneinfo import ZoneInfo
+
+import certifi
+import mysql.connector
+from dotenv import load_dotenv
+from pymongo import MongoClient
+
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+IST = ZoneInfo("Asia/Kolkata")
+MONGO_URI = os.environ.get("MONGO_URI", "").strip()
+MASTER_DB_HOST = os.environ.get("MASTER_DB_HOST", "").strip()
+MASTER_DB_PORT = int(os.environ.get("MASTER_DB_PORT", "3306"))
+MASTER_DB_USER = os.environ.get("MASTER_DB_USER", "").strip()
+MASTER_DB_PASSWORD = os.environ.get("MASTER_DB_PASSWORD", "").strip()
+MASTER_DB_NAME = os.environ.get("MASTER_DB_NAME", "").strip()
+MONGO_DB_NAME = os.environ.get("MONGO_EVENTS_DB_NAME", "alerts").strip() or "alerts"
+MONGO_COLLECTION_NAME = (
+    os.environ.get("MONGO_EVENTS_COLLECTION_NAME", "sessions").strip() or "sessions"
+)
+EVENTS_SUMMARY_TABLE = "events_summary"
+EVENT_COLUMN_SUFFIX = "_count"
+
+
+def now_ist() -> datetime:
+    return datetime.now(IST)
+
+
+def compute_rebuild_dates(current_dt: Optional[datetime] = None) -> List[date]:
+    local_now = current_dt.astimezone(IST) if current_dt else now_ist()
+    today = local_now.date()
+    return [today - timedelta(days=2), today - timedelta(days=1)]
+
+
+def compute_utc_bounds_for_dates(target_dates: Sequence[date]) -> Tuple[datetime, datetime]:
+    if not target_dates:
+        raise ValueError("target_dates must not be empty")
+
+    start_date = min(target_dates)
+    end_date = max(target_dates) + timedelta(days=1)
+    start_dt = datetime.combine(start_date, time.min, tzinfo=IST)
+    end_dt = datetime.combine(end_date, time.min, tzinfo=IST)
+    return start_dt.astimezone(timezone.utc), end_dt.astimezone(timezone.utc)
+
+
+def sanitize_event_type(event_type: object) -> Optional[str]:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(event_type or "").strip().lower())
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    if not normalized:
+        return None
+    return f"{normalized}{EVENT_COLUMN_SUFFIX}"
+
+
+def quote_identifier(identifier: str) -> str:
+    if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", identifier or ""):
+        raise ValueError(f"Unsafe SQL identifier: {identifier!r}")
+    return f"`{identifier}`"
+
+
+def aggregate_event_documents(
+    docs: Iterable[Dict],
+    target_dates: Set[date],
+    tz: ZoneInfo = IST,
+) -> Tuple[Dict[Tuple[date, str], Dict[str, int]], Set[str]]:
+    aggregated: Dict[Tuple[date, str], Dict[str, int]] = defaultdict(
+        lambda: defaultdict(int)
+    )
+    event_columns: Set[str] = set()
+
+    for doc in docs:
+        created_at = doc.get("createdAt")
+        if not isinstance(created_at, datetime):
+            continue
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+
+        local_dt = created_at.astimezone(tz)
+        local_date = local_dt.date()
+        if local_date not in target_dates:
+            continue
+
+        shop_name = str(doc.get("shop_name") or "").strip()
+        if not shop_name:
+            continue
+
+        column_name = sanitize_event_type(doc.get("event_type"))
+        if not column_name:
+            logger.warning("Skipping event with unusable event_type=%r", doc.get("event_type"))
+            continue
+
+        event_columns.add(column_name)
+        aggregated[(local_date, shop_name)][column_name] += 1
+
+    return aggregated, event_columns
+
+
+def _write_b64_to_tempfile(b64_str: str, prefix: str) -> str:
+    data = base64.b64decode(b64_str.encode("utf-8"))
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=".pem")
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+    return path
+
+
+def resolve_master_ca_bundle_path() -> Optional[str]:
+    mode = os.environ.get("MASTER_DB_TLS_CA_MODE", "certifi").strip().lower()
+    if mode == "certifi":
+        return certifi.where()
+    if mode == "rds":
+        path = os.environ.get("MASTER_RDS_CA_PATH", "").strip()
+        if path and Path(path).exists():
+            return path
+        bundle_b64 = os.environ.get("MASTER_RDS_CA_BUNDLE_B64", "").strip()
+        if bundle_b64:
+            return _write_b64_to_tempfile(bundle_b64, prefix="master-rds-ca-")
+        return None
+    if mode == "custom":
+        path = os.environ.get("MASTER_CUSTOM_CA_PATH", "").strip()
+        if path and Path(path).exists():
+            return path
+        bundle_b64 = os.environ.get("MASTER_CUSTOM_CA_BUNDLE_B64", "").strip()
+        if bundle_b64:
+            return _write_b64_to_tempfile(bundle_b64, prefix="master-custom-ca-")
+        return None
+    if mode == "none":
+        return None
+    return certifi.where()
+
+
+def build_master_db_config() -> Dict[str, object]:
+    missing = [
+        name
+        for name, value in (
+            ("MASTER_DB_HOST", MASTER_DB_HOST),
+            ("MASTER_DB_USER", MASTER_DB_USER),
+            ("MASTER_DB_PASSWORD", MASTER_DB_PASSWORD),
+            ("MASTER_DB_NAME", MASTER_DB_NAME),
+        )
+        if not value
+    ]
+    if missing:
+        raise ValueError(f"Missing required master DB env vars: {', '.join(missing)}")
+
+    config: Dict[str, object] = {
+        "host": MASTER_DB_HOST,
+        "port": MASTER_DB_PORT,
+        "user": MASTER_DB_USER,
+        "password": MASTER_DB_PASSWORD,
+        "database": MASTER_DB_NAME,
+        "connection_timeout": int(os.environ.get("MASTER_DB_CONNECT_TIMEOUT_S", "10")),
+        "read_timeout": int(os.environ.get("MASTER_DB_READ_TIMEOUT_S", "120")),
+        "write_timeout": int(os.environ.get("MASTER_DB_WRITE_TIMEOUT_S", "120")),
+    }
+
+    ca_path = resolve_master_ca_bundle_path()
+    if MASTER_DB_HOST.lower() not in {"localhost", "127.0.0.1"} and ca_path:
+        config.update(
+            {
+                "ssl_ca": ca_path,
+                "ssl_verify_cert": os.environ.get(
+                    "MASTER_DB_SSL_VERIFY_CERT", "true"
+                ).strip().lower()
+                == "true",
+                "ssl_verify_identity": os.environ.get(
+                    "MASTER_DB_SSL_VERIFY_IDENTITY", "false"
+                ).strip().lower()
+                == "true",
+            }
+        )
+
+    return config
+
+
+@contextmanager
+def get_master_db_cursor(dictionary: bool = True):
+    connection = mysql.connector.connect(**build_master_db_config())
+    cursor = connection.cursor(dictionary=dictionary)
+    try:
+        yield cursor, connection
+    finally:
+        try:
+            cursor.close()
+        finally:
+            connection.close()
+
+
+def resolve_mongo_collection():
+    if not MONGO_URI:
+        raise ValueError("MONGO_URI is not configured")
+    client = MongoClient(MONGO_URI, tz_aware=True)
+    return client, client[MONGO_DB_NAME][MONGO_COLLECTION_NAME]
+
+
+def ensure_events_summary_table(cursor, connection) -> None:
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {quote_identifier(EVENTS_SUMMARY_TABLE)} (
+            `date` DATE NOT NULL,
+            `shop_name` VARCHAR(255) NOT NULL,
+            `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`date`, `shop_name`),
+            KEY `idx_shop_name` (`shop_name`),
+            KEY `idx_updated_at` (`updated_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """
+    )
+    connection.commit()
+
+
+def get_existing_columns(cursor) -> Set[str]:
+    cursor.execute(f"SHOW COLUMNS FROM {quote_identifier(EVENTS_SUMMARY_TABLE)}")
+    return {
+        str(row["Field"] if isinstance(row, dict) else row[0])
+        for row in cursor.fetchall() or []
+    }
+
+
+def get_event_count_columns(existing_columns: Iterable[str]) -> List[str]:
+    return sorted(
+        column
+        for column in existing_columns
+        if column.endswith(EVENT_COLUMN_SUFFIX)
+        and re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", column)
+    )
+
+
+def ensure_event_columns(cursor, connection, event_columns: Iterable[str]) -> None:
+    existing_columns = get_existing_columns(cursor)
+    missing_columns = sorted(set(event_columns) - existing_columns)
+    for column in missing_columns:
+        cursor.execute(
+            f"ALTER TABLE {quote_identifier(EVENTS_SUMMARY_TABLE)} "
+            f"ADD COLUMN {quote_identifier(column)} INT NOT NULL DEFAULT 0"
+        )
+    if missing_columns:
+        connection.commit()
+
+
+def delete_target_dates(cursor, connection, target_dates: Sequence[date]) -> None:
+    if not target_dates:
+        return
+    placeholders = ", ".join(["%s"] * len(target_dates))
+    cursor.execute(
+        f"DELETE FROM {quote_identifier(EVENTS_SUMMARY_TABLE)} "
+        f"WHERE `date` IN ({placeholders})",
+        tuple(target_dates),
+    )
+    connection.commit()
+
+
+def build_event_summary_rows(
+    aggregated: Dict[Tuple[date, str], Dict[str, int]],
+    all_event_columns: Sequence[str],
+) -> List[Tuple]:
+    rows: List[Tuple] = []
+    for (bucket_date, shop_name), counts in sorted(aggregated.items()):
+        values = [bucket_date, shop_name]
+        for column in all_event_columns:
+            values.append(int(counts.get(column, 0)))
+        rows.append(tuple(values))
+    return rows
+
+
+def insert_event_summary_rows(
+    cursor,
+    connection,
+    aggregated: Dict[Tuple[date, str], Dict[str, int]],
+    all_event_columns: Sequence[str],
+) -> int:
+    rows = build_event_summary_rows(aggregated, all_event_columns)
+    if not rows:
+        return 0
+
+    columns = ["date", "shop_name", *all_event_columns]
+    quoted_columns = ", ".join(quote_identifier(column) for column in columns)
+    placeholders = ", ".join(["%s"] * len(columns))
+    sql = (
+        f"INSERT INTO {quote_identifier(EVENTS_SUMMARY_TABLE)} "
+        f"({quoted_columns}) VALUES ({placeholders})"
+    )
+    cursor.executemany(sql, rows)
+    connection.commit()
+    return len(rows)
+
+
+def fetch_mongo_events_for_dates(target_dates: Sequence[date]) -> List[Dict]:
+    start_utc, end_utc = compute_utc_bounds_for_dates(target_dates)
+    client = None
+    try:
+        client, collection = resolve_mongo_collection()
+        cursor = collection.find(
+            {
+                "createdAt": {"$gte": start_utc, "$lt": end_utc},
+            },
+            {
+                "createdAt": 1,
+                "event_type": 1,
+                "shop_name": 1,
+            },
+        )
+        return list(cursor)
+    finally:
+        if client is not None:
+            client.close()
+
+
+def run_worker(current_dt: Optional[datetime] = None) -> None:
+    target_dates = compute_rebuild_dates(current_dt=current_dt)
+    target_date_set = set(target_dates)
+    logger.info(
+        "Starting events summary worker for IST dates: %s",
+        ", ".join(day.isoformat() for day in target_dates),
+    )
+
+    docs = fetch_mongo_events_for_dates(target_dates)
+    aggregated, new_event_columns = aggregate_event_documents(docs, target_date_set, tz=IST)
+    logger.info(
+        "Fetched %s Mongo doc(s), aggregated into %s shop-date row(s), discovered %s event column(s)",
+        len(docs),
+        len(aggregated),
+        len(new_event_columns),
+    )
+
+    with get_master_db_cursor(dictionary=True) as (cursor, connection):
+        ensure_events_summary_table(cursor, connection)
+        ensure_event_columns(cursor, connection, new_event_columns)
+        all_columns = get_event_count_columns(get_existing_columns(cursor))
+
+        # Delete and reinsert the full 2-day window so reruns reset absent counts to zero.
+        delete_target_dates(cursor, connection, target_dates)
+        inserted = insert_event_summary_rows(cursor, connection, aggregated, all_columns)
+
+    logger.info(
+        "Events summary worker complete: rebuilt %s date(s), inserted %s row(s)",
+        len(target_dates),
+        inserted,
+    )
+
+
+if __name__ == "__main__":
+    run_worker()
