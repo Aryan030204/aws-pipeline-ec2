@@ -112,6 +112,36 @@ def aggregate_event_documents(
     return aggregated, event_columns
 
 
+def summarize_aggregated_counts(
+    aggregated: Dict[Tuple[date, str], Dict[str, int]],
+) -> Dict[str, Dict[str, object]]:
+    summary: Dict[str, Dict[str, object]] = {}
+
+    for (bucket_date, shop_name), counts in sorted(aggregated.items()):
+        non_zero_counts = {
+            column: int(value)
+            for column, value in sorted(counts.items())
+            if int(value or 0) > 0
+        }
+        total_events = sum(non_zero_counts.values())
+        shop_summary = summary.setdefault(
+            shop_name,
+            {
+                "rows": 0,
+                "total_events": 0,
+                "dates": {},
+            },
+        )
+        shop_summary["rows"] += 1
+        shop_summary["total_events"] += total_events
+        shop_summary["dates"][bucket_date.isoformat()] = {
+            "total_events": total_events,
+            "event_counts": non_zero_counts,
+        }
+
+    return summary
+
+
 def _write_b64_to_tempfile(b64_str: str, prefix: str) -> str:
     data = base64.b64decode(b64_str.encode("utf-8"))
     fd, path = tempfile.mkstemp(prefix=prefix, suffix=".pem")
@@ -339,6 +369,21 @@ def run_worker(current_dt: Optional[datetime] = None) -> None:
         len(aggregated),
         len(new_event_columns),
     )
+    for shop_name, shop_summary in summarize_aggregated_counts(aggregated).items():
+        logger.info(
+            "[%s] Aggregated %s shop-date row(s), %s total event(s)",
+            shop_name,
+            shop_summary["rows"],
+            shop_summary["total_events"],
+        )
+        for bucket_date, date_summary in shop_summary["dates"].items():
+            logger.info(
+                "[%s] Date %s -> total_events=%s, counts=%s",
+                shop_name,
+                bucket_date,
+                date_summary["total_events"],
+                date_summary["event_counts"],
+            )
 
     with get_master_db_cursor(dictionary=True) as (cursor, connection):
         ensure_events_summary_table(cursor, connection)
@@ -348,6 +393,17 @@ def run_worker(current_dt: Optional[datetime] = None) -> None:
         # Delete and reinsert the full 2-day window so reruns reset absent counts to zero.
         delete_target_dates(cursor, connection, target_dates)
         inserted = insert_event_summary_rows(cursor, connection, aggregated, all_columns)
+        for (bucket_date, shop_name), counts in sorted(aggregated.items()):
+            non_zero_columns = sorted(
+                column for column, value in counts.items() if int(value or 0) > 0
+            )
+            logger.info(
+                "[%s] Upserted events_summary row for %s with %s non-zero event column(s): %s",
+                shop_name,
+                bucket_date.isoformat(),
+                len(non_zero_columns),
+                non_zero_columns,
+            )
 
     logger.info(
         "Events summary worker complete: rebuilt %s date(s), inserted %s row(s)",

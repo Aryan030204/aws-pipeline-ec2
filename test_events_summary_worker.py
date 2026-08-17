@@ -117,6 +117,26 @@ class EventsSummaryWorkerTests(unittest.TestCase):
             ],
         )
 
+    def test_summarize_aggregated_counts_groups_by_shop_and_date(self):
+        aggregated = {
+            (date(2026, 8, 16), "tmc"): {"login_count": 3, "buy_now_count": 0},
+            (date(2026, 8, 17), "tmc"): {"checkout_initiated_count": 2},
+            (date(2026, 8, 17), "shyle"): {"login_count": 1},
+        }
+
+        summary = worker.summarize_aggregated_counts(aggregated)
+
+        self.assertEqual(summary["tmc"]["rows"], 2)
+        self.assertEqual(summary["tmc"]["total_events"], 5)
+        self.assertEqual(
+            summary["tmc"]["dates"]["2026-08-16"],
+            {"total_events": 3, "event_counts": {"login_count": 3}},
+        )
+        self.assertEqual(
+            summary["shyle"]["dates"]["2026-08-17"],
+            {"total_events": 1, "event_counts": {"login_count": 1}},
+        )
+
     def test_workflow_exists_and_has_schedule(self):
         workflow_path = ".github/workflows/events-summary-worker.yml"
         with open(workflow_path, "r", encoding="utf-8") as handle:
