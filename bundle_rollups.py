@@ -3,27 +3,13 @@ import logging
 import os
 import re
 from collections import defaultdict
-from datetime import datetime, timedelta
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+import requests
 
 
 logger = logging.getLogger(__name__)
-
-BUNDLE_MAP = {
-    8417496367300: "3 Products at 499",
-      8374355493060: "Mini Perfume Box",
-      8384621805764: "3 fragrances at 549",
-       8376454316228: "Luxury Scent Box",
-       8384622067908: "4 products at 699",
-       8376464376004: "Fab Five Kit",
-       8376464048324: "Self Grooming Kit",
-       8417496137924: "3 Products at 349",
-       8458140745924: "2 Products at 399",
-       8382929600708: "Daily Deo Combo",
-       8395644993732: "Fab four Kit",
-       8613032362180: "6 Products at 799 [Rs.799]",
-       8607284330692: "6 Products at 799 [Rs.7,794]",
-}
 
 BUNDLE_TARGET_BRAND_TAG = os.environ.get("BUNDLE_TARGET_BRAND_TAG", "tmc").strip().lower()
 BUNDLE_TARGET_SHOP_NAME = os.environ.get(
@@ -31,6 +17,158 @@ BUNDLE_TARGET_SHOP_NAME = os.environ.get(
 ).strip().lower()
 EXECUTEMANY_CHUNK_SIZE = int(os.environ.get("EXECUTEMANY_CHUNK_SIZE", "1000"))
 ITEM_COLUMN_COUNT = 10
+SHOPIFYQL_PAGE_SIZE = int(os.environ.get("BUNDLE_DISCOVERY_PAGE_SIZE", "1000"))
+SHOPIFYQL_PRODUCT_TYPES = ("CYOB", "BUNDLE")
+
+
+def _make_shopifyql_session() -> requests.Session:
+    return requests.Session()
+
+
+def _format_shopifyql_table(table_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not table_data:
+        return []
+
+    columns = table_data.get("columns") or []
+    rows = table_data.get("rows") or []
+    if not columns or not rows:
+        return []
+
+    formatted: List[Dict[str, Any]] = []
+    column_names = [col.get("name") for col in columns]
+    for row in rows:
+        if isinstance(row, dict):
+            formatted.append(dict(row))
+            continue
+        if not isinstance(row, (list, tuple)):
+            continue
+        obj: Dict[str, Any] = {}
+        for idx, value in enumerate(row):
+            if idx >= len(column_names):
+                break
+            col_name = column_names[idx]
+            if col_name:
+                obj[col_name] = value
+        formatted.append(obj)
+    return formatted
+
+
+def _build_last_full_month_window(today: Optional[date] = None) -> Tuple[str, str]:
+    current = today or datetime.utcnow().date()
+    month_start = current.replace(day=1)
+    year = month_start.year
+    month = month_start.month - 3
+    while month <= 0:
+        month += 12
+        year -= 1
+    start_date = month_start.replace(year=year, month=month)
+    return start_date.isoformat(), month_start.isoformat()
+
+
+def _build_bundle_discovery_shopifyql(start_date: str, end_date: str, limit: int, offset: int) -> str:
+    product_types = ", ".join(f"'{value}'" for value in SHOPIFYQL_PRODUCT_TYPES)
+    return (
+        "FROM inventory "
+        "SHOW inventory_units_sold "
+        f"WHERE product_type IN ({product_types}) "
+        "GROUP BY product_type, product_title, product_id, product_variant_sku, "
+        "product_variant_id, product_variant_title WITH TOTALS "
+        f"SINCE {start_date} UNTIL {end_date} "
+        "ORDER BY inventory_units_sold DESC "
+        f"LIMIT {limit} OFFSET {offset} "
+        "VISUALIZE inventory_units_sold"
+    )
+
+
+def _parse_dynamic_bundle_products(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    discovered: List[Dict[str, Any]] = []
+    seen_product_ids: Set[int] = set()
+
+    for row in rows:
+        product_id = _coerce_int(row.get("product_id"))
+        product_title = str(row.get("product_title") or "").strip()
+        if product_id is None or not product_title or product_title.lower() == "summary":
+            continue
+        if product_id in seen_product_ids:
+            continue
+        seen_product_ids.add(product_id)
+        discovered.append(
+            {
+                "product_id": product_id,
+                "product_title": product_title,
+            }
+        )
+
+    return discovered
+
+
+def fetch_dynamic_bundle_products(
+    shop_name: str,
+    access_token: str,
+    api_version: str,
+    *,
+    today: Optional[date] = None,
+    page_size: int = SHOPIFYQL_PAGE_SIZE,
+) -> List[Dict[str, Any]]:
+    start_date, end_date = _build_last_full_month_window(today=today)
+    session = _make_shopifyql_session()
+    discovered_by_id: Dict[int, Dict[str, Any]] = {}
+    offset = 0
+    try:
+        while True:
+            shopify_ql = _build_bundle_discovery_shopifyql(
+                start_date=start_date,
+                end_date=end_date,
+                limit=page_size,
+                offset=offset,
+            )
+            ql_flat = shopify_ql.replace("\n", " ").strip().replace('"', '\\"')
+            graphql_query = (
+                'query DynamicBundleDiscoveryQuery { shopifyqlQuery(query: "'
+                + ql_flat
+                + '") { tableData { rows columns { name dataType displayName } } parseErrors } }'
+            )
+            payload = {"query": graphql_query}
+            url = f"https://{shop_name}.myshopify.com/admin/api/{api_version}/graphql.json"
+            headers = {
+                "Content-Type": "application/json",
+                "X-Shopify-Access-Token": access_token,
+            }
+
+            response = session.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+            response.raise_for_status()
+            body = response.json()
+            if body.get("errors"):
+                raise RuntimeError(f"Bundle discovery GraphQL errors: {body['errors']}")
+
+            ql_result = (body.get("data") or {}).get("shopifyqlQuery") or {}
+            parse_errors = ql_result.get("parseErrors") or []
+            if parse_errors:
+                raise RuntimeError(f"Bundle discovery ShopifyQL parse errors: {parse_errors}")
+
+            rows = _format_shopifyql_table(ql_result.get("tableData") or {})
+            parsed_page = _parse_dynamic_bundle_products(rows)
+            for product in parsed_page:
+                discovered_by_id.setdefault(product["product_id"], product)
+
+            logger.info(
+                "Bundle discovery fetched %s row(s), %s unique product(s) total, window=%s..%s, offset=%s",
+                len(rows),
+                len(discovered_by_id),
+                start_date,
+                end_date,
+                offset,
+            )
+            if len(rows) < page_size:
+                break
+            offset += page_size
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+    return list(discovered_by_id.values())
 
 
 def is_bundle_rollup_brand(
@@ -62,11 +200,36 @@ def _dates_in_clause(target_dates: Iterable[str]) -> Tuple[str, List[str]]:
     return ",".join(["%s"] * len(dates)), dates
 
 
-def _bundle_ids_in_scope(bundle_ids: Optional[Iterable[int]] = None) -> List[int]:
-    scoped = sorted(
-        {int(pid) for pid in (bundle_ids if bundle_ids is not None else BUNDLE_MAP.keys())}
-    )
-    return [pid for pid in scoped if pid in BUNDLE_MAP]
+def _products_by_id(
+    bundle_products: Optional[Iterable[Dict[str, Any]]],
+) -> Dict[int, Dict[str, Any]]:
+    if not bundle_products:
+        return {}
+    products: Dict[int, Dict[str, Any]] = {}
+    for product in bundle_products:
+        product_id = _coerce_int(product.get("product_id"))
+        product_title = str(product.get("product_title") or "").strip()
+        if product_id is None or not product_title:
+            continue
+        products.setdefault(
+            product_id,
+            {
+                "product_id": product_id,
+                "product_title": product_title,
+            },
+        )
+    return products
+
+
+def _bundle_ids_in_scope(
+    bundle_ids: Optional[Iterable[int]] = None,
+    bundle_products: Optional[Iterable[Dict[str, Any]]] = None,
+) -> List[int]:
+    dynamic_products = _products_by_id(bundle_products)
+    if bundle_ids is not None:
+        scoped = sorted({int(pid) for pid in bundle_ids})
+        return [pid for pid in scoped if pid in dynamic_products]
+    return list(dynamic_products.keys())
 
 
 def _chunked(items: Sequence[int], size: int) -> Iterable[Sequence[int]]:
@@ -138,16 +301,20 @@ def ensure_bundle_rollup_tables(cursor, connection) -> None:
 
 
 def sync_bundle_master(
-    cursor, connection, bundle_ids: Optional[Iterable[int]] = None
+    cursor,
+    connection,
+    bundle_products: Optional[Iterable[Dict[str, Any]]] = None,
+    bundle_ids: Optional[Iterable[int]] = None,
 ) -> None:
-    scoped_ids = _bundle_ids_in_scope(bundle_ids)
+    products_by_id = _products_by_id(bundle_products)
+    scoped_ids = _bundle_ids_in_scope(bundle_ids, bundle_products)
     logger.info(
         "Syncing bundle_master with %s configured bundle(s): %s",
         len(scoped_ids),
         scoped_ids,
     )
     rows = [
-        (bundle_id, BUNDLE_MAP[bundle_id], 1, index)
+        (bundle_id, products_by_id[bundle_id]["product_title"], 1, index)
         for index, bundle_id in enumerate(scoped_ids, start=1)
     ]
 
@@ -176,10 +343,13 @@ def sync_bundle_master(
 
 
 def fetch_bundle_parent_rows_for_dates(
-    cursor, target_dates: Iterable[str], bundle_ids: Optional[Iterable[int]] = None
+    cursor,
+    target_dates: Iterable[str],
+    bundle_products: Optional[Iterable[Dict[str, Any]]] = None,
+    bundle_ids: Optional[Iterable[int]] = None,
 ) -> List[Dict]:
     placeholders, params = _dates_in_clause(target_dates)
-    scoped_ids = _bundle_ids_in_scope(bundle_ids)
+    scoped_ids = _bundle_ids_in_scope(bundle_ids, bundle_products)
     if not params or not scoped_ids:
         logger.info(
             "Skipping bundle order fetch: target_dates=%s, scoped_bundle_ids=%s",
@@ -356,7 +526,7 @@ def _extract_children_from_sub_items(props_map: Dict[str, str]) -> List[Dict]:
 def extract_bundle_children(row: Dict) -> Tuple[List[Dict], str]:
     order_id = row.get("order_id")
     bundle_id = row.get("product_id")
-    bundle_name = row.get("line_item") or BUNDLE_MAP.get(bundle_id, str(bundle_id))
+    bundle_name = row.get("line_item") or str(bundle_id)
     props_map = _parse_line_item_properties(row)
 
     uniware_items, uniware_present = _extract_children_from_uniware_items(
@@ -387,10 +557,11 @@ def _delete_rollup_dates(
     connection,
     table_name: str,
     target_dates: Iterable[str],
+    bundle_products: Optional[Iterable[Dict[str, Any]]] = None,
     bundle_ids: Optional[Iterable[int]] = None,
 ) -> None:
     placeholders, params = _dates_in_clause(target_dates)
-    scoped_ids = _bundle_ids_in_scope(bundle_ids)
+    scoped_ids = _bundle_ids_in_scope(bundle_ids, bundle_products)
     if not params:
         logger.info("Skipping delete for %s: no target dates", table_name)
         return
@@ -447,9 +618,11 @@ def _build_rollup_rows(
     shop_name: str,
     access_token: str,
     api_version: str,
+    bundle_products: Optional[Iterable[Dict[str, Any]]] = None,
     bundle_ids: Optional[Iterable[int]] = None,
 ) -> Tuple[List[Tuple], List[Tuple]]:
-    scoped_ids = _bundle_ids_in_scope(bundle_ids)
+    products_by_id = _products_by_id(bundle_products)
+    scoped_ids = _bundle_ids_in_scope(bundle_ids, bundle_products)
     logger.info(
         "Starting bundle rollup row build: target_dates=%s scoped_bundle_ids=%s shop=%s",
         sorted({d for d in target_dates if d}),
@@ -460,7 +633,9 @@ def _build_rollup_rows(
         logger.info("No scoped bundle IDs available for row build")
         return [], []
 
-    source_rows = fetch_bundle_parent_rows_for_dates(cursor, target_dates, scoped_ids)
+    source_rows = fetch_bundle_parent_rows_for_dates(
+        cursor, target_dates, bundle_products=bundle_products, bundle_ids=scoped_ids
+    )
     if not source_rows:
         logger.info("No bundle parent rows found for requested dates; rollup rows will be empty")
         return [], []
@@ -527,7 +702,7 @@ def _build_rollup_rows(
             )
             continue
 
-        bundle_name = row.get("line_item") or BUNDLE_MAP[bundle_id]
+        bundle_name = row.get("line_item") or products_by_id[bundle_id]["product_title"]
         quantity = _coerce_int(row.get("line_item_quantity")) or 1
         bundle_unit_price = _coerce_float(row.get("line_item_price")) or 0.0
         bundle_sales = bundle_unit_price * quantity
@@ -611,7 +786,7 @@ def _build_rollup_rows(
         (
             date_str,
             bundle_id,
-            BUNDLE_MAP[bundle_id],
+            products_by_id[bundle_id]["product_title"],
             len(values["order_ids"]),
             int(values["bundle_units_sold"]),
             round(values["bundle_sales"], 2),
@@ -623,7 +798,7 @@ def _build_rollup_rows(
         (
             date_str,
             bundle_id,
-            BUNDLE_MAP[bundle_id],
+            products_by_id[bundle_id]["product_title"],
             child_title,
             values["child_product_sku"],
             int(values["allocated_orders"]),
@@ -648,6 +823,7 @@ def update_bundle_daily_rollup_incremental(
     shop_name: str,
     access_token: str,
     api_version: str,
+    bundle_products: Optional[Iterable[Dict[str, Any]]] = None,
     bundle_ids: Optional[Iterable[int]] = None,
     prebuilt_rows: Optional[List[Tuple]] = None,
 ) -> int:
@@ -663,10 +839,17 @@ def update_bundle_daily_rollup_incremental(
         dates,
     )
     rows = prebuilt_rows if prebuilt_rows is not None else _build_rollup_rows(
-        cursor, dates, shop_name, access_token, api_version, bundle_ids
+        cursor, dates, shop_name, access_token, api_version, bundle_products, bundle_ids
     )[0]
     logger.info("[%s] bundle_daily_rollup prepared %s row(s) for insert", brand_name, len(rows))
-    _delete_rollup_dates(cursor, connection, "bundle_daily_rollup", dates, bundle_ids)
+    _delete_rollup_dates(
+        cursor,
+        connection,
+        "bundle_daily_rollup",
+        dates,
+        bundle_products=bundle_products,
+        bundle_ids=bundle_ids,
+    )
 
     inserted = _executemany_chunked(
         cursor,
@@ -698,6 +881,7 @@ def update_bundle_product_daily_rollup_incremental(
     shop_name: str,
     access_token: str,
     api_version: str,
+    bundle_products: Optional[Iterable[Dict[str, Any]]] = None,
     bundle_ids: Optional[Iterable[int]] = None,
     prebuilt_rows: Optional[List[Tuple]] = None,
 ) -> int:
@@ -713,7 +897,7 @@ def update_bundle_product_daily_rollup_incremental(
         dates,
     )
     rows = prebuilt_rows if prebuilt_rows is not None else _build_rollup_rows(
-        cursor, dates, shop_name, access_token, api_version, bundle_ids
+        cursor, dates, shop_name, access_token, api_version, bundle_products, bundle_ids
     )[1]
     logger.info(
         "[%s] bundle_product_daily_rollup prepared %s row(s) for insert",
@@ -721,7 +905,12 @@ def update_bundle_product_daily_rollup_incremental(
         len(rows),
     )
     _delete_rollup_dates(
-        cursor, connection, "bundle_product_daily_rollup", dates, bundle_ids
+        cursor,
+        connection,
+        "bundle_product_daily_rollup",
+        dates,
+        bundle_products=bundle_products,
+        bundle_ids=bundle_ids,
     )
 
     inserted = _executemany_chunked(
@@ -754,6 +943,7 @@ def execute_bundle_rollups_incremental(
     shop_name: str,
     access_token: str,
     api_version: str,
+    bundle_products: Optional[Iterable[Dict[str, Any]]] = None,
     bundle_ids: Optional[Iterable[int]] = None,
 ) -> Tuple[int, int]:
     logger.info(
@@ -765,7 +955,17 @@ def execute_bundle_rollups_incremental(
         list(bundle_ids) if bundle_ids is not None else None,
     )
     ensure_bundle_rollup_tables(cursor, connection)
-    sync_bundle_master(cursor, connection, bundle_ids=bundle_ids)
+    discovered_products = (
+        list(bundle_products)
+        if bundle_products is not None
+        else fetch_dynamic_bundle_products(shop_name, access_token, api_version)
+    )
+    sync_bundle_master(
+        cursor,
+        connection,
+        bundle_products=discovered_products,
+        bundle_ids=bundle_ids,
+    )
 
     dates = sorted({d for d in target_dates if d})
     if not dates:
@@ -773,7 +973,13 @@ def execute_bundle_rollups_incremental(
         return 0, 0
 
     daily_rows, product_rows = _build_rollup_rows(
-        cursor, dates, shop_name, access_token, api_version, bundle_ids
+        cursor,
+        dates,
+        shop_name,
+        access_token,
+        api_version,
+        bundle_products=discovered_products,
+        bundle_ids=bundle_ids,
     )
     daily_count = update_bundle_daily_rollup_incremental(
         cursor,
@@ -783,6 +989,7 @@ def execute_bundle_rollups_incremental(
         shop_name,
         access_token,
         api_version,
+        bundle_products=discovered_products,
         bundle_ids=bundle_ids,
         prebuilt_rows=daily_rows,
     )
@@ -794,6 +1001,7 @@ def execute_bundle_rollups_incremental(
         shop_name,
         access_token,
         api_version,
+        bundle_products=discovered_products,
         bundle_ids=bundle_ids,
         prebuilt_rows=product_rows,
     )
