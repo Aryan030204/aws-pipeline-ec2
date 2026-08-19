@@ -57,16 +57,22 @@ class EventsSummaryWorkerTests(unittest.TestCase):
                 "createdAt": datetime(2026, 8, 16, 20, 0, tzinfo=timezone.utc),
                 "event_type": "login",
                 "shop_name": "tmc",
+                "session_id": "s1",
+                "cart_token": "c1",
             },
             {
                 "createdAt": datetime(2026, 8, 16, 21, 0, tzinfo=timezone.utc),
                 "event_type": "checkout initiated",
                 "shop_name": "tmc",
+                "session_id": "s2",
+                "cart_token": "c2",
             },
             {
                 "createdAt": datetime(2026, 8, 17, 18, 40, tzinfo=timezone.utc),
                 "event_type": "checkout initiated",
                 "shop_name": "shyle",
+                "session_id": "s3",
+                "cart_token": "c3",
             },
         ]
 
@@ -82,6 +88,49 @@ class EventsSummaryWorkerTests(unittest.TestCase):
             {"login_count": 1, "checkout_initiated_count": 1},
         )
         self.assertNotIn((date(2026, 8, 17), "shyle"), aggregated)
+
+    def test_aggregate_event_documents_drops_repeated_pairs(self):
+        docs = [
+            {
+                "createdAt": datetime(2026, 8, 17, 10, 0, tzinfo=timezone.utc),
+                "event_type": "checkout initiated",
+                "shop_name": "tmc",
+                "session_id": "s1",
+                "cart_token": "c1",
+            },
+            {
+                "createdAt": datetime(2026, 8, 17, 11, 0, tzinfo=timezone.utc),
+                "event_type": "checkout initiated",
+                "shop_name": "tmc",
+                "session_id": "s1",
+                "cart_token": "c1",
+            },
+            {
+                "createdAt": datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc),
+                "event_type": "checkout initiated",
+                "shop_name": "tmc",
+                "session_id": "s2",
+                "cart_token": "c2",
+            },
+            {
+                "createdAt": datetime(2026, 8, 17, 13, 0, tzinfo=timezone.utc),
+                "event_type": "login",
+                "shop_name": "tmc",
+                "session_id": "s3",
+            },
+        ]
+
+        aggregated, columns = worker.aggregate_event_documents(
+            docs,
+            {date(2026, 8, 17)},
+            tz=worker.IST,
+        )
+
+        self.assertEqual(columns, {"checkout_initiated_count"})
+        self.assertEqual(
+            dict(aggregated[(date(2026, 8, 17), "tmc")]),
+            {"checkout_initiated_count": 1},
+        )
 
     def test_ensure_event_columns_adds_missing_columns(self):
         cursor = DummyCursor(fetch_rows=[{"Field": "date"}, {"Field": "shop_name"}])

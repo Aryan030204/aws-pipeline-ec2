@@ -75,6 +75,16 @@ def quote_identifier(identifier: str) -> str:
     return f"`{identifier}`"
 
 
+def _extract_session_id(doc: Dict) -> Optional[str]:
+    session_id = str(doc.get("session_id") or "").strip()
+    return session_id or None
+
+
+def _extract_cart_token(doc: Dict) -> Optional[str]:
+    cart_token = str(doc.get("cart_token") or "").strip()
+    return cart_token or None
+
+
 def aggregate_event_documents(
     docs: Iterable[Dict],
     target_dates: Set[date],
@@ -85,6 +95,7 @@ def aggregate_event_documents(
     )
     event_columns: Set[str] = set()
 
+    pair_docs: Dict[Tuple[date, str, str, str, str], List[Dict]] = defaultdict(list)
     for doc in docs:
         created_at = doc.get("createdAt")
         if not isinstance(created_at, datetime):
@@ -106,6 +117,17 @@ def aggregate_event_documents(
             logger.warning("Skipping event with unusable event_type=%r", doc.get("event_type"))
             continue
 
+        session_id = _extract_session_id(doc)
+        cart_token = _extract_cart_token(doc)
+        if not session_id or not cart_token:
+            continue
+
+        pair_key = (local_date, shop_name, column_name, session_id, cart_token)
+        pair_docs[pair_key].append(doc)
+
+    for (local_date, shop_name, column_name, _session_id, _cart_token), matched_docs in pair_docs.items():
+        if len(matched_docs) != 1:
+            continue
         event_columns.add(column_name)
         aggregated[(local_date, shop_name)][column_name] += 1
 
@@ -345,6 +367,8 @@ def fetch_mongo_events_for_dates(target_dates: Sequence[date]) -> List[Dict]:
                 "createdAt": 1,
                 "event_type": 1,
                 "shop_name": 1,
+                "session_id": 1,
+                "cart_token": 1,
             },
         )
         return list(cursor)
