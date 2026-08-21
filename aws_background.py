@@ -65,7 +65,6 @@ from typing import Dict, Iterable, List, Optional, Tuple, Any, Set
 from functools import lru_cache
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import multiprocessing
 import base64
 import uuid
 import queue
@@ -97,9 +96,6 @@ from sqlalchemy.pool import NullPool
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request, jsonify
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-import smtplib
 from pathlib import Path
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
@@ -208,8 +204,6 @@ def parse_store_timezone(tz_str: Optional[str]) -> ZoneInfo:
 
 def get_brand_timezone(brand_index: int) -> ZoneInfo:
     return brand_timezones.get(brand_index, ZoneInfo("Asia/Kolkata"))
-
-CPU_COUNT = multiprocessing.cpu_count()
 
 # --- TEST_MODE ---
 TEST_MODE = os.environ.get("TEST_MODE", "false").strip().lower() == "true"
@@ -762,10 +756,6 @@ def now_ist() -> datetime:
     return datetime.now(IST)
 
 
-def ts() -> str:
-    return now_ist().strftime("%Y-%m-%d %H:%M:%S %Z")
-
-
 def extract_bundle_item_columns_from_props(props) -> Dict[str, Optional[str]]:
     item_columns = {}
     for n in range(1, 11):
@@ -888,36 +878,6 @@ def executemany_chunked(
     if not commit_between_chunks:
         connection.commit()
     return total
-
-
-def enable_session_profiling(cursor) -> bool:
-    try:
-        cursor.execute("SET SESSION profiling = 1")
-        return True
-    except mysql.connector.Error:
-        return False
-
-
-def print_session_profiles(cursor, top_n=5):
-    try:
-        cursor.execute("SHOW PROFILES")
-        rows = cursor.fetchall()
-        if not rows:
-            return
-        logger.info("── SHOW PROFILES (last few) ──")
-        for qid, time_taken, qtext in rows[-top_n:]:
-            logger.info(f"  #{qid} {time_taken:.4f}s  {qtext[:160]}")
-    except mysql.connector.Error:
-        pass
-
-
-def exec_timed(cursor, sql, params=None, label=None, show_profile=False):
-    if label is None:
-        label = sql.splitlines()[0][:90]
-    with timed(label):
-        cursor.execute(sql) if params is None else cursor.execute(sql, params)
-    if show_profile:
-        print_session_profiles(cursor)
 
 
 # ---------------------------
@@ -1840,20 +1800,6 @@ def convert_to_desired_format(dt_obj: datetime, tz: ZoneInfo) -> str:
     return iso_str[:19] + iso_str[19:].replace("+", "%2B")
 
 
-def convert_to_desired_format_session(dt_obj: datetime, tz: ZoneInfo) -> str:
-    return convert_to_desired_format(dt_obj, tz)
-
-
-def extract_date_time(
-    datetime_str: Optional[str],
-) -> Tuple[Optional[str], Optional[str]]:
-    if not datetime_str:
-        return None, None
-    date, time_part = datetime_str.split("T")
-    time_s = time_part.split("+")[0]
-    return date, time_s
-
-
 def format_datetime(datetime_str: Optional[str]) -> Optional[str]:
     if not datetime_str:
         return None
@@ -1872,11 +1818,6 @@ def _parse_iso_to_store_date_time(
         return dt.date().isoformat(), dt.strftime("%H:%M:%S")
     except Exception:
         return None, None
-
-
-@lru_cache(maxsize=10000)
-def cached_format_datetime(datetime_str):
-    return format_datetime(datetime_str)
 
 
 def transform_orders_to_df_optimized(
@@ -3263,32 +3204,6 @@ def get_affected_dates_updates(
 # ---------------------------
 # DB reads/writes (accept cursor)
 # ---------------------------
-def get_orders_with_same_timestamp(
-    brand_index: int,
-    table_name: str,
-    timestamp_value,
-    timestamp_field="created_at",
-    cursor=None,
-) -> set:
-    try:
-        if cursor is None:
-            with get_db_cursor(brand_index) as (c, _):
-                c.execute(
-                    f"SELECT order_id FROM {table_name} WHERE {timestamp_field} = %s",
-                    (timestamp_value,),
-                )
-                return {row["order_id"] for row in c.fetchall()}
-        else:
-            cursor.execute(
-                f"SELECT order_id FROM {table_name} WHERE {timestamp_field} = %s",
-                (timestamp_value,),
-            )
-            return {row["order_id"] for row in cursor.fetchall()}
-    except mysql.connector.Error as err:
-        logger.error(f"Error checking existing orders in {table_name}: {err}")
-        return set()
-
-
 def _get_last_order_with_cursor(cursor, table_name: str) -> Optional[Dict]:
     order_by_col = "updated_at" if "update" in table_name else "created_at"
     cursor.execute(f"""
@@ -3310,14 +3225,6 @@ def get_last_order(brand_index: int, table_name: str, cursor=None) -> Optional[D
     except mysql.connector.Error as err:
         logger.error(f"Error getting last order from {table_name}: {err}")
         return None
-
-
-def _db_timestamp_to_aware_utc(dt_obj: Optional[datetime]) -> Optional[datetime]:
-    if dt_obj is None:
-        return None
-    if dt_obj.tzinfo is None:
-        return dt_obj.replace(tzinfo=timezone.utc)
-    return dt_obj.astimezone(timezone.utc)
 
 
 def ensure_user_agent_column(brand_index: int, table_name: str):
@@ -3624,280 +3531,6 @@ def _ist_date_range_to_utc_bounds(
         start_tz.astimezone(timezone.utc),
         end_tz_exclusive.astimezone(timezone.utc),
     )
-
-
-def fetch_checkout_initiated_hourly_counts_from_mongo(
-    start_date: date,
-    end_date: date,
-    mongo_shop_name: str,
-    tz: ZoneInfo = IST,
-) -> List[Dict[str, Any]]:
-    start_utc, end_utc = _ist_date_range_to_utc_bounds(start_date, end_date, tz)
-    client = None
-    try:
-        client, collection = _resolve_mongo_sessions_collection()
-        cursor = collection.find(
-            {
-                "event_type": "checkout_initiated",
-                "shop_name": mongo_shop_name,
-                "createdAt": {"$gte": start_utc, "$lt": end_utc},
-            },
-            {"createdAt": 1},
-        )
-
-        counts: Dict[Tuple[date, int], int] = {}
-        for doc in cursor:
-            created_at = doc.get("createdAt")
-            if not isinstance(created_at, datetime):
-                continue
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=timezone.utc)
-
-            created_at_store = created_at.astimezone(tz)
-            bucket_key = (created_at_store.date(), created_at_store.hour)
-            counts[bucket_key] = counts.get(bucket_key, 0) + 1
-
-        return [
-            {"date": bucket_date, "hour": bucket_hour, "ci_events": count}
-            for (bucket_date, bucket_hour), count in sorted(counts.items())
-        ]
-    finally:
-        if client is not None:
-            client.close()
-
-
-def _do_upsert_checkout_initiated_ci_events(
-    results: List[Dict[str, Any]],
-    cursor,
-    connection,
-    brand_name: str,
-    start_date: date,
-    end_date: date,
-):
-    cursor.execute(
-        """
-        UPDATE hourly_sessions_summary_shopify
-        SET ci_events = 0
-        WHERE date BETWEEN %s AND %s
-        """,
-        (start_date, end_date),
-    )
-
-    for row in results:
-        cursor.execute(
-            """
-            INSERT INTO hourly_sessions_summary_shopify (date, hour, ci_events)
-            VALUES (%s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                ci_events = VALUES(ci_events)
-            """,
-            (row["date"], row["hour"], row["ci_events"]),
-        )
-
-    connection.commit()
-    logger.info(
-        f"✅ Checkout-initiated ci_events updated for {brand_name} "
-        f"({len(results)} hour buckets, {start_date}..{end_date})"
-    )
-
-
-def sync_checkout_initiated_ci_events(
-    brand_index: int,
-    brand_name: str,
-    start_date: date,
-    end_date: date,
-    brand_key: Optional[str] = None,
-    cursor=None,
-    connection=None,
-):
-    if not is_ci_events_brand(brand_name, brand_key):
-        logger.info(
-            f"Skipping checkout-initiated Mongo sync for {brand_name}: brand not enabled for ci_events"
-        )
-        return
-
-    mongo_shop_name = get_ci_events_mongo_shop_name(brand_name, brand_key)
-    if not mongo_shop_name:
-        logger.info(
-            f"Skipping checkout-initiated Mongo sync for {brand_name}: no Mongo shop_name mapping"
-        )
-        return
-
-    tz = get_brand_timezone(brand_index)
-    try:
-        results = fetch_checkout_initiated_hourly_counts_from_mongo(
-            start_date=start_date,
-            end_date=end_date,
-            mongo_shop_name=mongo_shop_name,
-            tz=tz,
-        )
-    except Exception as e:
-        logger.error(
-            f"❌ Error fetching checkout-initiated Mongo events for {brand_name}: {e}"
-        )
-        return
-
-    if cursor is not None:
-        _do_upsert_checkout_initiated_ci_events(
-            results, cursor, connection, brand_name, start_date, end_date
-        )
-        return
-
-    try:
-        with get_db_cursor(brand_index) as (c, conn):
-            _do_upsert_checkout_initiated_ci_events(
-                results, c, conn, brand_name, start_date, end_date
-            )
-    except Exception as e:
-        logger.error(f"❌ Error updating checkout-initiated ci_events for {brand_name}: {e}")
-
-
-def fetch_checkout_initiated_variant_counts_from_mongo(
-    start_date: date,
-    end_date: date,
-    mongo_shop_name: str,
-    tz: ZoneInfo = IST,
-) -> List[Dict[str, Any]]:
-    start_utc, end_utc = _ist_date_range_to_utc_bounds(start_date, end_date, tz)
-    client = None
-    try:
-        client, collection = _resolve_mongo_sessions_collection()
-        cursor = collection.find(
-            {
-                "event_type": "checkout_initiated",
-                "shop_name": mongo_shop_name,
-                "createdAt": {"$gte": start_utc, "$lt": end_utc},
-            },
-            {"createdAt": 1, "variantId": 1},
-        )
-
-        counts: Dict[Tuple[date, str], int] = {}
-        for doc in cursor:
-            created_at = doc.get("createdAt")
-            if not isinstance(created_at, datetime):
-                continue
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=timezone.utc)
-
-            created_at_store = created_at.astimezone(tz)
-            event_date = created_at_store.date()
-            
-            variant_val = doc.get("variantId")
-            if variant_val is None:
-                continue
-            
-            variant_ids = []
-            if isinstance(variant_val, list):
-                variant_ids = [str(v).strip() for v in variant_val if v is not None]
-            elif isinstance(variant_val, (int, float)):
-                variant_ids = [str(int(variant_val)).strip()]
-            else:
-                val_str = str(variant_val).strip()
-                if val_str:
-                    variant_ids = [v.strip() for v in val_str.split(",") if v.strip()]
-            
-            unique_variant_ids = sorted(list(set(variant_ids)))
-            for vid in unique_variant_ids:
-                if vid:
-                    key = (event_date, vid)
-                    counts[key] = counts.get(key, 0) + 1
-
-        return [
-            {
-                "date": bucket_date,
-                "variant_id": vid,
-                "checkout_initiated_count": count,
-            }
-            for (bucket_date, vid), count in sorted(counts.items())
-        ]
-    finally:
-        if client is not None:
-            client.close()
-
-
-def _do_upsert_checkout_initiated_variant_events(
-    results: List[Dict[str, Any]],
-    cursor,
-    connection,
-    brand_name: str,
-    start_date: date,
-    end_date: date,
-):
-    cursor.execute(
-        """
-        DELETE FROM daily_ci_events_summary
-        WHERE date BETWEEN %s AND %s
-        """,
-        (start_date, end_date),
-    )
-
-    for row in results:
-        cursor.execute(
-            """
-            INSERT INTO daily_ci_events_summary (date, variant_id, checkout_initiated_count)
-            VALUES (%s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                checkout_initiated_count = VALUES(checkout_initiated_count)
-            """,
-            (row["date"], row["variant_id"], row["checkout_initiated_count"]),
-        )
-
-    connection.commit()
-    logger.info(
-        f"✅ Checkout-initiated variant events updated for {brand_name} "
-        f"({len(results)} variant-date rows, {start_date}..{end_date})"
-    )
-
-
-def sync_checkout_initiated_variant_events(
-    brand_index: int,
-    brand_name: str,
-    start_date: date,
-    end_date: date,
-    brand_key: Optional[str] = None,
-    cursor=None,
-    connection=None,
-):
-    if not is_ci_events_brand(brand_name, brand_key):
-        logger.info(
-            f"Skipping checkout-initiated variant Mongo sync for {brand_name}: brand not enabled for ci_events"
-        )
-        return
-
-    mongo_shop_name = get_ci_events_mongo_shop_name(brand_name, brand_key)
-    if not mongo_shop_name:
-        logger.info(
-            f"Skipping checkout-initiated variant Mongo sync for {brand_name}: no Mongo shop_name mapping"
-        )
-        return
-
-    tz = get_brand_timezone(brand_index)
-    try:
-        results = fetch_checkout_initiated_variant_counts_from_mongo(
-            start_date=start_date,
-            end_date=end_date,
-            mongo_shop_name=mongo_shop_name,
-            tz=tz,
-        )
-    except Exception as e:
-        logger.error(
-            f"❌ Error fetching checkout-initiated variant Mongo events for {brand_name}: {e}"
-        )
-        return
-
-    if cursor is not None:
-        _do_upsert_checkout_initiated_variant_events(
-            results, cursor, connection, brand_name, start_date, end_date
-        )
-        return
-
-    try:
-        with get_db_cursor(brand_index) as (c, conn):
-            _do_upsert_checkout_initiated_variant_events(
-                results, c, conn, brand_name, start_date, end_date
-            )
-    except Exception as e:
-        logger.error(f"❌ Error updating checkout-initiated variant events for {brand_name}: {e}")
 
 
 def _extract_session_id(doc: Dict[str, Any]) -> Optional[str]:
@@ -7524,31 +7157,6 @@ def execute_discount_dashboard_backfill_only(brand_index: int, brand_name: str):
 # ---------------------------
 # Email (unchanged behavior)
 # ---------------------------
-def send_email(
-    subject: str,
-    body: str,
-    recipients: List[str],
-    sender_email: str,
-    sender_password: str,
-):
-    if not sender_email or not sender_password or not recipients:
-        return
-    msg = MIMEMultipart()
-    msg["From"] = sender_email
-    msg["To"] = ", ".join(recipients)
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-    try:
-        server = smtplib.SMTP("smtp.gmail.com", 587)
-        server.starttls()
-        server.login(sender_email, sender_password)
-        server.sendmail(sender_email, recipients, msg.as_string())
-        server.quit()
-        logger.info("✅ Email sent")
-    except Exception as e:
-        logger.error(f"❌ Email send failed: {e}")
-
-
 # ---------------------------
 # ShopifyQL helpers for sessions (NEW)
 # ---------------------------
