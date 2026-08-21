@@ -436,5 +436,39 @@ def run_worker(current_dt: Optional[datetime] = None) -> None:
     )
 
 
+def _run_scheduled() -> None:
+    """
+    Long-running mode for the standalone container: schedules run_worker on
+    the same cadence the GitHub Actions cron used to (30 18 * * * UTC, i.e.
+    00:00 IST), then blocks. Set EVENTS_WORKER_SELF_RUN=false to instead run
+    once and exit (e.g. for a one-off/manual invocation).
+    """
+    from apscheduler.schedulers.blocking import BlockingScheduler
+
+    scheduler = BlockingScheduler(timezone="UTC")
+    scheduler.add_job(
+        run_worker,
+        trigger="cron",
+        hour=18,
+        minute=30,
+        timezone="UTC",
+        id="events_summary_worker_job",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+    logger.info(
+        "Events summary worker scheduler started (cron 30 18 * * * UTC / 00:00 IST)"
+    )
+    try:
+        scheduler.start()
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Events summary worker scheduler stopped")
+
+
 if __name__ == "__main__":
-    run_worker()
+    self_run = os.environ.get("EVENTS_WORKER_SELF_RUN", "true").strip().lower() == "true"
+    if self_run:
+        _run_scheduled()
+    else:
+        run_worker()
