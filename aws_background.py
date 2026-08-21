@@ -109,41 +109,27 @@ except ImportError:
 
 from bundle_rollups import execute_bundle_rollups_incremental, is_bundle_rollup_brand
 
-# ---- Logging ----
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+from pipeline.state import (
+    IST,
+    logger,
+    _LastLogsHandler,
+    _last_logs_handler,
+    brand_timezones,
+    brand_tag_to_index_map,
+    brand_id_from_config,
+    brand_db_configs,
+    sqlalchemy_engines,
+    active_brand_indices,
+    brand_rto_tags_by_index,
+    scheduler,
+    app,
+    MANUAL_TRIGGER_QUEUE,
+    _db_metrics_lock,
+    _db_shutdown_lock,
+    _db_context,
+    _db_connection_metrics,
+    http_session,
 )
-logger = logging.getLogger(__name__)
-
-
-class _LastLogsHandler(logging.Handler):
-    def __init__(self, maxlen: int = 2) -> None:
-        super().__init__()
-        self._buffer = deque(maxlen=maxlen)
-
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            msg = self.format(record)
-            self._buffer.append(msg)
-        except Exception:
-            # Avoid breaking logging on handler errors.
-            pass
-
-    def get_recent(self) -> List[str]:
-        return list(self._buffer)
-
-
-_last_logs_handler = _LastLogsHandler(maxlen=2)
-_last_logs_handler.setLevel(logging.INFO)
-_last_logs_handler.setFormatter(
-    logging.Formatter(
-        fmt="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-)
-logging.getLogger().addHandler(_last_logs_handler)
 
 
 def _derive_error_code(exc: Optional[BaseException]) -> str:
@@ -178,9 +164,6 @@ def _derive_error_code(exc: Optional[BaseException]) -> str:
     return exc.__class__.__name__.upper()
 
 # ---- Globals ----
-IST = ZoneInfo("Asia/Kolkata")
-brand_timezones: Dict[int, ZoneInfo] = {}
-
 def parse_store_timezone(tz_str: Optional[str]) -> ZoneInfo:
     """
     Parses timezone strings of the form "(GMT+05:30) Asia/Kolkata" or "Asia/Kolkata".
@@ -216,23 +199,12 @@ if TEST_MODE:
 MONGO_URI = os.environ.get("MONGO_URI", "").strip()
 SPEED_MONGO_URI = os.environ.get("SPEED_MONGO_URI", "").strip()
 
-brand_tag_to_index_map: Dict[str, int] = {}
-brand_id_from_config: Dict[
-    int, int
-] = {}  # brand_index -> brand_id from pipelinecreds MongoDB
-brand_db_configs: Dict[int, Dict[str, Any]] = {}
-sqlalchemy_engines: Dict[int, Any] = {}
-active_brand_indices: List[int] = []  # only brands with valid configs/engines
-scheduler = BackgroundScheduler(timezone=IST)
-app = Flask(__name__)
 PIPELINE_AUTH_HEADER = os.environ.get("PIPELINE_AUTH_HEADER", "pipeline@nosecret123")
 SELF_RUN = os.environ.get("SELF_RUN", "true").strip().lower() == "true"
 MANAGER_STARTED_ENDPOINT = os.environ.get("MANAGER_STARTED_ENDPOINT")
 MANAGER_COMPLETED_ENDPOINT = os.environ.get("MANAGER_COMPLETED_ENDPOINT")
 MANAGER_FAILED_ENDPOINT = os.environ.get("MANAGER_FAILED_ENDPOINT")
 PIPELINE_ID = os.environ.get("PIPELINE_ID", "shopify-pipeline-etl")
-
-MANUAL_TRIGGER_QUEUE = queue.Queue()
 
 
 class RDSProxyValidationError(RuntimeError):
@@ -253,19 +225,7 @@ except ValueError:
     )
     RTO_ASSUMPTION_PERIOD = 7
 
-_db_metrics_lock = threading.Lock()
-_db_shutdown_lock = threading.Lock()
 _db_shutdown_done = False
-_db_context = threading.local()
-brand_rto_tags_by_index: Dict[int, str] = {}
-_db_connection_metrics: Dict[str, int] = {
-    "active_connector_connections": 0,
-    "peak_connector_connections": 0,
-    "connections_opened_total": 0,
-    "connection_failures_total": 0,
-    "active_sqlalchemy_connections": 0,
-    "peak_sqlalchemy_connections": 0,
-}
 
 
 def _metric_inc(name: str, amount: int = 1) -> None:
@@ -308,18 +268,6 @@ def log_db_connection_metrics(prefix: str = "DB_CONNECTION_METRICS") -> None:
         metrics["active_sqlalchemy_connections"],
         metrics["peak_sqlalchemy_connections"],
     )
-
-# HTTP Session (requests) with pooling/retries (used for sessions API)
-http_session = requests.Session()
-retry_strategy = Retry(
-    total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504]
-)
-adapter = HTTPAdapter(
-    pool_connections=20, pool_maxsize=50, max_retries=retry_strategy, pool_block=False
-)
-http_session.mount("https://", adapter)
-http_session.mount("http://", adapter)
-
 
 def close_all_database_resources() -> None:
     global _db_shutdown_done
