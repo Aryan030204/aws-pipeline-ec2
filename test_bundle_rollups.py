@@ -237,6 +237,61 @@ class BundleRollupTests(unittest.TestCase):
             ],
         )
 
+    def test_is_bundle_rollup_brand_matches_tmc_and_pts(self):
+        self.assertTrue(
+            bundle_rollups.is_bundle_rollup_brand("The Man Company", "tmc", "the-man-company")
+        )
+        self.assertTrue(
+            bundle_rollups.is_bundle_rollup_brand("PTS", "pts", "skincarepersonaltouch")
+        )
+        self.assertTrue(
+            bundle_rollups.is_bundle_rollup_brand(None, None, "skincarepersonaltouch")
+        )
+        self.assertFalse(
+            bundle_rollups.is_bundle_rollup_brand("Some Other Brand", "other", "some-other-shop")
+        )
+
+    def test_extract_bundle_children_uses_bundle_product_properties(self):
+        row = {
+            "order_id": "6001",
+            "product_id": "201",
+            "line_item": "Buy any 3 at 999",
+            "line_item_properties_json": json.dumps(
+                [
+                    {"name": "_bundle_product1", "value": "Face Wash/SKU-FW-100"},
+                    {"name": "_bundle_product2", "value": "Face Wash/SKU-FW-100"},
+                    {"name": "_bundle_product3", "value": "Sunscreen/SKU-SS-200"},
+                ]
+            ),
+        }
+
+        items, source = bundle_rollups.extract_bundle_children(row)
+
+        self.assertEqual(source, "bundle_product_property")
+        self.assertEqual(
+            items,
+            [
+                {
+                    "title": "Face Wash",
+                    "sku": "SKU-FW-100",
+                    "quantity": 1,
+                    "source": "bundle_product_property",
+                },
+                {
+                    "title": "Face Wash",
+                    "sku": "SKU-FW-100",
+                    "quantity": 1,
+                    "source": "bundle_product_property",
+                },
+                {
+                    "title": "Sunscreen",
+                    "sku": "SKU-SS-200",
+                    "quantity": 1,
+                    "source": "bundle_product_property",
+                },
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
