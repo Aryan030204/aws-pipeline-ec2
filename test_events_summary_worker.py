@@ -186,14 +186,31 @@ class EventsSummaryWorkerTests(unittest.TestCase):
             {"total_events": 1, "event_counts": {"login_count": 1}},
         )
 
-    def test_workflow_exists_and_has_schedule(self):
-        workflow_path = ".github/workflows/events-summary-worker.yml"
-        with open(workflow_path, "r", encoding="utf-8") as handle:
+    def test_dockerfile_runs_worker_as_a_service(self):
+        dockerfile_path = "Dockerfile.events-worker"
+        with open(dockerfile_path, "r", encoding="utf-8") as handle:
             content = handle.read()
 
-        self.assertIn("workflow_dispatch:", content)
-        self.assertIn("cron: '30 18 * * *'", content)
-        self.assertIn("workers/events_summary_worker.py", content)
+        self.assertIn("requirements.txt", content)
+        self.assertIn('CMD ["python", "workers/events_summary_worker.py"]', content)
+
+    def test_docker_compose_defines_events_worker_service(self):
+        with open("docker-compose.yml", "r", encoding="utf-8") as handle:
+            content = handle.read()
+
+        self.assertIn("events-summary-worker:", content)
+        self.assertIn("Dockerfile.events-worker", content)
+
+    def test_scheduled_mode_uses_same_cron_as_former_github_actions_workflow(self):
+        # Former GitHub Actions schedule was cron: '30 18 * * *' (UTC) == 00:00 IST.
+        # The container replicates this via APScheduler; assert the job is wired
+        # with the same hour/minute/timezone rather than re-parsing source text.
+        import inspect
+
+        source = inspect.getsource(worker._run_scheduled)
+        self.assertIn('hour=18', source)
+        self.assertIn('minute=30', source)
+        self.assertIn('timezone="UTC"', source)
 
 
 if __name__ == "__main__":

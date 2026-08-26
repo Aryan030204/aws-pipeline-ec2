@@ -11,10 +11,15 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-BUNDLE_TARGET_BRAND_TAG = os.environ.get("BUNDLE_TARGET_BRAND_TAG", "tmc").strip().lower()
-BUNDLE_TARGET_SHOP_NAME = os.environ.get(
-    "BUNDLE_TARGET_SHOP_NAME", "the-man-company"
-).strip().lower()
+def _parse_csv_set(env_name: str, default: str) -> Set[str]:
+    raw = os.environ.get(env_name, default)
+    return {v.strip().lower() for v in raw.split(",") if v.strip()}
+
+
+BUNDLE_TARGET_BRAND_TAGS = _parse_csv_set("BUNDLE_TARGET_BRAND_TAG", "tmc,pts")
+BUNDLE_TARGET_SHOP_NAMES = _parse_csv_set(
+    "BUNDLE_TARGET_SHOP_NAME", "the-man-company,skincarepersonaltouch"
+)
 EXECUTEMANY_CHUNK_SIZE = int(os.environ.get("EXECUTEMANY_CHUNK_SIZE", "1000"))
 ITEM_COLUMN_COUNT = 10
 SHOPIFYQL_PAGE_SIZE = int(os.environ.get("BUNDLE_DISCOVERY_PAGE_SIZE", "1000"))
@@ -175,20 +180,17 @@ def is_bundle_rollup_brand(
     brand_name: Optional[str], brand_key: Optional[str], shop_name: Optional[str]
 ) -> bool:
     logger.info(
-        "Bundle brand check: brand_name=%s, brand_key=%s, shop_name=%s, target_brand_tag=%s, target_shop=%s",
+        "Bundle brand check: brand_name=%s, brand_key=%s, shop_name=%s, target_brand_tags=%s, target_shops=%s",
         brand_name,
         brand_key,
         shop_name,
-        BUNDLE_TARGET_BRAND_TAG,
-        BUNDLE_TARGET_SHOP_NAME,
+        BUNDLE_TARGET_BRAND_TAGS,
+        BUNDLE_TARGET_SHOP_NAMES,
     )
-    if (brand_key or "").strip().lower() == BUNDLE_TARGET_BRAND_TAG:
+    if (brand_key or "").strip().lower() in BUNDLE_TARGET_BRAND_TAGS:
         logger.info("Bundle brand check matched on brand_key=%s", brand_key)
         return True
-    if (brand_name or "").strip().lower() == "tmc":
-        logger.info("Bundle brand check matched on brand_name=%s", brand_name)
-        return True
-    if (shop_name or "").strip().lower() == BUNDLE_TARGET_SHOP_NAME:
+    if (shop_name or "").strip().lower() in BUNDLE_TARGET_SHOP_NAMES:
         logger.info("Bundle brand check matched on shop_name=%s", shop_name)
         return True
     logger.info("Bundle brand check did not match; bundle rollups will be skipped")
@@ -523,6 +525,33 @@ def _extract_children_from_sub_items(props_map: Dict[str, str]) -> List[Dict]:
     return items
 
 
+def _extract_children_from_bundle_product_properties(
+    props_map: Dict[str, str],
+) -> List[Dict]:
+    items: List[Dict] = []
+    logger.info("Falling back to _bundle_product* child extraction")
+    for key, raw_value in props_map.items():
+        if not key.startswith("_bundle_product"):
+            continue
+        value = str(raw_value or "").strip()
+        if not value:
+            continue
+        parts = value.split("/")
+        title = parts[0].strip()
+        sku = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+        if not title:
+            continue
+        items.append(
+            {
+                "title": title,
+                "sku": sku,
+                "quantity": 1,
+                "source": "bundle_product_property",
+            }
+        )
+    return items
+
+
 def extract_bundle_children(row: Dict) -> Tuple[List[Dict], str]:
     order_id = row.get("order_id")
     bundle_id = row.get("product_id")
@@ -540,6 +569,14 @@ def extract_bundle_children(row: Dict) -> Tuple[List[Dict], str]:
     if sub_items:
         logger.info("Extracted %s child item(s) from sub_item_N", len(sub_items))
         return sub_items, "sub_item"
+
+    bundle_product_items = _extract_children_from_bundle_product_properties(props_map)
+    if bundle_product_items:
+        logger.info(
+            "Extracted %s child item(s) from _bundle_product* properties",
+            len(bundle_product_items),
+        )
+        return bundle_product_items, "bundle_product_property"
 
     if uniware_present:
         logger.warning(
