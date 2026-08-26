@@ -8,10 +8,11 @@ up to date.
 """
 
 import traceback
-from datetime import date
+from datetime import date, datetime
 from typing import Iterable, Optional
+from zoneinfo import ZoneInfo
 
-from pipeline.state import logger, brand_id_from_config
+from pipeline.state import IST, logger, brand_id_from_config
 from pipeline.db import get_db_cursor, timed
 from pipeline.schema_migrations import ensure_summary_tables
 from pipeline.notifications import get_qstash_client, ALERTS_WEBHOOK_URL
@@ -1487,6 +1488,94 @@ def push_overall_summary_events_to_qstash(
             f"📤 Published {pushed} cumulative (up to hour={current_hour}) events to QStash "
             f"for {brand_label} (date {today_str})"
         )
+
+
+# ---------------------------
+# NEW: Publish daily web vitals averages to QStash for alerts
+# ---------------------------
+def push_web_vitals_metrics_to_qstash(
+    brand_index: int,
+    brand_name: str,
+    brand_key: Optional[str],
+    cursor=None,
+    connection=None,
+    tz: ZoneInfo = IST,
+) -> None:
+    """
+    Average today's per-page daily_web_vitals_summary rows for this brand into
+    one brand-wide reading and publish it to QStash via ALERTS_WEBHOOK_URL.
+
+    Event shape:
+      {
+        brand_key, brand_name,
+        performance, cls, fcp, inp, lcp, ttfb,
+        date, time,
+      }
+    """
+    effective_brand_key = (brand_key or "").strip()
+    if not effective_brand_key:
+        return
+
+    client = get_qstash_client()
+    if client is None:
+        return
+    if not ALERTS_WEBHOOK_URL:
+        return
+
+    now = datetime.now(tz)
+    date_str = now.date().isoformat()
+    time_str = now.strftime("%H:%M:%S")
+
+    query = """
+        SELECT
+            AVG(avg_performance) AS performance,
+            AVG(avg_cls) AS cls,
+            AVG(avg_fcp) AS fcp,
+            AVG(avg_inp) AS inp,
+            AVG(avg_lcp) AS lcp,
+            AVG(avg_ttfb) AS ttfb
+        FROM daily_web_vitals_summary
+        WHERE brand_key = %s AND `date` = %s
+    """
+    if cursor is not None:
+        cursor.execute(query, (effective_brand_key, date_str))
+        row = cursor.fetchone()
+    else:
+        with get_db_cursor(brand_index) as (c, _conn):
+            c.execute(query, (effective_brand_key, date_str))
+            row = c.fetchone()
+
+    if not row or row.get("performance") is None:
+        logger.info(
+            f"No daily_web_vitals_summary rows for {brand_name} on {date_str}; "
+            "skipping web vitals QStash event."
+        )
+        return
+
+    event = {
+        "brand_key": effective_brand_key,
+        "brand_name": brand_name,
+        "performance": round(float(row["performance"])),
+        "cls": round(float(row["cls"]), 3) if row["cls"] is not None else 0,
+        "fcp": round(float(row["fcp"]), 2) if row["fcp"] is not None else 0,
+        "inp": round(float(row["inp"]), 2) if row["inp"] is not None else 0,
+        "lcp": round(float(row["lcp"]), 2) if row["lcp"] is not None else 0,
+        "ttfb": round(float(row["ttfb"]), 2) if row["ttfb"] is not None else 0,
+        "date": date_str,
+        "time": time_str,
+    }
+
+    try:
+        client.message.publish_json(
+            url=ALERTS_WEBHOOK_URL,
+            body=event,
+            headers={"Content-Type": "application/json", "X-Brand": effective_brand_key},
+        )
+        logger.info(
+            f"📤 Published web vitals event to QStash for {brand_name} (date {date_str})"
+        )
+    except Exception as e:
+        logger.error(f"❌ Failed to publish web vitals QStash event for {brand_name}: {e}")
 
 
 def execute_summary_queries_incremental(

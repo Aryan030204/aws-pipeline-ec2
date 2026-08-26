@@ -308,6 +308,7 @@ from pipeline.summary_incremental import (
     update_rto_summary_incremental,
     update_shopify_orders_utm_daily_incremental,
     push_overall_summary_events_to_qstash,
+    push_web_vitals_metrics_to_qstash,
     execute_summary_queries_incremental,
     execute_discount_dashboard_backfill_only,
 )

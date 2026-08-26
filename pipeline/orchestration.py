@@ -64,6 +64,7 @@ from pipeline.summary_incremental import (
     update_daily_citywise_summary_incremental,
     update_hour_wise_sales_incremental,
     update_hourly_citywise_summary_incremental,
+    push_web_vitals_metrics_to_qstash,
 )
 from pipeline.mongo_events import (
     sync_buy_now_events,
@@ -277,6 +278,20 @@ def update_sessions_summary(
                 end_dt=web_vitals_end_dt,
                 use_watermark=use_web_vitals_watermark,
             )
+
+            try:
+                push_web_vitals_metrics_to_qstash(
+                    brand_index=brand_index,
+                    brand_name=brand_name,
+                    brand_key=os.environ.get(f"BRAND_TAG_{brand_index}"),
+                    cursor=cursor,
+                    connection=connection,
+                    tz=tz,
+                )
+            except Exception as e:
+                logger.error(
+                    f"❌ Error while publishing web vitals QStash event for {brand_name}: {e}"
+                )
 
             update_last_fetch_timestamp(cursor, connection, datetime.now(tz))
             logger.info(f"✅ Sessions updated via ShopifyQL for {brand_name}")
