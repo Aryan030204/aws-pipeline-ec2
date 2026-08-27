@@ -37,6 +37,19 @@ ADDED NOW:
   QStash to the alerting system.
 """
 
+import sys
+
+# When this file is run directly (`python aws_background.py`), Python registers
+# it as sys.modules['__main__'], NOT sys.modules['aws_background']. Several
+# pipeline/*.py modules do `import aws_background` to reach names that stay in
+# this facade (TEST_MODE, get_brand_timezone, etc.), relying on Python finding
+# an already-registered 'aws_background' module rather than re-executing this
+# file from scratch. Without this alias, direct execution triggers a second,
+# independent import of this same file partway through the first one's pipeline
+# imports, which fails with a circular-import ImportError. Must run before any
+# `from pipeline.X import (...)` that could reach a submodule's `import aws_background`.
+sys.modules.setdefault("aws_background", sys.modules[__name__])
+
 from dotenv import load_dotenv
 
 load_dotenv()
