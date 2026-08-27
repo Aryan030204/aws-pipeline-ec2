@@ -1,6 +1,5 @@
 import json
 import unittest
-from datetime import date
 from unittest import mock
 
 import bundle_rollups
@@ -65,38 +64,29 @@ class _FakeSession:
 
 
 class BundleRollupTests(unittest.TestCase):
-    def test_build_last_full_month_window(self):
-        start_date, end_date = bundle_rollups._build_last_full_month_window(
-            today=date(2026, 8, 17)
-        )
-        self.assertEqual(start_date, "2026-05-01")
-        self.assertEqual(end_date, "2026-08-01")
+    def test_build_bundle_discovery_query_filter_is_active_only(self):
+        query = bundle_rollups._build_bundle_discovery_query_filter()
+        self.assertIn("status:active", query)
+        self.assertIn("product_type:'CYOB'", query)
+        self.assertIn("product_type:'BUNDLE'", query)
 
-    def test_parse_dynamic_bundle_products_dedupes_and_skips_summary(self):
-        rows = [
-            {
-                "product_id": "101",
-                "product_title": "Bundle A",
-                "product_type": "BUNDLE",
-            },
-            {
-                "product_id": "101",
-                "product_title": "Bundle A duplicate",
-                "product_type": "BUNDLE",
-            },
-            {
-                "product_id": "999",
-                "product_title": "Summary",
-                "product_type": "",
-            },
-            {
-                "product_id": "202",
-                "product_title": "Cyob A",
-                "product_type": "CYOB",
-            },
+    def test_extract_numeric_id_from_gid(self):
+        self.assertEqual(
+            bundle_rollups._extract_numeric_id_from_gid("gid://shopify/Product/1234567890"),
+            1234567890,
+        )
+        self.assertIsNone(bundle_rollups._extract_numeric_id_from_gid(None))
+        self.assertIsNone(bundle_rollups._extract_numeric_id_from_gid(""))
+
+    def test_parse_bundle_product_nodes_dedupes_and_skips_untitled(self):
+        nodes = [
+            {"id": "gid://shopify/Product/101", "title": "Bundle A"},
+            {"id": "gid://shopify/Product/101", "title": "Bundle A duplicate"},
+            {"id": "gid://shopify/Product/999", "title": ""},
+            {"id": "gid://shopify/Product/202", "title": "Cyob A"},
         ]
 
-        parsed = bundle_rollups._parse_dynamic_bundle_products(rows)
+        parsed = bundle_rollups._parse_bundle_product_nodes(nodes)
 
         self.assertEqual(
             parsed,
@@ -107,67 +97,58 @@ class BundleRollupTests(unittest.TestCase):
         )
 
     def test_fetch_dynamic_bundle_products_paginates_and_dedupes(self):
-        first_page_rows = [
-            {"product_id": str(i), "product_title": f"Bundle {i}", "product_type": "BUNDLE"}
-            for i in range(1, 1001)
+        first_page_edges = [
+            {"cursor": f"cursor-{i}", "node": {"id": f"gid://shopify/Product/{i}", "title": f"Bundle {i}"}}
+            for i in range(1, 251)
         ]
-        second_page_rows = [
-            {"product_id": "1000", "product_title": "Bundle 1000 duplicate", "product_type": "BUNDLE"},
-            {"product_id": "1001", "product_title": "Cyob 1001", "product_type": "CYOB"},
+        second_page_edges = [
+            {
+                "cursor": "cursor-250-dup",
+                "node": {"id": "gid://shopify/Product/250", "title": "Bundle 250 duplicate"},
+            },
+            {
+                "cursor": "cursor-251",
+                "node": {"id": "gid://shopify/Product/251", "title": "Cyob 251"},
+            },
         ]
         payloads = [
             {
                 "data": {
-                    "shopifyqlQuery": {
-                        "tableData": {
-                            "columns": [
-                                {"name": "product_id"},
-                                {"name": "product_title"},
-                                {"name": "product_type"},
-                            ],
-                            "rows": first_page_rows,
-                        },
-                        "parseErrors": [],
+                    "products": {
+                        "edges": first_page_edges,
+                        "pageInfo": {"hasNextPage": True},
                     }
                 }
             },
             {
                 "data": {
-                    "shopifyqlQuery": {
-                        "tableData": {
-                            "columns": [
-                                {"name": "product_id"},
-                                {"name": "product_title"},
-                                {"name": "product_type"},
-                            ],
-                            "rows": second_page_rows,
-                        },
-                        "parseErrors": [],
+                    "products": {
+                        "edges": second_page_edges,
+                        "pageInfo": {"hasNextPage": False},
                     }
                 }
             },
         ]
         fake_session = _FakeSession(payloads)
 
-        with mock.patch.object(bundle_rollups, "_make_shopifyql_session", return_value=fake_session):
+        with mock.patch.object(bundle_rollups, "_make_admin_api_session", return_value=fake_session):
             products = bundle_rollups.fetch_dynamic_bundle_products(
                 shop_name="the-man-company",
                 access_token="token",
                 api_version="2025-10",
-                today=date(2026, 8, 17),
-                page_size=1000,
+                page_size=250,
             )
 
         self.assertTrue(fake_session.closed)
         self.assertEqual(len(fake_session.posts), 2)
-        first_query = json.loads(fake_session.posts[0]["data"])["query"]
-        second_query = json.loads(fake_session.posts[1]["data"])["query"]
-        self.assertIn("SINCE 2026-05-01 UNTIL 2026-08-01", first_query)
-        self.assertIn("LIMIT 1000 OFFSET 0", first_query)
-        self.assertIn("LIMIT 1000 OFFSET 1000", second_query)
-        self.assertEqual(len(products), 1001)
+        first_payload = json.loads(fake_session.posts[0]["data"])
+        second_payload = json.loads(fake_session.posts[1]["data"])
+        self.assertEqual(first_payload["variables"]["after"], None)
+        self.assertIn("status:active", first_payload["variables"]["searchQuery"])
+        self.assertEqual(second_payload["variables"]["after"], "cursor-250")
+        self.assertEqual(len(products), 251)
         self.assertEqual(products[0], {"product_id": 1, "product_title": "Bundle 1"})
-        self.assertEqual(products[-1], {"product_id": 1001, "product_title": "Cyob 1001"})
+        self.assertEqual(products[-1], {"product_id": 251, "product_title": "Cyob 251"})
 
     def test_sync_bundle_master_uses_dynamic_products(self):
         cursor = _DummyCursor()

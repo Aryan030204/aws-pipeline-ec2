@@ -3,7 +3,7 @@ import logging
 import os
 import re
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import requests
@@ -22,77 +22,57 @@ BUNDLE_TARGET_SHOP_NAMES = _parse_csv_set(
 )
 EXECUTEMANY_CHUNK_SIZE = int(os.environ.get("EXECUTEMANY_CHUNK_SIZE", "1000"))
 ITEM_COLUMN_COUNT = 10
-SHOPIFYQL_PAGE_SIZE = int(os.environ.get("BUNDLE_DISCOVERY_PAGE_SIZE", "1000"))
-SHOPIFYQL_PRODUCT_TYPES = ("CYOB", "BUNDLE")
+# GraphQL Admin API connections cap `first` at 250 regardless of what's requested.
+BUNDLE_DISCOVERY_PAGE_SIZE = min(int(os.environ.get("BUNDLE_DISCOVERY_PAGE_SIZE", "250")), 250)
+BUNDLE_PRODUCT_TYPES = ("CYOB", "BUNDLE")
+
+_BUNDLE_DISCOVERY_GRAPHQL = """
+query BundleDiscovery($first: Int!, $after: String, $searchQuery: String!) {
+  products(first: $first, after: $after, query: $searchQuery) {
+    edges {
+      cursor
+      node {
+        id
+        title
+      }
+    }
+    pageInfo {
+      hasNextPage
+    }
+  }
+}
+"""
 
 
-def _make_shopifyql_session() -> requests.Session:
+def _make_admin_api_session() -> requests.Session:
     return requests.Session()
 
 
-def _format_shopifyql_table(table_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    if not table_data:
-        return []
-
-    columns = table_data.get("columns") or []
-    rows = table_data.get("rows") or []
-    if not columns or not rows:
-        return []
-
-    formatted: List[Dict[str, Any]] = []
-    column_names = [col.get("name") for col in columns]
-    for row in rows:
-        if isinstance(row, dict):
-            formatted.append(dict(row))
-            continue
-        if not isinstance(row, (list, tuple)):
-            continue
-        obj: Dict[str, Any] = {}
-        for idx, value in enumerate(row):
-            if idx >= len(column_names):
-                break
-            col_name = column_names[idx]
-            if col_name:
-                obj[col_name] = value
-        formatted.append(obj)
-    return formatted
+def _build_bundle_discovery_query_filter() -> str:
+    """
+    Active products only, of any of the configured bundle product types.
+    Draft/archived products are deliberately excluded.
+    """
+    type_clause = " OR ".join(f"product_type:'{value}'" for value in BUNDLE_PRODUCT_TYPES)
+    return f"status:active AND ({type_clause})"
 
 
-def _build_last_full_month_window(today: Optional[date] = None) -> Tuple[str, str]:
-    current = today or datetime.utcnow().date()
-    month_start = current.replace(day=1)
-    year = month_start.year
-    month = month_start.month - 3
-    while month <= 0:
-        month += 12
-        year -= 1
-    start_date = month_start.replace(year=year, month=month)
-    return start_date.isoformat(), month_start.isoformat()
+def _extract_numeric_id_from_gid(gid: Optional[str]) -> Optional[int]:
+    """Shopify GraphQL ids look like 'gid://shopify/Product/1234567890'."""
+    if not gid:
+        return None
+    tail = str(gid).rsplit("/", 1)[-1]
+    return _coerce_int(tail)
 
 
-def _build_bundle_discovery_shopifyql(start_date: str, end_date: str, limit: int, offset: int) -> str:
-    product_types = ", ".join(f"'{value}'" for value in SHOPIFYQL_PRODUCT_TYPES)
-    return (
-        "FROM inventory "
-        "SHOW inventory_units_sold "
-        f"WHERE product_type IN ({product_types}) "
-        "GROUP BY product_type, product_title, product_id, product_variant_sku, "
-        "product_variant_id, product_variant_title WITH TOTALS "
-        f"SINCE {start_date} UNTIL {end_date} "
-        "ORDER BY inventory_units_sold DESC "
-        f"LIMIT {limit} OFFSET {offset} "
-        "VISUALIZE inventory_units_sold"
-    )
-
-
-def _parse_dynamic_bundle_products(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _parse_bundle_product_nodes(nodes: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     discovered: List[Dict[str, Any]] = []
     seen_product_ids: Set[int] = set()
 
-    for row in rows:
-        product_id = _coerce_int(row.get("product_id"))
-        product_title = str(row.get("product_title") or "").strip()
-        if product_id is None or not product_title or product_title.lower() == "summary":
+    for node in nodes:
+        product_id = _extract_numeric_id_from_gid((node or {}).get("id"))
+        product_title = str((node or {}).get("title") or "").strip()
+        if product_id is None or not product_title:
             continue
         if product_id in seen_product_ids:
             continue
@@ -112,61 +92,58 @@ def fetch_dynamic_bundle_products(
     access_token: str,
     api_version: str,
     *,
-    today: Optional[date] = None,
-    page_size: int = SHOPIFYQL_PAGE_SIZE,
+    page_size: int = BUNDLE_DISCOVERY_PAGE_SIZE,
 ) -> List[Dict[str, Any]]:
-    start_date, end_date = _build_last_full_month_window(today=today)
-    session = _make_shopifyql_session()
+    """
+    Discover bundle products directly from the Shopify Admin API product
+    catalog (active products only), instead of a sales report. This finds a
+    bundle the moment it's published, rather than only after it has
+    accumulated sales history within a lookback window.
+    """
+    search_query = _build_bundle_discovery_query_filter()
+    session = _make_admin_api_session()
     discovered_by_id: Dict[int, Dict[str, Any]] = {}
-    offset = 0
+    after_cursor: Optional[str] = None
+    url = f"https://{shop_name}.myshopify.com/admin/api/{api_version}/graphql.json"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": access_token,
+    }
+
     try:
         while True:
-            shopify_ql = _build_bundle_discovery_shopifyql(
-                start_date=start_date,
-                end_date=end_date,
-                limit=page_size,
-                offset=offset,
-            )
-            ql_flat = shopify_ql.replace("\n", " ").strip().replace('"', '\\"')
-            graphql_query = (
-                'query DynamicBundleDiscoveryQuery { shopifyqlQuery(query: "'
-                + ql_flat
-                + '") { tableData { rows columns { name dataType displayName } } parseErrors } }'
-            )
-            payload = {"query": graphql_query}
-            url = f"https://{shop_name}.myshopify.com/admin/api/{api_version}/graphql.json"
-            headers = {
-                "Content-Type": "application/json",
-                "X-Shopify-Access-Token": access_token,
+            payload = {
+                "query": _BUNDLE_DISCOVERY_GRAPHQL,
+                "variables": {
+                    "first": page_size,
+                    "after": after_cursor,
+                    "searchQuery": search_query,
+                },
             }
-
             response = session.post(url, headers=headers, data=json.dumps(payload), timeout=60)
             response.raise_for_status()
             body = response.json()
             if body.get("errors"):
                 raise RuntimeError(f"Bundle discovery GraphQL errors: {body['errors']}")
 
-            ql_result = (body.get("data") or {}).get("shopifyqlQuery") or {}
-            parse_errors = ql_result.get("parseErrors") or []
-            if parse_errors:
-                raise RuntimeError(f"Bundle discovery ShopifyQL parse errors: {parse_errors}")
-
-            rows = _format_shopifyql_table(ql_result.get("tableData") or {})
-            parsed_page = _parse_dynamic_bundle_products(rows)
+            products_conn = (body.get("data") or {}).get("products") or {}
+            edges = products_conn.get("edges") or []
+            nodes = [edge.get("node") or {} for edge in edges]
+            parsed_page = _parse_bundle_product_nodes(nodes)
             for product in parsed_page:
                 discovered_by_id.setdefault(product["product_id"], product)
 
             logger.info(
-                "Bundle discovery fetched %s row(s), %s unique product(s) total, window=%s..%s, offset=%s",
-                len(rows),
+                "Bundle discovery fetched %s product(s), %s unique product(s) total, query=%s",
+                len(edges),
                 len(discovered_by_id),
-                start_date,
-                end_date,
-                offset,
+                search_query,
             )
-            if len(rows) < page_size:
+
+            page_info = products_conn.get("pageInfo") or {}
+            if not page_info.get("hasNextPage") or not edges:
                 break
-            offset += page_size
+            after_cursor = edges[-1].get("cursor")
     finally:
         try:
             session.close()
