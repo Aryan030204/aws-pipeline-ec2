@@ -314,6 +314,7 @@ from pipeline.summary_incremental import (
     update_discount_summary_incremental,
     update_gross_summary_incremental,
     update_hour_wise_sales_incremental,
+    backfill_payment_mode_breakdown_columns,
     update_daily_citywise_summary_incremental,
     update_hourly_citywise_summary_incremental,
     update_dashboard_discount_daily_incremental,

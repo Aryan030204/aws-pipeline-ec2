@@ -741,6 +741,148 @@ def update_hour_wise_sales_incremental(
         )
 
 
+_PAYMENT_MODE_BREAKDOWN_CASE_SQL = """
+        COUNT(DISTINCT CASE WHEN (payment_gateway_names IS NOT NULL AND payment_gateway_names != '')
+            AND NOT (payment_gateway_names LIKE '%Cash on Delivery (COD)%'
+            OR payment_gateway_names LIKE '%cash_on_delivery%'
+            OR payment_gateway_names LIKE '%Gokwik PPCOD%') THEN order_id END) AS prepaid_orders,
+        COUNT(DISTINCT CASE WHEN (payment_gateway_names is NULL OR payment_gateway_names LIKE '%Cash on Delivery (COD)%'
+            OR payment_gateway_names LIKE '%cash_on_delivery%')
+            AND (payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR payment_gateway_names is NULL) THEN order_id END) AS cod_orders,
+        COUNT(DISTINCT CASE WHEN payment_gateway_names LIKE '%Gokwik PPCOD%'
+            THEN order_id END) AS ppcod_orders,
+        SUM(CASE WHEN (payment_gateway_names is NULL OR payment_gateway_names LIKE '%Cash on Delivery (COD)%'
+            OR payment_gateway_names LIKE '%cash_on_delivery%')
+            AND (payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR payment_gateway_names is NULL)
+            THEN COALESCE(total_price, 0) ELSE 0 END) AS cod_sales,
+        SUM(CASE WHEN (payment_gateway_names IS NOT NULL AND payment_gateway_names != '')
+            AND NOT (payment_gateway_names LIKE '%Cash on Delivery (COD)%'
+            OR payment_gateway_names LIKE '%cash_on_delivery%'
+            OR payment_gateway_names LIKE '%Gokwik PPCOD%')
+            THEN COALESCE(total_price, 0) ELSE 0 END) AS prepaid_sales,
+        SUM(CASE WHEN payment_gateway_names LIKE '%Gokwik PPCOD%'
+            THEN COALESCE(total_price, 0) ELSE 0 END) AS partially_prepaid_sales
+"""
+
+
+def backfill_payment_mode_breakdown_columns(
+    brand_index: int, brand_name: str, target_dates: Iterable[str]
+) -> None:
+    """
+    Focused backfill: recomputes and upserts ONLY the cod/prepaid/ppcod
+    order-count and sales-amount columns on hour_wise_sales
+    (number_of_cod_orders, number_of_prepaid_orders, number_of_ppcod_orders,
+    cod_sales, prepaid_sales, partially_prepaid_sales) and overall_summary
+    (cod_orders, prepaid_orders, partially_paid_orders, cod_sales,
+    prepaid_sales, partially_prepaid_sales), computed straight from
+    shopify_orders.
+
+    Every other column on both tables (session counts, total_sales,
+    ci_events, etc.) is left completely untouched - this intentionally does
+    NOT go through the full stage-table/merge_staging_to_main_by_date
+    rebuild the regular incremental functions use, and upserts via an
+    explicit ON DUPLICATE KEY UPDATE column list instead.
+    """
+    placeholders, params = _dates_in_clause(target_dates)
+    if not params:
+        logger.debug(f"[{brand_name}] payment mode breakdown backfill: no dates to process")
+        return
+
+    with get_db_cursor(brand_index, dictionary=True) as (cursor, connection):
+        hourly_sql = f"""
+            SELECT
+                STR_TO_DATE(created_date, '%Y-%m-%d') AS date,
+                HOUR(created_time) AS hour,
+                {_PAYMENT_MODE_BREAKDOWN_CASE_SQL}
+            FROM shopify_orders
+            WHERE created_date IN ({placeholders})
+                AND created_time IS NOT NULL
+            GROUP BY date, hour
+        """
+        cursor.execute(hourly_sql, params)
+        hourly_rows = cursor.fetchall()
+
+        if hourly_rows:
+            cursor.executemany(
+                """
+                INSERT INTO hour_wise_sales (
+                    date, hour, number_of_prepaid_orders, number_of_cod_orders,
+                    number_of_ppcod_orders, cod_sales, prepaid_sales, partially_prepaid_sales
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    number_of_prepaid_orders = VALUES(number_of_prepaid_orders),
+                    number_of_cod_orders = VALUES(number_of_cod_orders),
+                    number_of_ppcod_orders = VALUES(number_of_ppcod_orders),
+                    cod_sales = VALUES(cod_sales),
+                    prepaid_sales = VALUES(prepaid_sales),
+                    partially_prepaid_sales = VALUES(partially_prepaid_sales)
+                """,
+                [
+                    (
+                        row["date"],
+                        row["hour"],
+                        row["prepaid_orders"],
+                        row["cod_orders"],
+                        row["ppcod_orders"],
+                        row["cod_sales"],
+                        row["prepaid_sales"],
+                        row["partially_prepaid_sales"],
+                    )
+                    for row in hourly_rows
+                ],
+            )
+            connection.commit()
+        logger.info(
+            f"[{brand_name}] hour_wise_sales payment columns backfilled: {len(hourly_rows)} hour bucket(s)"
+        )
+
+        daily_sql = f"""
+            SELECT
+                STR_TO_DATE(created_date, '%Y-%m-%d') AS date,
+                {_PAYMENT_MODE_BREAKDOWN_CASE_SQL}
+            FROM shopify_orders
+            WHERE created_date IN ({placeholders})
+            GROUP BY date
+        """
+        cursor.execute(daily_sql, params)
+        daily_rows = cursor.fetchall()
+
+        if daily_rows:
+            cursor.executemany(
+                """
+                INSERT INTO overall_summary (
+                    date, prepaid_orders, cod_orders, partially_paid_orders,
+                    cod_sales, prepaid_sales, partially_prepaid_sales
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    prepaid_orders = VALUES(prepaid_orders),
+                    cod_orders = VALUES(cod_orders),
+                    partially_paid_orders = VALUES(partially_paid_orders),
+                    cod_sales = VALUES(cod_sales),
+                    prepaid_sales = VALUES(prepaid_sales),
+                    partially_prepaid_sales = VALUES(partially_prepaid_sales)
+                """,
+                [
+                    (
+                        row["date"],
+                        row["prepaid_orders"],
+                        row["cod_orders"],
+                        row["ppcod_orders"],
+                        row["cod_sales"],
+                        row["prepaid_sales"],
+                        row["partially_prepaid_sales"],
+                    )
+                    for row in daily_rows
+                ],
+            )
+            connection.commit()
+        logger.info(
+            f"[{brand_name}] overall_summary payment columns backfilled: {len(daily_rows)} date(s)"
+        )
+
+
 def update_daily_citywise_summary_incremental(
     cursor, connection, brand_name: str, target_dates: Iterable[str]
 ):
