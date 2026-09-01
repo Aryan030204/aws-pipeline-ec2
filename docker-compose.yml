@@ -28,3 +28,16 @@ services:
       - pipeline-net
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  variant-wise-events-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.variant-wise-events-worker
+    container_name: variant-wise-events-worker
+    env_file:
+      - .env
+    restart: always
+    networks:
+      - pipeline-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

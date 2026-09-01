@@ -8,7 +8,7 @@ columns.
 
 import re
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
 from pymongo import MongoClient
@@ -822,3 +822,263 @@ def sync_buy_now_variant_events(
             )
     except Exception as e:
         logger.error(f"Error updating buy-now variant events for {brand_name}: {e}")
+
+
+# ---------------------------
+# Variant-wise events summary (dynamic event types)
+# ---------------------------
+# Unlike the checkout_initiated/buy_now tables above (one hardcoded event
+# type each), this table discovers ANY event_type present in Mongo and adds
+# a column for it on the fly, mirroring the pattern in
+# workers/events_summary_worker.py - but keyed by (date, variant_id) instead
+# of (date, shop_name), and reusing this module's "count a (session_id,
+# cart_token) pair only if it occurs exactly once that day" dedup rule,
+# applied independently per event type.
+
+VARIANT_WISE_EVENTS_TABLE = "variant_wise_events_summary"
+EVENT_COLUMN_SUFFIX = "_count"
+
+
+def _sanitize_event_type_column(event_type: Any) -> Optional[str]:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(event_type or "").strip().lower())
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    if not normalized:
+        return None
+    return f"{normalized}{EVENT_COLUMN_SUFFIX}"
+
+
+def _quote_identifier(identifier: str) -> str:
+    if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", identifier or ""):
+        raise ValueError(f"Unsafe SQL identifier: {identifier!r}")
+    return f"`{identifier}`"
+
+
+def _iter_unique_daily_pair_events_all_types_from_mongo(
+    start_date: date,
+    end_date: date,
+    mongo_shop_name: str,
+    tz: ZoneInfo = IST,
+) -> List[Dict[str, Any]]:
+    """
+    Same "exactly once per day" dedup as _iter_unique_daily_pair_events_from_mongo,
+    but fetches every event_type in one query instead of being pre-filtered to a
+    single type. The dedup key includes the (sanitized) event type, so each event
+    type is still deduped independently - identical semantics to calling the
+    single-event-type version once per type.
+    """
+    start_utc, end_utc = _ist_date_range_to_utc_bounds(start_date, end_date, tz)
+    client = None
+    try:
+        client, collection = _resolve_mongo_sessions_collection()
+        cursor = collection.find(
+            {
+                "shop_name": mongo_shop_name,
+                "createdAt": {"$gte": start_utc, "$lt": end_utc},
+            },
+            {"createdAt": 1, "session_id": 1, "cart_token": 1, "variantId": 1, "event_type": 1},
+        )
+
+        pair_events: Dict[Tuple[date, str, str, str], List[Dict[str, Any]]] = {}
+        for doc in cursor:
+            session_id = _extract_session_id(doc)
+            cart_token = _extract_cart_token(doc)
+            event_column = _sanitize_event_type_column(doc.get("event_type"))
+            if not session_id or not cart_token or not event_column:
+                continue
+
+            created_at = doc.get("createdAt")
+            if not isinstance(created_at, datetime):
+                continue
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+
+            local_created_at = created_at.astimezone(tz)
+            local_date = local_created_at.date()
+            if local_date < start_date or local_date > end_date:
+                continue
+
+            pair_key = (local_date, session_id, cart_token, event_column)
+            pair_events.setdefault(pair_key, []).append(
+                {
+                    "date": local_date,
+                    "event_column": event_column,
+                    "variant_ids": _normalize_variant_ids(doc.get("variantId")),
+                }
+            )
+
+        unique_events: List[Dict[str, Any]] = []
+        for events in pair_events.values():
+            if len(events) == 1:
+                unique_events.append(events[0])
+
+        return unique_events
+    finally:
+        if client is not None:
+            client.close()
+
+
+def _aggregate_variant_wise_event_counts(
+    start_date: date,
+    end_date: date,
+    mongo_shop_name: str,
+    tz: ZoneInfo = IST,
+) -> Tuple[Dict[Tuple[date, str], Dict[str, int]], Set[str]]:
+    unique_events = _iter_unique_daily_pair_events_all_types_from_mongo(
+        start_date=start_date,
+        end_date=end_date,
+        mongo_shop_name=mongo_shop_name,
+        tz=tz,
+    )
+
+    aggregated: Dict[Tuple[date, str], Dict[str, int]] = {}
+    event_columns: Set[str] = set()
+    for event in unique_events:
+        event_column = event["event_column"]
+        event_columns.add(event_column)
+        for variant_id in event["variant_ids"]:
+            key = (event["date"], variant_id)
+            bucket = aggregated.setdefault(key, {})
+            bucket[event_column] = bucket.get(event_column, 0) + 1
+
+    return aggregated, event_columns
+
+
+def _ensure_variant_wise_events_summary_table(cursor, connection) -> None:
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {_quote_identifier(VARIANT_WISE_EVENTS_TABLE)} (
+            `date` DATE NOT NULL,
+            `variant_id` VARCHAR(255) NOT NULL,
+            `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`date`, `variant_id`),
+            KEY `idx_date` (`date`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """
+    )
+    connection.commit()
+
+
+def _get_existing_variant_wise_columns(cursor) -> Set[str]:
+    cursor.execute(f"SHOW COLUMNS FROM {_quote_identifier(VARIANT_WISE_EVENTS_TABLE)}")
+    return {
+        str(row["Field"] if isinstance(row, dict) else row[0])
+        for row in cursor.fetchall() or []
+    }
+
+
+def _ensure_variant_wise_event_columns(cursor, connection, event_columns) -> None:
+    existing_columns = _get_existing_variant_wise_columns(cursor)
+    missing_columns = sorted(set(event_columns) - existing_columns)
+    for column in missing_columns:
+        cursor.execute(
+            f"ALTER TABLE {_quote_identifier(VARIANT_WISE_EVENTS_TABLE)} "
+            f"ADD COLUMN {_quote_identifier(column)} INT NOT NULL DEFAULT 0"
+        )
+    if missing_columns:
+        connection.commit()
+
+
+def _upsert_variant_wise_events_summary(
+    cursor,
+    connection,
+    start_date: date,
+    end_date: date,
+    aggregated: Dict[Tuple[date, str], Dict[str, int]],
+    event_columns,
+) -> int:
+    if not event_columns:
+        return 0
+
+    _ensure_variant_wise_event_columns(cursor, connection, event_columns)
+
+    cursor.execute(
+        f"DELETE FROM {_quote_identifier(VARIANT_WISE_EVENTS_TABLE)} "
+        f"WHERE `date` BETWEEN %s AND %s",
+        (start_date, end_date),
+    )
+
+    sorted_columns = sorted(event_columns)
+    quoted_columns = ", ".join(_quote_identifier(c) for c in sorted_columns)
+    placeholders = ", ".join(["%s"] * (2 + len(sorted_columns)))
+    update_clause = ", ".join(
+        f"{_quote_identifier(c)} = VALUES({_quote_identifier(c)})" for c in sorted_columns
+    )
+    sql = (
+        f"INSERT INTO {_quote_identifier(VARIANT_WISE_EVENTS_TABLE)} "
+        f"(`date`, `variant_id`, {quoted_columns}) "
+        f"VALUES ({placeholders}) "
+        f"ON DUPLICATE KEY UPDATE {update_clause}"
+    )
+
+    rows = [
+        (bucket_date, variant_id, *[counts.get(c, 0) for c in sorted_columns])
+        for (bucket_date, variant_id), counts in sorted(aggregated.items())
+    ]
+    if rows:
+        cursor.executemany(sql, rows)
+    connection.commit()
+    return len(rows)
+
+
+def sync_variant_wise_events_summary(
+    brand_index: int,
+    brand_name: str,
+    start_date: date,
+    end_date: date,
+    brand_key: Optional[str] = None,
+    cursor=None,
+    connection=None,
+) -> None:
+    if not is_ci_events_brand(brand_name, brand_key):
+        logger.info(
+            f"Skipping variant-wise events summary sync for {brand_name}: "
+            "brand not enabled for ci_events"
+        )
+        return
+
+    mongo_shop_name = get_ci_events_mongo_shop_name(brand_name, brand_key)
+    if not mongo_shop_name:
+        logger.info(
+            f"Skipping variant-wise events summary sync for {brand_name}: "
+            "no Mongo shop_name mapping"
+        )
+        return
+
+    tz = aws_background.get_brand_timezone(brand_index)
+    try:
+        aggregated, event_columns = _aggregate_variant_wise_event_counts(
+            start_date=start_date,
+            end_date=end_date,
+            mongo_shop_name=mongo_shop_name,
+            tz=tz,
+        )
+    except Exception as e:
+        logger.error(
+            f"Error fetching variant-wise events from Mongo for {brand_name}: {e}"
+        )
+        return
+
+    if cursor is not None:
+        _ensure_variant_wise_events_summary_table(cursor, connection)
+        inserted = _upsert_variant_wise_events_summary(
+            cursor, connection, start_date, end_date, aggregated, event_columns
+        )
+        logger.info(
+            f"Updated variant-wise events summary for {brand_name} "
+            f"({len(event_columns)} event type(s), {inserted} row(s), {start_date}..{end_date})"
+        )
+        return
+
+    try:
+        with get_db_cursor(brand_index) as (c, conn):
+            _ensure_variant_wise_events_summary_table(c, conn)
+            inserted = _upsert_variant_wise_events_summary(
+                c, conn, start_date, end_date, aggregated, event_columns
+            )
+            logger.info(
+                f"Updated variant-wise events summary for {brand_name} "
+                f"({len(event_columns)} event type(s), {inserted} row(s), {start_date}..{end_date})"
+            )
+    except Exception as e:
+        logger.error(f"Error updating variant-wise events summary for {brand_name}: {e}")

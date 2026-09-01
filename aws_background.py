@@ -349,6 +349,7 @@ from pipeline.mongo_events import (
     fetch_buy_now_variant_counts_from_mongo,
     sync_checkout_initiated_variant_events,
     sync_buy_now_variant_events,
+    sync_variant_wise_events_summary,
 )
 from pipeline.utm_traffic import (
     fetch_shopify_utm_sessions_daily,
