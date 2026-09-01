@@ -1,8 +1,8 @@
 """
 Schema migration helpers: idempotent DDL to create/extend the summary
 tables used by the pipeline. Each ensure_* function is safe to call
-repeatedly (it either creates a table with IF NOT EXISTS or attempts an
-ALTER TABLE and swallows the duplicate-column error).
+repeatedly (it either creates a table with IF NOT EXISTS, or checks
+SHOW COLUMNS and ALTERs in only what's missing via _ensure_columns).
 """
 
 import os
@@ -14,54 +14,66 @@ from sqlalchemy import text
 from pipeline.state import logger, sqlalchemy_engines
 
 
+def _ensure_columns(brand_index: int, table_name: str, column_defs: dict) -> None:
+    """
+    Idempotent schema migration used by every ensure_* function below:
+    checks SHOW COLUMNS FROM {table_name} first and ALTERs in only the
+    columns from column_defs that are actually missing.
+
+    This replaces the older pattern of blindly firing ALTER TABLE and
+    swallowing every exception except "Duplicate column name" - that
+    pattern silently ate real failures (lock timeouts, missing tables,
+    permissions, etc.) with zero logging, so a migration could fail and the
+    pipeline would look healthy right up until a later INSERT hit an
+    "Unknown column" error with no clue why. Any failure here - the
+    existence check itself, or an individual ALTER - is now logged instead
+    of swallowed.
+    """
+    engine = sqlalchemy_engines.get(brand_index)
+    if not engine:
+        return
+    brand_name = os.environ.get(f"BRAND_NAME_{brand_index}", f"Brand_{brand_index}")
+
+    try:
+        with engine.connect() as conn:
+            existing = {
+                row[0] for row in conn.execute(text(f"SHOW COLUMNS FROM {table_name}"))
+            }
+            for col, definition in column_defs.items():
+                if col in existing:
+                    continue
+                try:
+                    conn.execute(
+                        text(f"ALTER TABLE {table_name} ADD COLUMN {col} {definition}")
+                    )
+                    conn.commit()
+                    logger.info(
+                        f"✅ Added missing column {table_name}.{col} for {brand_name}"
+                    )
+                except Exception as e:
+                    if "Duplicate column name" not in str(e):
+                        logger.warning(
+                            f"⚠️ Failed to add column {table_name}.{col} for {brand_name}: {e}"
+                        )
+    except Exception as e:
+        logger.warning(
+            f"⚠️ Column-existence check failed for {table_name} ({brand_name}): {e}"
+        )
+
+
 def ensure_user_agent_column(brand_index: int, table_name: str):
     """
     Ensure user_agent column exists in the specific table.
     Run this in a separate transaction BEFORE opening long-lived cursors to avoid metadata locks.
     """
-    engine = sqlalchemy_engines.get(brand_index)
-    if not engine:
-        return
-
-    try:
-        with engine.connect() as conn:
-            # Check/Add user_agent column
-            # We blindly attempt ADD COLUMN; if it exists, it fails safely or throws error we catch.
-            try:
-                conn.execute(
-                    text(f"ALTER TABLE {table_name} ADD COLUMN user_agent TEXT")
-                )
-                conn.commit()
-            except Exception as e:
-                # If it fails, likely because it exists.
-                if "Duplicate column name" in str(e):
-                    pass
-                else:
-                    pass
-    except Exception:
-        pass
+    _ensure_columns(brand_index, table_name, {"user_agent": "TEXT"})
 
 
 def ensure_customer_tag_column(brand_index: int, table_name: str):
     """
     Ensure customer_tag exists in the specific table.
     """
-    engine = sqlalchemy_engines.get(brand_index)
-    if not engine:
-        return
-
-    try:
-        with engine.connect() as conn:
-            try:
-                conn.execute(
-                    text(f"ALTER TABLE {table_name} ADD COLUMN customer_tag TEXT")
-                )
-                conn.commit()
-            except Exception as e:
-                if "Duplicate column name" in str(e):
-                    pass
-    except Exception:
-        pass
+    _ensure_columns(brand_index, table_name, {"customer_tag": "TEXT"})
 
 
 def ensure_bundle_property_columns(brand_index: int, table_name: str):
@@ -69,84 +81,36 @@ def ensure_bundle_property_columns(brand_index: int, table_name: str):
     Ensure line_item_properties_json exists in the specific table so bundle
     rollups can be rebuilt directly from shopify_orders rows.
     """
-    engine = sqlalchemy_engines.get(brand_index)
-    if not engine:
-        return
-
-    try:
-        with engine.connect() as conn:
-            try:
-                conn.execute(
-                    text(
-                        f"ALTER TABLE {table_name} ADD COLUMN line_item_properties_json TEXT"
-                    )
-                )
-                conn.commit()
-            except Exception as e:
-                if "Duplicate column name" in str(e):
-                    pass
-    except Exception:
-        pass
+    _ensure_columns(
+        brand_index, table_name, {"line_item_properties_json": "TEXT"}
+    )
 
 
 def ensure_device_summary_columns(brand_index: int, table_name: str):
     """
     Ensure device-wise session and ATC columns exist in the specific table.
     """
-    engine = sqlalchemy_engines.get(brand_index)
-    if not engine:
-        return
-
-    columns = [
-        "desktop_sessions",
-        "desktop_atc_sessions",
-        "mobile_sessions",
-        "mobile_atc_sessions",
-        "tablet_sessions",
-        "tablet_atc_sessions",
-        "other_sessions",
-        "other_atc_sessions",
-    ]
-
-    try:
-        with engine.connect() as conn:
-            for col in columns:
-                try:
-                    conn.execute(
-                        text(f"ALTER TABLE {table_name} ADD COLUMN {col} INT DEFAULT 0")
-                    )
-                    conn.commit()
-                except Exception as e:
-                    if "Duplicate column name" in str(e):
-                        pass
-                    else:
-                        pass
-    except Exception:
-        pass
+    _ensure_columns(
+        brand_index,
+        table_name,
+        {
+            "desktop_sessions": "INT DEFAULT 0",
+            "desktop_atc_sessions": "INT DEFAULT 0",
+            "mobile_sessions": "INT DEFAULT 0",
+            "mobile_atc_sessions": "INT DEFAULT 0",
+            "tablet_sessions": "INT DEFAULT 0",
+            "tablet_atc_sessions": "INT DEFAULT 0",
+            "other_sessions": "INT DEFAULT 0",
+            "other_atc_sessions": "INT DEFAULT 0",
+        },
+    )
 
 
 def ensure_utm_names_column(brand_index: int, table_name: str = "overall_utm_summary"):
     """
     Ensure 'utm_names' JSON column exists in existing table.
     """
-    engine = sqlalchemy_engines.get(brand_index)
-    if not engine:
-        return
-
-    try:
-        with engine.connect() as conn:
-            try:
-                conn.execute(
-                    text(f"ALTER TABLE {table_name} ADD COLUMN utm_names JSON")
-                )
-                conn.commit()
-            except Exception as e:
-                if "Duplicate column name" in str(e):
-                    pass
-                else:
-                    pass
-    except Exception:
-        pass
+    _ensure_columns(brand_index, table_name, {"utm_names": "JSON"})
 
 
 def ensure_ci_events_column(
@@ -155,22 +119,7 @@ def ensure_ci_events_column(
     """
     Ensure ci_events exists in the specific table.
     """
-    engine = sqlalchemy_engines.get(brand_index)
-    if not engine:
-        return
-
-    try:
-        with engine.connect() as conn:
-            try:
-                conn.execute(
-                    text(f"ALTER TABLE {table_name} ADD COLUMN ci_events INT DEFAULT 0")
-                )
-                conn.commit()
-            except Exception as e:
-                if "Duplicate column name" in str(e):
-                    pass
-    except Exception:
-        pass
+    _ensure_columns(brand_index, table_name, {"ci_events": "INT DEFAULT 0"})
 
 
 def ensure_buy_now_events_column(
@@ -179,49 +128,18 @@ def ensure_buy_now_events_column(
     """
     Ensure buy_now_events exists in the specific table.
     """
-    engine = sqlalchemy_engines.get(brand_index)
-    if not engine:
-        return
-
-    try:
-        with engine.connect() as conn:
-            try:
-                conn.execute(
-                    text(
-                        f"ALTER TABLE {table_name} ADD COLUMN buy_now_events INT DEFAULT 0"
-                    )
-                )
-                conn.commit()
-            except Exception as e:
-                if "Duplicate column name" in str(e):
-                    pass
-    except Exception:
-        pass
+    _ensure_columns(brand_index, table_name, {"buy_now_events": "INT DEFAULT 0"})
 
 
 def ensure_overall_summary_event_columns(brand_index: int) -> None:
     """
     Ensure ci_events and buy_now_events exist in overall_summary.
     """
-    engine = sqlalchemy_engines.get(brand_index)
-    if not engine:
-        return
-
-    statements = (
-        "ALTER TABLE overall_summary ADD COLUMN ci_events INT DEFAULT 0",
-        "ALTER TABLE overall_summary ADD COLUMN buy_now_events INT DEFAULT 0",
+    _ensure_columns(
+        brand_index,
+        "overall_summary",
+        {"ci_events": "INT DEFAULT 0", "buy_now_events": "INT DEFAULT 0"},
     )
-    try:
-        with engine.connect() as conn:
-            for sql in statements:
-                try:
-                    conn.execute(text(sql))
-                    conn.commit()
-                except Exception as e:
-                    if "Duplicate column name" in str(e):
-                        continue
-    except Exception:
-        pass
 
 
 def ensure_hour_wise_ppcod_column(brand_index: int) -> None:
@@ -231,24 +149,9 @@ def ensure_hour_wise_ppcod_column(brand_index: int) -> None:
     number_of_prepaid_orders and number_of_cod_orders today, so this is a
     genuinely new bucket, not a split out of an existing one.
     """
-    engine = sqlalchemy_engines.get(brand_index)
-    if not engine:
-        return
-
-    try:
-        with engine.connect() as conn:
-            try:
-                conn.execute(
-                    text(
-                        "ALTER TABLE hour_wise_sales ADD COLUMN number_of_ppcod_orders INT DEFAULT 0"
-                    )
-                )
-                conn.commit()
-            except Exception as e:
-                if "Duplicate column name" in str(e):
-                    pass
-    except Exception:
-        pass
+    _ensure_columns(
+        brand_index, "hour_wise_sales", {"number_of_ppcod_orders": "INT DEFAULT 0"}
+    )
 
 
 def ensure_hour_wise_payment_sales_columns(brand_index: int) -> None:
@@ -258,26 +161,15 @@ def ensure_hour_wise_payment_sales_columns(brand_index: int) -> None:
     number_of_cod_orders/number_of_prepaid_orders/number_of_ppcod_orders
     order-count columns.
     """
-    engine = sqlalchemy_engines.get(brand_index)
-    if not engine:
-        return
-
-    statements = (
-        "ALTER TABLE hour_wise_sales ADD COLUMN cod_sales DECIMAL(12,2) DEFAULT 0",
-        "ALTER TABLE hour_wise_sales ADD COLUMN prepaid_sales DECIMAL(12,2) DEFAULT 0",
-        "ALTER TABLE hour_wise_sales ADD COLUMN partially_prepaid_sales DECIMAL(12,2) DEFAULT 0",
+    _ensure_columns(
+        brand_index,
+        "hour_wise_sales",
+        {
+            "cod_sales": "DECIMAL(12,2) DEFAULT 0",
+            "prepaid_sales": "DECIMAL(12,2) DEFAULT 0",
+            "partially_prepaid_sales": "DECIMAL(12,2) DEFAULT 0",
+        },
     )
-    try:
-        with engine.connect() as conn:
-            for sql in statements:
-                try:
-                    conn.execute(text(sql))
-                    conn.commit()
-                except Exception as e:
-                    if "Duplicate column name" in str(e):
-                        continue
-    except Exception:
-        pass
 
 
 def ensure_overall_summary_payment_sales_columns(brand_index: int) -> None:
@@ -286,26 +178,15 @@ def ensure_overall_summary_payment_sales_columns(brand_index: int) -> None:
     overall_summary - the sales-amount counterparts of the existing
     cod_orders/prepaid_orders/partially_paid_orders order-count columns.
     """
-    engine = sqlalchemy_engines.get(brand_index)
-    if not engine:
-        return
-
-    statements = (
-        "ALTER TABLE overall_summary ADD COLUMN cod_sales DECIMAL(12,2) DEFAULT 0",
-        "ALTER TABLE overall_summary ADD COLUMN prepaid_sales DECIMAL(12,2) DEFAULT 0",
-        "ALTER TABLE overall_summary ADD COLUMN partially_prepaid_sales DECIMAL(12,2) DEFAULT 0",
+    _ensure_columns(
+        brand_index,
+        "overall_summary",
+        {
+            "cod_sales": "DECIMAL(12,2) DEFAULT 0",
+            "prepaid_sales": "DECIMAL(12,2) DEFAULT 0",
+            "partially_prepaid_sales": "DECIMAL(12,2) DEFAULT 0",
+        },
     )
-    try:
-        with engine.connect() as conn:
-            for sql in statements:
-                try:
-                    conn.execute(text(sql))
-                    conn.commit()
-                except Exception as e:
-                    if "Duplicate column name" in str(e):
-                        continue
-    except Exception:
-        pass
 
 
 def run_brand_preflight_schema_migrations(brand_index: int) -> None:
