@@ -146,6 +146,9 @@ from pipeline.schema_migrations import (
     ensure_ci_events_column,
     ensure_buy_now_events_column,
     ensure_overall_summary_event_columns,
+    ensure_hour_wise_ppcod_column,
+    ensure_hour_wise_payment_sales_columns,
+    ensure_overall_summary_payment_sales_columns,
     run_brand_preflight_schema_migrations,
     ensure_summary_tables,
 )

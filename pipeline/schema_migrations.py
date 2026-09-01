@@ -224,6 +224,90 @@ def ensure_overall_summary_event_columns(brand_index: int) -> None:
         pass
 
 
+def ensure_hour_wise_ppcod_column(brand_index: int) -> None:
+    """
+    Ensure number_of_ppcod_orders exists in hour_wise_sales. PPCOD
+    (Gokwik "Prepaid Partial COD") orders are excluded from BOTH
+    number_of_prepaid_orders and number_of_cod_orders today, so this is a
+    genuinely new bucket, not a split out of an existing one.
+    """
+    engine = sqlalchemy_engines.get(brand_index)
+    if not engine:
+        return
+
+    try:
+        with engine.connect() as conn:
+            try:
+                conn.execute(
+                    text(
+                        "ALTER TABLE hour_wise_sales ADD COLUMN number_of_ppcod_orders INT DEFAULT 0"
+                    )
+                )
+                conn.commit()
+            except Exception as e:
+                if "Duplicate column name" in str(e):
+                    pass
+    except Exception:
+        pass
+
+
+def ensure_hour_wise_payment_sales_columns(brand_index: int) -> None:
+    """
+    Ensure cod_sales, prepaid_sales, partially_prepaid_sales exist in
+    hour_wise_sales - the sales-amount counterparts of the existing
+    number_of_cod_orders/number_of_prepaid_orders/number_of_ppcod_orders
+    order-count columns.
+    """
+    engine = sqlalchemy_engines.get(brand_index)
+    if not engine:
+        return
+
+    statements = (
+        "ALTER TABLE hour_wise_sales ADD COLUMN cod_sales DECIMAL(12,2) DEFAULT 0",
+        "ALTER TABLE hour_wise_sales ADD COLUMN prepaid_sales DECIMAL(12,2) DEFAULT 0",
+        "ALTER TABLE hour_wise_sales ADD COLUMN partially_prepaid_sales DECIMAL(12,2) DEFAULT 0",
+    )
+    try:
+        with engine.connect() as conn:
+            for sql in statements:
+                try:
+                    conn.execute(text(sql))
+                    conn.commit()
+                except Exception as e:
+                    if "Duplicate column name" in str(e):
+                        continue
+    except Exception:
+        pass
+
+
+def ensure_overall_summary_payment_sales_columns(brand_index: int) -> None:
+    """
+    Ensure cod_sales, prepaid_sales, partially_prepaid_sales exist in
+    overall_summary - the sales-amount counterparts of the existing
+    cod_orders/prepaid_orders/partially_paid_orders order-count columns.
+    """
+    engine = sqlalchemy_engines.get(brand_index)
+    if not engine:
+        return
+
+    statements = (
+        "ALTER TABLE overall_summary ADD COLUMN cod_sales DECIMAL(12,2) DEFAULT 0",
+        "ALTER TABLE overall_summary ADD COLUMN prepaid_sales DECIMAL(12,2) DEFAULT 0",
+        "ALTER TABLE overall_summary ADD COLUMN partially_prepaid_sales DECIMAL(12,2) DEFAULT 0",
+    )
+    try:
+        with engine.connect() as conn:
+            for sql in statements:
+                try:
+                    conn.execute(text(sql))
+                    conn.commit()
+                except Exception as e:
+                    if "Duplicate column name" in str(e):
+                        continue
+    except Exception:
+        pass
+
+
 def run_brand_preflight_schema_migrations(brand_index: int) -> None:
     brand_name = os.environ.get(f"BRAND_NAME_{brand_index}", f"Brand_{brand_index}")
     logger.info(f"🧱 Running preflight schema migrations for {brand_name}")
@@ -237,6 +321,9 @@ def run_brand_preflight_schema_migrations(brand_index: int) -> None:
     ensure_ci_events_column(brand_index, "hourly_sessions_summary_shopify")
     ensure_buy_now_events_column(brand_index, "hourly_sessions_summary_shopify")
     ensure_overall_summary_event_columns(brand_index)
+    ensure_hour_wise_ppcod_column(brand_index)
+    ensure_hour_wise_payment_sales_columns(brand_index)
+    ensure_overall_summary_payment_sales_columns(brand_index)
     ensure_utm_names_column(brand_index, "overall_utm_summary")
     logger.info(f"✅ Preflight schema migrations complete for {brand_name}")
 
@@ -350,6 +437,9 @@ def ensure_summary_tables(cursor, connection):
                 rto_cod_orders_returned INT DEFAULT 0,
                 rto_prepaid_orders_returned INT DEFAULT 0,
                 rto_partially_paid_orders_returned INT DEFAULT 0,
+                overall_cod_sales DECIMAL(12,2) DEFAULT 0,
+                overall_prepaid_sales DECIMAL(12,2) DEFAULT 0,
+                overall_partially_paid_sales DECIMAL(12,2) DEFAULT 0,
                 KEY idx_date (date)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
@@ -365,6 +455,9 @@ def ensure_summary_tables(cursor, connection):
                 "rto_cod_orders_returned": "INT DEFAULT 0 AFTER rto_number_of_orders_returned",
                 "rto_prepaid_orders_returned": "INT DEFAULT 0 AFTER rto_cod_orders_returned",
                 "rto_partially_paid_orders_returned": "INT DEFAULT 0 AFTER rto_prepaid_orders_returned",
+                "overall_cod_sales": "DECIMAL(12,2) DEFAULT 0 AFTER rto_partially_paid_orders_returned",
+                "overall_prepaid_sales": "DECIMAL(12,2) DEFAULT 0 AFTER overall_cod_sales",
+                "overall_partially_paid_sales": "DECIMAL(12,2) DEFAULT 0 AFTER overall_prepaid_sales",
             }
             for col, definition in migrations.items():
                 if col not in existing_cols:
@@ -422,6 +515,10 @@ def ensure_summary_tables(cursor, connection):
                 total_sales DECIMAL(12,2) DEFAULT 0,
                 number_of_prepaid_orders INT DEFAULT 0,
                 number_of_cod_orders INT DEFAULT 0,
+                number_of_ppcod_orders INT DEFAULT 0,
+                cod_sales DECIMAL(12,2) DEFAULT 0,
+                prepaid_sales DECIMAL(12,2) DEFAULT 0,
+                partially_prepaid_sales DECIMAL(12,2) DEFAULT 0,
                 number_of_sessions INT DEFAULT 0,
                 number_of_atc_sessions INT DEFAULT 0,
                 PRIMARY KEY (date, hour),
@@ -536,6 +633,9 @@ def ensure_summary_tables(cursor, connection):
                 cod_orders INT DEFAULT 0,
                 prepaid_orders INT DEFAULT 0,
                 partially_paid_orders INT DEFAULT 0,
+                cod_sales DECIMAL(12,2) DEFAULT 0,
+                prepaid_sales DECIMAL(12,2) DEFAULT 0,
+                partially_prepaid_sales DECIMAL(12,2) DEFAULT 0,
                 total_sessions INT DEFAULT 0,
                 total_atc_sessions INT DEFAULT 0,
                 adjusted_total_sessions INT DEFAULT 0,

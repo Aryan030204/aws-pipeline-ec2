@@ -312,7 +312,8 @@ def update_order_summary_incremental(
             cod_orders, prepaid_orders, partially_paid_orders,
             overall_cod_orders, overall_prepaid_orders, overall_partially_paid_orders,
             rto_number_of_orders_returned, rto_cod_orders_returned,
-            rto_prepaid_orders_returned, rto_partially_paid_orders_returned
+            rto_prepaid_orders_returned, rto_partially_paid_orders_returned,
+            overall_cod_sales, overall_prepaid_sales, overall_partially_paid_sales
         )
         WITH OrderHeaders AS (
             SELECT
@@ -337,7 +338,10 @@ def update_order_summary_incremental(
             SUM(rto_orders_returned) AS rto_number_of_orders_returned,
             SUM(rto_cod_returned) AS rto_cod_orders_returned,
             SUM(rto_prepaid_returned) AS rto_prepaid_orders_returned,
-            SUM(rto_partially_paid_returned) AS rto_partially_paid_orders_returned
+            SUM(rto_partially_paid_returned) AS rto_partially_paid_orders_returned,
+            SUM(cod_sales_created) AS overall_cod_sales,
+            SUM(prepaid_sales_created) AS overall_prepaid_sales,
+            SUM(partially_paid_sales_created) AS overall_partially_paid_sales
         FROM (
             SELECT 
                 STR_TO_DATE(created_date, '%Y-%m-%d') AS date,
@@ -367,15 +371,33 @@ def update_order_summary_incremental(
                 0 AS all_prepaid_returned,
 
                 -- Partially paid created (Gokwik PPCOD)
-                COUNT(DISTINCT CASE 
-                    WHEN payment_gateway_names LIKE '%Gokwik PPCOD%' 
+                COUNT(DISTINCT CASE
+                    WHEN payment_gateway_names LIKE '%Gokwik PPCOD%'
                     THEN order_id END) AS partially_paid_created,
 
                 0 AS all_partially_paid_returned,
                 0 AS rto_orders_returned,
                 0 AS rto_cod_returned,
                 0 AS rto_prepaid_returned,
-                0 AS rto_partially_paid_returned
+                0 AS rto_partially_paid_returned,
+
+                SUM(CASE
+                    WHEN (payment_gateway_names IS NULL
+                      OR payment_gateway_names = ''
+                      OR payment_gateway_names LIKE '%Cash on Delivery (COD)%'
+                      OR payment_gateway_names LIKE '%cash_on_delivery%')
+                      AND (payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR payment_gateway_names IS NULL)
+                    THEN COALESCE(total_price, 0) ELSE 0 END) AS cod_sales_created,
+                SUM(CASE
+                    WHEN payment_gateway_names IS NOT NULL
+                      AND payment_gateway_names != ''
+                      AND NOT (payment_gateway_names LIKE '%Cash on Delivery (COD)%'
+                          OR payment_gateway_names LIKE '%cash_on_delivery%'
+                          OR payment_gateway_names LIKE '%Gokwik PPCOD%')
+                    THEN COALESCE(total_price, 0) ELSE 0 END) AS prepaid_sales_created,
+                SUM(CASE
+                    WHEN payment_gateway_names LIKE '%Gokwik PPCOD%'
+                    THEN COALESCE(total_price, 0) ELSE 0 END) AS partially_paid_sales_created
 
             FROM shopify_orders
             WHERE created_date IN ({placeholders})
@@ -410,7 +432,10 @@ def update_order_summary_incremental(
                 0 AS rto_orders_returned,
                 0 AS rto_cod_returned,
                 0 AS rto_prepaid_returned,
-                0 AS rto_partially_paid_returned
+                0 AS rto_partially_paid_returned,
+                0 AS cod_sales_created,
+                0 AS prepaid_sales_created,
+                0 AS partially_paid_sales_created
             FROM returns_fact rf
             INNER JOIN OrderHeaders h
                 ON h.order_id = CAST(rf.order_id AS CHAR)
@@ -448,7 +473,10 @@ def update_order_summary_incremental(
                     THEN 1 END) AS rto_prepaid_returned,
                 COUNT(CASE
                     WHEN h.payment_gateway_names LIKE '%Gokwik PPCOD%'
-                    THEN 1 END) AS rto_partially_paid_returned
+                    THEN 1 END) AS rto_partially_paid_returned,
+                0 AS cod_sales_created,
+                0 AS prepaid_sales_created,
+                0 AS partially_paid_sales_created
             FROM returns_fact rf
             INNER JOIN OrderHeaders h
                 ON h.order_id = CAST(rf.order_id AS CHAR)
@@ -638,8 +666,9 @@ def update_hour_wise_sales_incremental(
         # STEP 3: Populate staging table
         sql = f"""
         INSERT INTO hour_wise_sales_stage (
-            date, hour, number_of_orders, total_sales, number_of_prepaid_orders, 
-            number_of_cod_orders, number_of_sessions, number_of_atc_sessions
+            date, hour, number_of_orders, total_sales, number_of_prepaid_orders,
+            number_of_cod_orders, number_of_ppcod_orders, cod_sales, prepaid_sales,
+            partially_prepaid_sales, number_of_sessions, number_of_atc_sessions
         )
         WITH HourlySales AS (
             SELECT
@@ -647,13 +676,26 @@ def update_hour_wise_sales_incremental(
                 HOUR(created_time) AS hour,
                 COUNT(DISTINCT order_id) AS number_of_orders,
                 SUM(COALESCE(total_price, 0)) AS total_sales,
-                COUNT(DISTINCT CASE WHEN (payment_gateway_names IS NOT NULL AND payment_gateway_names != '') 
-                    AND NOT (payment_gateway_names LIKE '%Cash on Delivery (COD)%' 
+                COUNT(DISTINCT CASE WHEN (payment_gateway_names IS NOT NULL AND payment_gateway_names != '')
+                    AND NOT (payment_gateway_names LIKE '%Cash on Delivery (COD)%'
                     OR payment_gateway_names LIKE '%cash_on_delivery%'
                     OR payment_gateway_names LIKE '%Gokwik PPCOD%') THEN order_id END) AS number_of_prepaid_orders,
-                COUNT(DISTINCT CASE WHEN (payment_gateway_names is NULL OR payment_gateway_names LIKE '%Cash on Delivery (COD)%' 
+                COUNT(DISTINCT CASE WHEN (payment_gateway_names is NULL OR payment_gateway_names LIKE '%Cash on Delivery (COD)%'
                     OR payment_gateway_names LIKE '%cash_on_delivery%')
-                    AND (payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR payment_gateway_names is NULL) THEN order_id END) AS number_of_cod_orders
+                    AND (payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR payment_gateway_names is NULL) THEN order_id END) AS number_of_cod_orders,
+                COUNT(DISTINCT CASE WHEN payment_gateway_names LIKE '%Gokwik PPCOD%'
+                    THEN order_id END) AS number_of_ppcod_orders,
+                SUM(CASE WHEN (payment_gateway_names is NULL OR payment_gateway_names LIKE '%Cash on Delivery (COD)%'
+                    OR payment_gateway_names LIKE '%cash_on_delivery%')
+                    AND (payment_gateway_names NOT LIKE '%Gokwik PPCOD%' OR payment_gateway_names is NULL)
+                    THEN COALESCE(total_price, 0) ELSE 0 END) AS cod_sales,
+                SUM(CASE WHEN (payment_gateway_names IS NOT NULL AND payment_gateway_names != '')
+                    AND NOT (payment_gateway_names LIKE '%Cash on Delivery (COD)%'
+                    OR payment_gateway_names LIKE '%cash_on_delivery%'
+                    OR payment_gateway_names LIKE '%Gokwik PPCOD%')
+                    THEN COALESCE(total_price, 0) ELSE 0 END) AS prepaid_sales,
+                SUM(CASE WHEN payment_gateway_names LIKE '%Gokwik PPCOD%'
+                    THEN COALESCE(total_price, 0) ELSE 0 END) AS partially_prepaid_sales
             FROM shopify_orders
             WHERE created_date IN ({placeholders})
                 AND created_time IS NOT NULL
@@ -674,12 +716,16 @@ def update_hour_wise_sales_incremental(
             SELECT date, hour FROM HourlySessions
         )
         SELECT
-            ak.date, 
-            ak.hour, 
-            COALESCE(hs.number_of_orders, 0) AS number_of_orders, 
+            ak.date,
+            ak.hour,
+            COALESCE(hs.number_of_orders, 0) AS number_of_orders,
             COALESCE(hs.total_sales, 0) AS total_sales,
-            COALESCE(hs.number_of_prepaid_orders, 0) AS number_of_prepaid_orders, 
+            COALESCE(hs.number_of_prepaid_orders, 0) AS number_of_prepaid_orders,
             COALESCE(hs.number_of_cod_orders, 0) AS number_of_cod_orders,
+            COALESCE(hs.number_of_ppcod_orders, 0) AS number_of_ppcod_orders,
+            COALESCE(hs.cod_sales, 0) AS cod_sales,
+            COALESCE(hs.prepaid_sales, 0) AS prepaid_sales,
+            COALESCE(hs.partially_prepaid_sales, 0) AS partially_prepaid_sales,
             COALESCE(ss.number_of_sessions, 0) AS number_of_sessions,
             COALESCE(ss.number_of_atc_sessions, 0) AS number_of_atc_sessions
         FROM AllKeys ak
@@ -1099,6 +1145,7 @@ def update_overall_summary_incremental(
         INSERT INTO overall_summary_stage (
             date, gross_sales, total_discount_amount, total_sales, net_sales,
             total_orders, cod_orders, prepaid_orders, partially_paid_orders,
+            cod_sales, prepaid_sales, partially_prepaid_sales,
             total_sessions, total_atc_sessions, adjusted_total_sessions
         )
         SELECT
@@ -1111,6 +1158,9 @@ def update_overall_summary_incremental(
             COALESCE(o.overall_cod_orders, 0)             AS cod_orders,
             COALESCE(o.overall_prepaid_orders, 0)         AS prepaid_orders,
             COALESCE(o.overall_partially_paid_orders, 0)  AS partially_paid_orders,
+            COALESCE(o.overall_cod_sales, 0)              AS cod_sales,
+            COALESCE(o.overall_prepaid_sales, 0)          AS prepaid_sales,
+            COALESCE(o.overall_partially_paid_sales, 0)   AS partially_prepaid_sales,
             COALESCE(sess.number_of_sessions, 0)          AS total_sessions,
             COALESCE(sess.number_of_atc_sessions, 0)      AS total_atc_sessions,
             ROUND(
