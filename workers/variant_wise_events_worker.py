@@ -19,6 +19,7 @@ Business logic (dedup rule, dynamic column discovery) is not duplicated here.
 
 import logging
 import os
+import sys
 from datetime import date, datetime, timedelta
 from typing import List, Optional
 from zoneinfo import ZoneInfo
@@ -33,6 +34,15 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+# When run directly (`python workers/variant_wise_events_worker.py`, which is
+# how the Dockerfile/CMD invokes it), Python sets sys.path[0] to this script's
+# own directory (workers/), not the repo root - so aws_background.py (at the
+# repo root) isn't importable without this. Same pattern every script under
+# backfill scripts/ already uses to reach aws_background.py.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
 
 import aws_background
 
