@@ -42,7 +42,7 @@ from pipeline.db import (
 from pipeline.schema_migrations import ensure_summary_tables, run_brand_preflight_schema_migrations
 from pipeline.notifications import (
     _derive_error_code,
-    trigger_pipeline_completion_webhook,
+    trigger_cache_pipeline,
     trigger_utm_pipeline,
 )
 from pipeline.shopify_orders import (
@@ -758,8 +758,8 @@ def run_data_pipeline():
         )
         logger.info(f"Total Duration: {dur:.2f}s ({dur / 60:.2f} minutes)\n{'=' * 60}")
 
-        # Trigger completion webhook
-        trigger_pipeline_completion_webhook()
+        # Trigger cache pipeline rebuild
+        trigger_cache_pipeline()
 
         # --- NEW: UTM Pipeline API Trigger ---
         trigger_utm_pipeline("ETL_COMPLETED", job_id)

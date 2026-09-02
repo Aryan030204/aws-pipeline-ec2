@@ -6,6 +6,7 @@ classification used for the manager-failure webhook payload.
 
 import asyncio
 import os
+import threading
 from datetime import datetime
 from typing import Optional
 
@@ -67,9 +68,6 @@ def _derive_error_code(exc: Optional[BaseException]) -> str:
 QSTASH_TOKEN = os.environ.get("QSTASH_TOKEN")
 ALERTS_WEBHOOK_URL = os.environ.get("ALERTS_WEBHOOK_URL")
 
-# New: QStash Completion Token
-QSTASH_COMPLETION_TOKEN = os.environ.get("QSTASH_COMPLETION_TOKEN")
-
 _qstash_client: Optional["QStash"] = None
 
 
@@ -107,44 +105,51 @@ def get_qstash_client() -> Optional["QStash"]:
     return _qstash_client
 
 
-def trigger_pipeline_completion_webhook():
-    """
-    Triggers a QStash webhook via the QStash Publish API.
-    Retries are handled by QStash.
-    """
-    if not QSTASH_TOKEN or not QSTASH_COMPLETION_TOKEN:
-        logger.warning("Skipping QStash: Token(s) missing.")
-        return
+# ---------------------------
+# Cache pipeline trigger
+# ---------------------------
+# Cache pipeline now runs as a container on the same Docker network as this
+# pipeline, so it's triggered with a direct GET instead of routing through
+# QStash.
+CACHE_PIPELINE_TRIGGER_URL = os.environ.get(
+    "CACHE_PIPELINE_TRIGGER_URL", "http://cache-pipeline:8080/trigger-pipeline"
+)
 
-    if aws_background.TEST_MODE:
-        logger.info("Skipping QStash completion webhook (TEST_MODE)")
-        return
 
-    # Target URL is the QStash Publish endpoint wrapping the destination
-    destination_urls = ["https://etl-cache-pipeline.onrender.com/qstash"]
-
-    headers = {
-        "Authorization": f"Bearer {QSTASH_TOKEN}",
-        "Upstash-Forward-Authorization": f"Bearer {QSTASH_COMPLETION_TOKEN}",
-        "Content-Type": "application/json",
-    }
-
-    for destination_url in destination_urls:
-        qstash_url = f"https://qstash.upstash.io/v2/publish/{destination_url}"
+def _do_trigger_cache_pipeline():
+    """Runs in a background thread - see trigger_cache_pipeline() below."""
+    try:
+        resp = http_session.get(CACHE_PIPELINE_TRIGGER_URL, timeout=600)
         try:
-            # We can use a short timeout because QStash accepts the request immediately (millisecond latency)
-            resp = requests.post(qstash_url, headers=headers, json={}, timeout=10)
+            body = resp.json()
+            status = body.get("status", "unknown")
+            brand_count = len(body.get("results") or {})
+            logger.info(
+                f"✅ Cache pipeline trigger completed: status={status}, brands={brand_count}"
+            )
+        except ValueError:
+            logger.info(
+                f"✅ Cache pipeline trigger completed: HTTP {resp.status_code}"
+            )
+    except Exception as e:
+        logger.error(f"❌ Cache pipeline trigger failed: {e}")
 
-            if resp.status_code in (200, 201):
-                logger.info(
-                    f"✅ QStash Publish API accepted the message for {destination_url} (Async delivery started)."
-                )
-            else:
-                logger.error(
-                    f"❌ QStash Publish failed for {destination_url}: {resp.status_code} {resp.text}"
-                )
-        except Exception as e:
-            logger.error(f"❌ QStash Publish error for {destination_url}: {e}")
+
+def trigger_cache_pipeline():
+    """
+    Fires a GET request to the cache pipeline's trigger endpoint. The
+    request runs in a background thread so the ETL run doesn't block
+    waiting for the cache rebuild to finish (it can take a while across all
+    brands/dates) - this function returns immediately after starting the
+    thread. Whenever the response does come back, only a compact summary
+    is logged, not the full per-brand/per-date JSON body.
+    """
+    if aws_background.TEST_MODE:
+        logger.info("Skipping cache pipeline trigger (TEST_MODE)")
+        return
+
+    logger.info(f"🚀 Triggering cache pipeline: {CACHE_PIPELINE_TRIGGER_URL}")
+    threading.Thread(target=_do_trigger_cache_pipeline, daemon=True).start()
 
 
 # ---------------------------
