@@ -14,9 +14,11 @@ For every brand it manages, the pipeline:
 - Pulls session and traffic data via ShopifyQL (Shopify's analytics query language).
 - Syncs checkout-initiated and buy-now events from MongoDB.
 - Syncs page-speed ("web vitals") data from MongoDB.
-- Rebuilds dashboard summary tables — but only for the dates that actually changed, not the whole table.
-- Rolls up "bundle" product sales (currently TMC and PTS) — bundle products are discovered automatically by Shopify product type, not a hardcoded list.
+- Rebuilds dashboard summary tables — but only for the dates that actually changed, not the whole table — including a full payment-mode breakdown (COD, prepaid, partially-prepaid) for both order counts and sales amounts.
+- Tracks any checkout/session event type per product variant, not just checkout-initiated and buy-now — new event types are discovered automatically and get their own column, via a separate daily worker.
+- Rolls up "bundle" product sales (currently TMC and PTS) — bundle products are discovered automatically from the Shopify product catalog (active products only), not a hardcoded list.
 - Sends live alerts to QStash: sales/session numbers and page-speed averages, per brand.
+- Triggers the downstream cache pipeline directly after each run finishes, so dashboards pick up fresh data.
 
 Each brand is fully isolated — its own database, its own Shopify store, its own failure boundary. If one brand's run fails, the others still complete.
 
@@ -46,8 +48,9 @@ The pipeline used to be a single ~10,000-line file. It's now split into focused 
 | `pipeline/utm_traffic.py` | UTM and referrer attribution |
 | `pipeline/notifications.py` | QStash alerts and webhook triggers |
 | `pipeline/orchestration.py` | Runs everything above, per brand, per pipeline tick |
-| `bundle_rollups.py` | Bundle product discovery and sales rollups (TMC, PTS) |
+| `bundle_rollups.py` | Bundle product discovery (via the Shopify Admin API, active products only) and sales rollups (TMC, PTS) |
 | `workers/events_summary_worker.py` | A separate, smaller worker that rolls up daily event totals — runs as its own Docker container |
+| `workers/variant_wise_events_worker.py` | A separate worker that rolls up any Mongo event type, per product variant, into each brand's own database — runs as its own Docker container |
 | `backfill scripts/` | Standalone scripts for re-running specific pieces of the pipeline over a historical date range |
 
 ## Configuration
@@ -110,10 +113,11 @@ curl -X POST http://localhost:5000/trigger \
 
 ## Deployment
 
-Runs as two Docker services (see `docker-compose.yml`):
+Runs as three Docker services (see `docker-compose.yml`):
 
 - **`shopify-pipeline`** — the main pipeline described above.
 - **`events-summary-worker`** — a separate container that rolls up daily event totals across all brands into one summary table, on its own daily schedule.
+- **`variant-wise-events-worker`** — a separate container that rolls up any Mongo event type, per product variant, into each brand's own database, on its own daily schedule.
 
 To deploy an update on the server: pull the latest code on the branch that's live, rebuild, and restart:
 
@@ -122,6 +126,12 @@ git pull origin master
 docker compose build shopify-pipeline
 docker compose up -d shopify-pipeline
 ```
+
+### Cache pipeline trigger
+
+The cache pipeline runs as its own container (`cache-pipeline`) on the same EC2 host, joined to the same Docker network (`pipeline-net`) as `shopify-pipeline`. After each full run finishes, the pipeline fires a plain `GET http://cache-pipeline:8080/trigger-pipeline` — no QStash involved, just a direct container-to-container call over the shared network.
+
+This request runs in a background thread, so the pipeline doesn't wait for the cache rebuild to finish before moving on. Whenever the response does come back, only a short summary (status + brand count) is logged — not the full per-brand/per-date result body.
 
 ## Testing
 
@@ -140,8 +150,10 @@ Covers brand-activation filtering, bundle rollup logic, UTM source mapping, and 
 | Orders & addresses | `backfill_shopify.py`, `backfill_shopify_order_addresses.py`, `backfill_shopify_order_tags.py` |
 | Returns / RTO | `backfill_returns_fact_order_created_date.py`, `backfill_rto_summary.py` |
 | Checkout / buy-now events | `backfill_checkout_initiated_ci_events.py`, `backfill_buy_now_events.py`, and their variant-level counterparts |
+| Variant-wise events | `backfill_variant_wise_events_summary.py` |
 | Sessions & web vitals | `backfill_hourly_sessions.py`, `backfill_web_vitals_summary.py`, `backfill_daily_web_vitals_summary.py` |
 | UTM & traffic | `utm_sessions_backfill.py`, `referrer_sessions_backfill.py`, `backfill_product_traffic_split.py` |
 | Bundles | `bundle_rollup_backfill.py` |
+| Payment mode breakdown | `backfill_payment_mode_breakdown_columns.py` — cod/prepaid/ppcod order counts and sales amounts only, on `hour_wise_sales` and `overall_summary` |
 
 Each script is run directly with Python and reads the same brand configuration as the main pipeline.

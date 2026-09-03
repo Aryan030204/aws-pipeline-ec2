@@ -59,7 +59,7 @@ def arrow(draw, x0, y0, x1, y1, color=GRAY, width=3):
 
 
 def draw_architecture_diagram(path):
-    W, H = 1200, 560
+    W, H = 1200, 660
     img = Image.new("RGB", (W, H), WHITE)
     d = ImageDraw.Draw(img)
 
@@ -74,7 +74,7 @@ def draw_architecture_diagram(path):
     shopify_box = (src_x0, 130, src_x0 + src_w, 220)
     mongo_box = (src_x0, 250, src_x0 + src_w, 340)
     draw_box(d, shopify_box, "Shopify", BLUE_LIGHT, BLUE, sub="Admin REST API + ShopifyQL", f_title=f_title, f_sub=f_sub)
-    draw_box(d, mongo_box, "MongoDB", GREEN_LIGHT, GREEN, sub="checkout / buy-now events, web vitals", f_title=f_title, f_sub=f_sub)
+    draw_box(d, mongo_box, "MongoDB", GREEN_LIGHT, GREEN, sub="checkout / buy-now / other events\nweb vitals", f_title=f_title, f_sub=f_sub)
 
     # Pipeline (center)
     pipe_x0 = 420
@@ -83,26 +83,31 @@ def draw_architecture_diagram(path):
 
     # Outputs (right column)
     out_x0, out_w = 850, 300
-    mysql_box = (out_x0, 100, out_x0 + out_w, 210)
-    qstash_box = (out_x0, 250, out_x0 + out_w, 360)
+    mysql_box = (out_x0, 90, out_x0 + out_w, 185)
+    qstash_box = (out_x0, 215, out_x0 + out_w, 310)
+    cache_box = (out_x0, 340, out_x0 + out_w, 435)
     draw_box(d, mysql_box, "Per-brand MySQL DBs", BLUE_LIGHT, BLUE, sub="orders, summaries, rollups", f_title=f_title, f_sub=f_sub)
     draw_box(d, qstash_box, "QStash", GREEN_LIGHT, GREEN, sub="sales + web-vitals alerts", f_title=f_title, f_sub=f_sub)
+    draw_box(d, cache_box, "Cache Pipeline", GRAY_LIGHT, GRAY, sub="direct GET, same Docker network\n(no longer via QStash)", f_title=f_title, f_sub=f_sub)
 
     # Arrows in
     arrow(d, src_x0 + src_w, 175, pipe_x0, 200)
     arrow(d, src_x0 + src_w, 295, pipe_x0, 260)
     # Arrows out
-    arrow(d, pipe_x0 + 340, 210, out_x0, 155)
-    arrow(d, pipe_x0 + 340, 280, out_x0, 305)
+    arrow(d, pipe_x0 + 340, 190, out_x0, 137)
+    arrow(d, pipe_x0 + 340, 260, out_x0, 262)
+    arrow(d, pipe_x0 + 340, 320, out_x0, 387)
 
     # Bottom strip: brands
-    d.text((40, 420), "Each brand (TMC, PTS, Ajmal, BBB, Neulife, Vama, ...) has its own isolated database and Shopify store,",
+    d.text((40, 480), "Each brand (TMC, PTS, Ajmal, BBB, Neulife, Vama, ...) has its own isolated database and Shopify store,",
            font=f_sub, fill=GRAY)
-    d.text((40, 442), "processed independently every pipeline run — one brand's failure never blocks another.",
+    d.text((40, 502), "processed independently every pipeline run — one brand's failure never blocks another.",
            font=f_sub, fill=GRAY)
 
     # Trigger note
-    d.text((40, 500), "Triggered by: APScheduler cron (:00 :10 :20 :30 :40 :50) — or POST /trigger for an immediate manual run.",
+    d.text((40, 560), "Triggered by: APScheduler cron (:00 :10 :20 :30 :40 :50) — or POST /trigger for an immediate manual run.",
+           font=f_sub, fill=GRAY)
+    d.text((40, 582), "After each run completes, the pipeline fires a background trigger to Cache Pipeline and does not wait for it to finish.",
            font=f_sub, fill=GRAY)
 
     img.save(path)

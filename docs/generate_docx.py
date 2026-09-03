@@ -97,10 +97,18 @@ def build():
             "Pulls session and traffic data via ShopifyQL (Shopify's analytics query language).",
             "Syncs checkout-initiated and buy-now events from MongoDB.",
             "Syncs page-speed (“web vitals”) data from MongoDB.",
-            "Rebuilds dashboard summary tables incrementally, only for changed dates.",
+            "Rebuilds dashboard summary tables incrementally, only for changed dates — including a "
+            "full payment-mode breakdown (COD, prepaid, partially-prepaid) for both order counts "
+            "and sales amounts.",
+            "Tracks any checkout/session event type per product variant, not just checkout-initiated "
+            "and buy-now — new event types are discovered automatically and get their own column, "
+            "via a separate daily worker.",
             "Rolls up “bundle” product sales (TMC and PTS today) — bundle products are "
-            "discovered automatically by Shopify product type, not a hardcoded list.",
+            "discovered automatically from the Shopify product catalog (active products only), "
+            "not a hardcoded list.",
             "Sends live alerts to QStash: sales/session numbers and page-speed averages, per brand.",
+            "Triggers the downstream cache pipeline directly after each run finishes, so "
+            "dashboards pick up fresh data.",
         ],
     )
     add_body(
@@ -146,8 +154,9 @@ def build():
             ("pipeline/utm_traffic.py", "UTM and referrer attribution"),
             ("pipeline/notifications.py", "QStash alerts and webhook triggers"),
             ("pipeline/orchestration.py", "Runs everything above, per brand, per pipeline tick"),
-            ("bundle_rollups.py", "Bundle product discovery and sales rollups (TMC, PTS)"),
+            ("bundle_rollups.py", "Bundle product discovery (Shopify Admin API, active products only) and sales rollups (TMC, PTS)"),
             ("workers/events_summary_worker.py", "Separate worker rolling up daily event totals, own Docker container"),
+            ("workers/variant_wise_events_worker.py", "Separate worker rolling up any Mongo event type per product variant, own Docker container"),
             ("backfill scripts/", "Standalone scripts to re-run specific pieces over a historical date range"),
         ],
     )
@@ -206,9 +215,10 @@ def build():
     add_h1(doc, "Deployment")
     add_body(
         doc,
-        "Runs as two Docker services (see docker-compose.yml): shopify-pipeline (the main "
-        "pipeline) and events-summary-worker (a separate container rolling up daily event "
-        "totals across all brands, on its own daily schedule).",
+        "Runs as three Docker services (see docker-compose.yml): shopify-pipeline (the main "
+        "pipeline), events-summary-worker (rolls up daily event totals across all brands, on "
+        "its own daily schedule), and variant-wise-events-worker (rolls up any Mongo event "
+        "type per product variant, into each brand's own database, on its own daily schedule).",
     )
     add_body(doc, "To deploy an update on the server:")
     add_bullets(
@@ -218,6 +228,21 @@ def build():
             "docker compose build shopify-pipeline",
             "docker compose up -d shopify-pipeline",
         ],
+    )
+
+    add_h2(doc, "Cache pipeline trigger")
+    add_body(
+        doc,
+        "The cache pipeline runs as its own container (cache-pipeline) on the same EC2 host, "
+        "joined to the same Docker network (pipeline-net) as shopify-pipeline. After each full "
+        "run finishes, the pipeline fires a plain GET http://cache-pipeline:8080/trigger-pipeline "
+        "— no QStash involved, just a direct container-to-container call over the shared network.",
+    )
+    add_body(
+        doc,
+        "This request runs in a background thread, so the pipeline doesn't wait for the cache "
+        "rebuild to finish before moving on. Whenever the response does come back, only a short "
+        "summary (status + brand count) is logged — not the full per-brand/per-date result body.",
     )
 
     add_h1(doc, "Testing")
@@ -243,9 +268,11 @@ def build():
             ("Orders & addresses", "backfill_shopify.py, backfill_shopify_order_addresses.py, backfill_shopify_order_tags.py"),
             ("Returns / RTO", "backfill_returns_fact_order_created_date.py, backfill_rto_summary.py"),
             ("Checkout / buy-now events", "backfill_checkout_initiated_ci_events.py, backfill_buy_now_events.py (+ variant-level)"),
+            ("Variant-wise events", "backfill_variant_wise_events_summary.py"),
             ("Sessions & web vitals", "backfill_hourly_sessions.py, backfill_web_vitals_summary.py, backfill_daily_web_vitals_summary.py"),
             ("UTM & traffic", "utm_sessions_backfill.py, referrer_sessions_backfill.py, backfill_product_traffic_split.py"),
             ("Bundles", "bundle_rollup_backfill.py"),
+            ("Payment mode breakdown", "backfill_payment_mode_breakdown_columns.py — cod/prepaid/ppcod orders & sales only, on hour_wise_sales and overall_summary"),
         ],
     )
 
