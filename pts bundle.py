@@ -6,6 +6,8 @@ import mysql.connector
 from collections import defaultdict
 from dotenv import load_dotenv
 
+import bundle_rollups
+
 # ===================== CONFIG ===================== #
 
 load_dotenv(".env.bundle")
@@ -41,22 +43,29 @@ END_DATE = "2026-08-10"
 
 OUTPUT_FILE = f"PTS_Bundle_Analysis_{START_DATE}_to_{END_DATE}--.xlsx"
 
-BUNDLE_MAP = {
-    10207672992019: "Buy any 3 at 999",
-    10386295914771: "Buy any 3 at 1299",
-    10219967578387: "Buy any 2 at 1199",
-    10169674989843: "Buy any 5 at 2599",
-    10207675154707: "Buy any 3 at 1499",
-    10199892361491: "Buy any 4 at 1999",
-    10304722731283: "PT Vanity Kit (S) At ₹ 999",
-    10305748271379: "Buy any 4 at 1499",
-    10360719573267: "BUY ANY 3 BATH TOWEL AT 1999",
-    10304723616019: "PT Vanity Kit (M) At ₹1999",
-    10360727634195: "BUY ANY 3 FACE TOWEL AT 999"
-}   
-
-BUNDLE_IDS = tuple(BUNDLE_MAP.keys())
+# Populated at the start of run_analysis() by discover_bundle_map() - no
+# hardcoded product-ID map to maintain. Bundle products are discovered
+# straight from the Shopify Admin API product catalog (active products,
+# product_type CYOB/BUNDLE), same mechanism as the live pipeline's
+# bundle_rollups.fetch_dynamic_bundle_products.
+BUNDLE_MAP = {}
+BUNDLE_IDS = ()
 ONLY_SPECIFIED_BUNDLES = True
+
+
+def discover_bundle_map():
+    """Fetch the current active bundle products for this shop and populate
+    BUNDLE_MAP/BUNDLE_IDS. Called once at the top of run_analysis()."""
+    global BUNDLE_MAP, BUNDLE_IDS
+
+    discovered = bundle_rollups.fetch_dynamic_bundle_products(
+        shop_name=SHOP_DOMAIN.removesuffix(".myshopify.com"),
+        access_token=SHOPIFY_TOKEN,
+        api_version=API_VERSION,
+    )
+    BUNDLE_MAP = {p["product_id"]: p["product_title"] for p in discovered}
+    BUNDLE_IDS = tuple(BUNDLE_MAP.keys())
+    print(f"Discovered {len(BUNDLE_MAP)} active bundle product(s) from Shopify.")
 
 
 # ===================== STEP 1 ===================== #
@@ -186,6 +195,8 @@ def extract_picked_products(line_item):
 # ===================== MAIN ===================== #
 
 def run_analysis():
+    discover_bundle_map()
+
     orders_df = fetch_bundle_orders()
     print(f"Bundle orders found: {orders_df}")
 
