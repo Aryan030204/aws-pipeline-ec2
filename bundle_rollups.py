@@ -16,9 +16,9 @@ def _parse_csv_set(env_name: str, default: str) -> Set[str]:
     return {v.strip().lower() for v in raw.split(",") if v.strip()}
 
 
-BUNDLE_TARGET_BRAND_TAGS = _parse_csv_set("BUNDLE_TARGET_BRAND_TAG", "tmc,pts")
+BUNDLE_TARGET_BRAND_TAGS = _parse_csv_set("BUNDLE_TARGET_BRAND_TAG", "tmc,pts,bbb")
 BUNDLE_TARGET_SHOP_NAMES = _parse_csv_set(
-    "BUNDLE_TARGET_SHOP_NAME", "the-man-company,skincarepersonaltouch"
+    "BUNDLE_TARGET_SHOP_NAME", "the-man-company,skincarepersonaltouch,pypyyn-d1"
 )
 EXECUTEMANY_CHUNK_SIZE = int(os.environ.get("EXECUTEMANY_CHUNK_SIZE", "1000"))
 ITEM_COLUMN_COUNT = 10

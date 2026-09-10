@@ -232,6 +232,14 @@ class BundleRollupTests(unittest.TestCase):
             bundle_rollups.is_bundle_rollup_brand("Some Other Brand", "other", "some-other-shop")
         )
 
+    def test_is_bundle_rollup_brand_matches_bbb(self):
+        self.assertTrue(
+            bundle_rollups.is_bundle_rollup_brand("BlaBliBluLife", "bbb", "pypyyn-d1")
+        )
+        self.assertTrue(
+            bundle_rollups.is_bundle_rollup_brand(None, None, "pypyyn-d1")
+        )
+
     def test_extract_bundle_children_uses_bundle_product_properties(self):
         row = {
             "order_id": "6001",
