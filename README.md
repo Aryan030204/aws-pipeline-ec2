@@ -51,6 +51,7 @@ The pipeline used to be a single ~10,000-line file. It's now split into focused 
 | `bundle_rollups.py` | Bundle product discovery (via the Shopify Admin API, active products only) and sales rollups (TMC, PTS) |
 | `workers/events_summary_worker.py` | A separate, smaller worker that rolls up daily event totals — runs as its own Docker container |
 | `workers/variant_wise_events_worker.py` | A separate worker that rolls up any Mongo event type, per product variant, into each brand's own database — runs as its own Docker container |
+| `workers/checkout_login_status_worker.py` | A separate worker that rolls up daily checkout counts by logged-in/non-logged-in status, per brand and per variant — runs as its own Docker container |
 | `backfill scripts/` | Standalone scripts for re-running specific pieces of the pipeline over a historical date range |
 
 ## Configuration
@@ -113,19 +114,14 @@ curl -X POST http://localhost:5000/trigger \
 
 ## Deployment
 
-Runs as three Docker services (see `docker-compose.yml`):
+Runs as four Docker services (see `docker-compose.yml`):
 
 - **`shopify-pipeline`** — the main pipeline described above.
 - **`events-summary-worker`** — a separate container that rolls up daily event totals across all brands into one summary table, on its own daily schedule.
 - **`variant-wise-events-worker`** — a separate container that rolls up any Mongo event type, per product variant, into each brand's own database, on its own daily schedule.
+- **`checkout-login-status-worker`** — a separate container that rolls up daily checkout counts by logged-in/non-logged-in status, per brand, on its own daily schedule (00:05 IST).
 
-To deploy an update on the server: pull the latest code on the branch that's live, rebuild, and restart:
-
-```bash
-git pull origin master
-docker compose build shopify-pipeline
-docker compose up -d shopify-pipeline
-```
+Deploys are automated via `.github/workflows/deploy.yml`: every push to `master` creates a workflow run that pulls, rebuilds, and restarts all four services on the EC2 host, then fires one immediate one-off run of `checkout-login-status-worker` (its own schedule is once a day, so a deploy doesn't otherwise take effect until the next scheduled tick) — but none of this ever runs on its own. It sits in "Waiting for review" until an authorized reviewer approves it from the Actions tab. See `docs/DEPLOYMENT.md` for the one-time setup (self-hosted runner + approval gate) and the manual fallback command sequence.
 
 ### Cache pipeline trigger
 

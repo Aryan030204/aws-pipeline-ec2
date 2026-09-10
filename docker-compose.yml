@@ -41,3 +41,16 @@ services:
       - pipeline-net
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  checkout-login-status-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.checkout-login-status-worker
+    container_name: checkout-login-status-worker
+    env_file:
+      - .env
+    restart: always
+    networks:
+      - pipeline-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

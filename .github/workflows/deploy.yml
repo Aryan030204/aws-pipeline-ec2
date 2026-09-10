@@ -1,0 +1,84 @@
+name: Deploy to EC2
+
+# Only ever fires on a push to master - not on any other branch, and not on
+# pull requests. The "production" environment below (configured in repo
+# Settings -> Environments, with a required reviewer) is what actually gates
+# the run: every trigger sits in "Waiting for review" until an authorized
+# reviewer approves it in the Actions tab. See docs/DEPLOYMENT.md for the
+# one-time setup this workflow depends on (self-hosted runner + environment
+# protection rule).
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    environment: production
+    timeout-minutes: 20
+    steps:
+      - name: Pull latest master
+        run: |
+          set -euo pipefail
+          DEPLOY_PATH="${DEPLOY_PATH:-$HOME/pipelines/aws-pipeline-ec2}"
+          echo "Deploying from: $DEPLOY_PATH"
+          cd "$DEPLOY_PATH"
+          git fetch origin master
+          git checkout master
+          git pull origin master
+        env:
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+
+      - name: Rebuild containers
+        run: |
+          set -euo pipefail
+          DEPLOY_PATH="${DEPLOY_PATH:-$HOME/pipelines/aws-pipeline-ec2}"
+          cd "$DEPLOY_PATH"
+          docker compose build shopify-pipeline events-summary-worker variant-wise-events-worker checkout-login-status-worker
+        env:
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+
+      - name: Restart containers
+        run: |
+          set -euo pipefail
+          DEPLOY_PATH="${DEPLOY_PATH:-$HOME/pipelines/aws-pipeline-ec2}"
+          cd "$DEPLOY_PATH"
+          docker compose up -d shopify-pipeline events-summary-worker variant-wise-events-worker checkout-login-status-worker
+        env:
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+
+      - name: Trigger an immediate checkout login-status run
+        # This worker's normal schedule is 00:05 IST daily (see
+        # workers/checkout_login_status_worker.py). On every deploy we also
+        # fire one immediate one-off run so a change doesn't have to wait
+        # for the next scheduled tick - via `docker compose exec` into the
+        # container that was just restarted above, invoking run_worker()
+        # directly in a fresh process. This does not disturb the
+        # container's own long-running scheduler process (still running as
+        # PID 1) - it's a second, independent process inside the same
+        # container, and it exits on its own when done.
+        run: |
+          set -euo pipefail
+          DEPLOY_PATH="${DEPLOY_PATH:-$HOME/pipelines/aws-pipeline-ec2}"
+          cd "$DEPLOY_PATH"
+          docker compose exec -T checkout-login-status-worker \
+            python -c "from workers.checkout_login_status_worker import run_worker; run_worker()"
+        env:
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+
+      - name: Show running containers
+        run: |
+          set -euo pipefail
+          DEPLOY_PATH="${DEPLOY_PATH:-$HOME/pipelines/aws-pipeline-ec2}"
+          cd "$DEPLOY_PATH"
+          docker compose ps
+        env:
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}

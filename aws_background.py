@@ -355,6 +355,9 @@ from pipeline.mongo_events import (
     sync_buy_now_variant_events,
     sync_variant_wise_events_summary,
 )
+from pipeline.checkout_login_status import (
+    sync_daily_checkout_login_status,
+)
 from pipeline.utm_traffic import (
     fetch_shopify_utm_sessions_daily,
     process_and_upload_utm_summary,
