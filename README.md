@@ -121,7 +121,21 @@ Runs as four Docker services (see `docker-compose.yml`):
 - **`variant-wise-events-worker`** — a separate container that rolls up any Mongo event type, per product variant, into each brand's own database, on its own daily schedule.
 - **`checkout-login-status-worker`** — a separate container that rolls up daily checkout counts by logged-in/non-logged-in status, per brand, on its own daily schedule (00:05 IST).
 
-Deploys are automated via `.github/workflows/deploy.yml`: every push to `master` creates a workflow run that connects to the EC2 host over SSH from a GitHub-hosted runner (nothing to install on EC2 itself), pulls, rebuilds, and restarts all four services, then fires one immediate one-off run of `checkout-login-status-worker` (its own schedule is once a day, so a deploy doesn't otherwise take effect until the next scheduled tick) — but none of this ever runs on its own. It sits in "Waiting for review" until an authorized reviewer approves it from the Actions tab. See `docs/DEPLOYMENT.md` for the one-time setup (SSH deploy key + approval gate) and the manual fallback command sequence.
+To deploy an update on the server: pull the latest code on the branch that's live, rebuild, and restart:
+
+```bash
+cd ~/pipelines/aws-pipeline-ec2
+git pull origin master
+docker compose build shopify-pipeline events-summary-worker variant-wise-events-worker checkout-login-status-worker
+docker compose up -d shopify-pipeline events-summary-worker variant-wise-events-worker checkout-login-status-worker
+```
+
+`checkout-login-status-worker`'s own schedule is once a day (00:05 IST), so after deploying a change to it, optionally trigger one immediate run instead of waiting for the next scheduled tick:
+
+```bash
+docker compose exec -T checkout-login-status-worker \
+  python -c "from workers.checkout_login_status_worker import run_worker; run_worker()"
+```
 
 ### Cache pipeline trigger
 
