@@ -121,7 +121,7 @@ Runs as four Docker services (see `docker-compose.yml`):
 - **`variant-wise-events-worker`** — a separate container that rolls up any Mongo event type, per product variant, into each brand's own database, on its own daily schedule.
 - **`checkout-login-status-worker`** — a separate container that rolls up daily checkout counts by logged-in/non-logged-in status, per brand, on its own daily schedule (00:05 IST).
 
-Deploys are automated via `.github/workflows/deploy.yml`: every push to `master` creates a workflow run that pulls, rebuilds, and restarts all four services on the EC2 host, then fires one immediate one-off run of `checkout-login-status-worker` (its own schedule is once a day, so a deploy doesn't otherwise take effect until the next scheduled tick) — but none of this ever runs on its own. It sits in "Waiting for review" until an authorized reviewer approves it from the Actions tab. See `docs/DEPLOYMENT.md` for the one-time setup (self-hosted runner + approval gate) and the manual fallback command sequence.
+Deploys are automated via `.github/workflows/deploy.yml`: every push to `master` creates a workflow run that connects to the EC2 host over SSH from a GitHub-hosted runner (nothing to install on EC2 itself), pulls, rebuilds, and restarts all four services, then fires one immediate one-off run of `checkout-login-status-worker` (its own schedule is once a day, so a deploy doesn't otherwise take effect until the next scheduled tick) — but none of this ever runs on its own. It sits in "Waiting for review" until an authorized reviewer approves it from the Actions tab. See `docs/DEPLOYMENT.md` for the one-time setup (SSH deploy key + approval gate) and the manual fallback command sequence.
 
 ### Cache pipeline trigger
 
