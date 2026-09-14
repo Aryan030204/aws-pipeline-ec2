@@ -358,6 +358,10 @@ from pipeline.mongo_events import (
 from pipeline.checkout_login_status import (
     sync_daily_checkout_login_status,
 )
+from pipeline.intent_events import (
+    _parse_intent_db_map,
+    sync_intent_events_for_brand,
+)
 from pipeline.utm_traffic import (
     fetch_shopify_utm_sessions_daily,
     process_and_upload_utm_summary,

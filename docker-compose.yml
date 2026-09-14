@@ -54,3 +54,16 @@ services:
       - pipeline-net
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  intent-events-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.intent-events-worker
+    container_name: intent-events-worker
+    env_file:
+      - .env
+    restart: always
+    networks:
+      - pipeline-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
