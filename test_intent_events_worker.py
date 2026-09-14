@@ -22,13 +22,10 @@ class IntentEventsWorkerTests(unittest.TestCase):
         self.assertIn("intent-events-worker:", content)
         self.assertIn("Dockerfile.intent-events-worker", content)
 
-    def test_scheduled_mode_uses_a_35_minute_interval_not_cron(self):
-        # 35 doesn't evenly divide 60, so this must be an IntervalTrigger,
-        # not a cron trigger with minute=*/35 (which would produce an
-        # uneven 25/35-minute cycle instead of a true "every 35 minutes").
+    def test_scheduled_mode_uses_a_15_minute_interval(self):
         source = inspect.getsource(worker._run_scheduled)
         self.assertIn('trigger="interval"', source)
-        self.assertIn("minutes=35", source)
+        self.assertIn("minutes=15", source)
         self.assertNotIn('trigger="cron"', source)
 
     def test_scheduled_mode_prevents_overlapping_runs(self):

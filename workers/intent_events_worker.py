@@ -104,12 +104,10 @@ def run_worker() -> None:
 def _run_scheduled() -> None:
     """
     Long-running mode for the standalone container: schedules run_worker
-    every 35 minutes. Uses an IntervalTrigger, not a cron trigger - 35
-    doesn't evenly divide 60, so `cron minute=*/35` would fire at :00 and
-    :35 of every hour (an uneven 25/35-minute cycle), not a true "every 35
-    minutes." IntervalTrigger(minutes=35) is the correct primitive for an
-    actual uniform 35-minute cadence. Set INTENT_EVENTS_WORKER_SELF_RUN=false
-    to instead run once and exit (e.g. for a one-off/manual invocation).
+    every 15 minutes via an IntervalTrigger (uniform cadence, anchored to
+    when the scheduler process starts - not fixed clock times like the
+    other daily workers). Set INTENT_EVENTS_WORKER_SELF_RUN=false to
+    instead run once and exit (e.g. for a one-off/manual invocation).
     """
     from apscheduler.schedulers.blocking import BlockingScheduler
 
@@ -117,13 +115,13 @@ def _run_scheduled() -> None:
     scheduler.add_job(
         run_worker,
         trigger="interval",
-        minutes=35,
+        minutes=15,
         id="intent_events_worker_job",
         coalesce=True,
         max_instances=1,
         misfire_grace_time=600,
     )
-    logger.info("Intent events worker scheduler started (every 35 minutes)")
+    logger.info("Intent events worker scheduler started (every 15 minutes)")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
