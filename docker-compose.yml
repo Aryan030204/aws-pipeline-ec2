@@ -67,3 +67,16 @@ services:
       - pipeline-net
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  pnl-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.pnl-worker
+    container_name: pnl-worker
+    env_file:
+      - .env
+    restart: always
+    networks:
+      - pipeline-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
