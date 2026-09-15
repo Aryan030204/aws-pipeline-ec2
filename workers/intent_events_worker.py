@@ -122,13 +122,21 @@ def run_worker() -> None:
 
 def _run_scheduled() -> None:
     """
-    Long-running mode for the standalone container: schedules run_worker
-    every 15 minutes via an IntervalTrigger (uniform cadence, anchored to
-    when the scheduler process starts - not fixed clock times like the
-    other daily workers). Set INTENT_EVENTS_WORKER_SELF_RUN=false to
-    instead run once and exit (e.g. for a one-off/manual invocation).
+    Long-running mode for the standalone container: runs run_worker once
+    immediately (so a container reboot/redeploy doesn't have to wait up to
+    15 minutes for fresh data), then schedules it every 15 minutes via an
+    IntervalTrigger from that point on (uniform cadence, anchored to when
+    the scheduler process starts - not fixed clock times like the other
+    daily workers). Set INTENT_EVENTS_WORKER_SELF_RUN=false to instead run
+    once and exit (e.g. for a one-off/manual invocation).
     """
     from apscheduler.schedulers.blocking import BlockingScheduler
+
+    logger.info("Running intent events worker once immediately on startup")
+    try:
+        run_worker()
+    except Exception as e:
+        logger.error("Error in immediate startup run of intent events worker: %s", e)
 
     scheduler = BlockingScheduler(timezone="UTC")
     scheduler.add_job(

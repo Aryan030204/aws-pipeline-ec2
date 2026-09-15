@@ -37,6 +37,40 @@ class IntentEventsWorkerTests(unittest.TestCase):
         source = inspect.getsource(worker)
         self.assertIn("INTENT_EVENTS_WORKER_SELF_RUN", source)
 
+    def test_scheduled_mode_runs_once_immediately_before_starting_scheduler(self):
+        # A container reboot/redeploy shouldn't have to wait up to 15
+        # minutes for the first run - _run_scheduled must call run_worker()
+        # once immediately, before scheduler.start() takes over for the
+        # recurring 15-minute cadence.
+        call_order = []
+
+        def fake_run_worker():
+            call_order.append("run_worker")
+
+        fake_scheduler = mock.Mock()
+        fake_scheduler.start.side_effect = lambda: call_order.append("scheduler.start")
+
+        with mock.patch.object(worker, "run_worker", side_effect=fake_run_worker), \
+             mock.patch(
+                 "apscheduler.schedulers.blocking.BlockingScheduler",
+                 return_value=fake_scheduler,
+             ):
+            worker._run_scheduled()
+
+        self.assertEqual(call_order, ["run_worker", "scheduler.start"])
+
+    def test_scheduled_mode_immediate_run_failure_does_not_prevent_scheduler_start(self):
+        fake_scheduler = mock.Mock()
+
+        with mock.patch.object(worker, "run_worker", side_effect=RuntimeError("boom")), \
+             mock.patch(
+                 "apscheduler.schedulers.blocking.BlockingScheduler",
+                 return_value=fake_scheduler,
+             ):
+            worker._run_scheduled()  # must not raise
+
+        fake_scheduler.start.assert_called_once()
+
     def test_resolve_brand_index_by_db_database_matches_case_insensitively(self):
         with mock.patch.object(worker.aws_background, "active_brand_indices", [1]), \
              mock.patch.dict(os.environ, {"DB_DATABASE_1": "BBB"}):
