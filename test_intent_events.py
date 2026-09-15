@@ -114,6 +114,124 @@ class ExtractBehavioralEventRowTests(unittest.TestCase):
         self.assertIsNone(row[8])  # product_id
 
 
+def _sample_click_doc(**overrides):
+    # Matches a real dead_click document supplied by the user.
+    doc = {
+        "event_id": "shu-a44ac102-774D-41FD-85A8-F0018CCA492C",
+        "brand_id": "bbb_shop",
+        "click": {
+            "x": 306,
+            "y": 579,
+            "tag_name": "SPAN",
+            "element_id": None,
+            "element_name": None,
+            "element_type": None,
+            "element_value": None,
+            "href": None,
+        },
+        "click_bucket": "useful_click",
+        "client_id": "6d351267-53c7-4a2d-b96e-cad5ce8c5587",
+        "event_name": "click",
+        "occurred_at": datetime(2026, 9, 15, 8, 59, 8, 237000, tzinfo=timezone.utc),
+        "referrer": "https://blabliblulife.com/collections/all",
+        "session_id": None,
+        "signals": {
+            "url_changed": False,
+            "cart_changed": False,
+            "ui_changed": True,
+            "meaningful_scroll": False,
+        },
+        "url": "https://blabliblulife.com/collections/body-wash",
+        "user_agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36",
+        "visitor_id": "10198230171943",
+    }
+    doc.update(overrides)
+    return doc
+
+
+class ExtractClickEventRowTests(unittest.TestCase):
+    def test_extracts_all_fields_from_useful_click_document(self):
+        row = ie._extract_click_event_row(_sample_click_doc())
+        self.assertIsNotNone(row)
+        (
+            event_id, event_name, client_id, visitor_id, session_id, url, referrer,
+            user_agent, click_x, click_y, click_tag, click_element_id, click_element_name,
+            click_element_type, click_element_value, click_href, url_changed, cart_changed,
+            ui_changed, meaningful_scroll, click_bucket, data, occurred_at,
+        ) = row
+
+        self.assertEqual(event_id, "shu-a44ac102-774D-41FD-85A8-F0018CCA492C")
+        self.assertEqual(event_name, "click")
+        self.assertEqual(client_id, "6d351267-53c7-4a2d-b96e-cad5ce8c5587")
+        self.assertEqual(visitor_id, "10198230171943")
+        self.assertIsNone(session_id)
+        self.assertEqual(click_x, 306)
+        self.assertEqual(click_y, 579)
+        self.assertEqual(click_tag, "SPAN")
+        self.assertIsNone(click_element_id)
+        self.assertIsNone(click_element_type)
+        self.assertEqual(url_changed, False)
+        self.assertEqual(ui_changed, True)
+        self.assertEqual(click_bucket, "useful_click")
+        self.assertEqual(
+            json.loads(data),
+            {
+                "click": _sample_click_doc()["click"],
+                "signals": _sample_click_doc()["signals"],
+            },
+        )
+        self.assertEqual(occurred_at, _sample_click_doc()["occurred_at"])
+
+    def test_extracts_dead_click_document(self):
+        doc = _sample_click_doc(
+            event_id="shu-a44ae837-4A21-4FF5-AB6B-57D24EA1ADF5",
+            click_bucket="dead_click",
+            click={
+                "x": 153,
+                "y": 595,
+                "tag_name": "BUTTON",
+                "element_id": None,
+                "element_name": None,
+                "element_type": "submit",
+                "element_value": None,
+                "href": None,
+            },
+            signals={
+                "url_changed": False,
+                "cart_changed": False,
+                "ui_changed": False,
+                "meaningful_scroll": False,
+            },
+        )
+        row = ie._extract_click_event_row(doc)
+        self.assertIsNotNone(row)
+        self.assertEqual(row[9], 595)  # click_y
+        self.assertEqual(row[13], "submit")  # click_element_type
+        self.assertEqual(row[20], "dead_click")  # click_bucket
+
+    def test_missing_click_and_signals_objects_default_to_none(self):
+        doc = _sample_click_doc(click=None, signals=None)
+        row = ie._extract_click_event_row(doc)
+        self.assertIsNotNone(row)
+        self.assertIsNone(row[8])  # click_x
+        self.assertIsNone(row[16])  # url_changed
+
+    def test_invalid_click_bucket_becomes_none(self):
+        doc = _sample_click_doc(click_bucket="not_a_real_bucket")
+        row = ie._extract_click_event_row(doc)
+        self.assertIsNone(row[20])
+
+    def test_missing_click_bucket_becomes_none(self):
+        doc = _sample_click_doc()
+        del doc["click_bucket"]
+        row = ie._extract_click_event_row(doc)
+        self.assertIsNone(row[20])
+
+    def test_missing_event_id_is_skipped(self):
+        doc = _sample_click_doc(event_id="")
+        self.assertIsNone(ie._extract_click_event_row(doc))
+
+
 class ParseIntentDbMapTests(unittest.TestCase):
     def test_valid_json_object(self):
         with mock.patch.dict("os.environ", {"INTENT_DB_MAP": '{"test_shop": "tmc"}'}):
@@ -157,6 +275,32 @@ class UpsertBehavioralEventsTests(unittest.TestCase):
         cursor = _DummyCursor()
         connection = _DummyConnection()
         inserted = ie._upsert_behavioral_events(cursor, connection, [])
+        self.assertEqual(inserted, 0)
+        self.assertEqual(cursor.executemany_calls, [])
+
+
+class UpsertClickEventsTests(unittest.TestCase):
+    def test_builds_full_upsert_excluding_ingested_at(self):
+        cursor = _DummyCursor()
+        connection = _DummyConnection()
+        row = ie._extract_click_event_row(_sample_click_doc())
+
+        inserted = ie._upsert_click_events(cursor, connection, [row])
+
+        self.assertEqual(inserted, 1)
+        self.assertEqual(len(cursor.executemany_calls), 1)
+        sql, rows = cursor.executemany_calls[0]
+        self.assertIn("INSERT INTO click_events", sql)
+        self.assertIn("ON DUPLICATE KEY UPDATE", sql)
+        self.assertIn("click_bucket = VALUES(click_bucket)", sql)
+        self.assertNotIn("ingested_at", sql)
+        self.assertNotIn("event_id = VALUES(event_id)", sql)  # key column not in UPDATE clause
+        self.assertEqual(rows, [row])
+
+    def test_empty_rows_is_a_no_op(self):
+        cursor = _DummyCursor()
+        connection = _DummyConnection()
+        inserted = ie._upsert_click_events(cursor, connection, [])
         self.assertEqual(inserted, 0)
         self.assertEqual(cursor.executemany_calls, [])
 

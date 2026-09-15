@@ -27,8 +27,22 @@ from pipeline.db import (
 )
 
 INTENT_METADATA_KEY = "intent_events_last_occurred_at"
+CLICK_EVENTS_METADATA_KEY = "intent_click_events_last_occurred_at"
 INTENT_OVERLAP = timedelta(minutes=5)
 INTENT_DEFAULT_LOOKBACK = timedelta(hours=1)
+
+_VALID_CLICK_BUCKETS = {"useful_click", "dead_click"}
+_CLICK_FIELDS = (
+    "x",
+    "y",
+    "tag_name",
+    "element_id",
+    "element_name",
+    "element_type",
+    "element_value",
+    "href",
+)
+_SIGNAL_FIELDS = ("url_changed", "cart_changed", "ui_changed", "meaningful_scroll")
 
 # Table's fixed, nullable columns pulled from the nested `raw` payload - not
 # dynamic/on-the-fly like variant_wise_events_summary's event columns.
@@ -55,6 +69,15 @@ def _resolve_intent_events_collection():
     return client, client["intent_sessions"]["events"]
 
 
+def _resolve_intent_click_events_collection():
+    mongo_uri = os.environ.get("INTENT_MONGO_URI")
+    if not mongo_uri:
+        raise ValueError("INTENT_MONGO_URI is not configured")
+
+    client = MongoClient(mongo_uri, tz_aware=True)
+    return client, client["intent_sessions"]["click_events"]
+
+
 def _parse_intent_db_map() -> Dict[str, str]:
     raw = os.environ.get("INTENT_DB_MAP", "{}")
     try:
@@ -79,12 +102,51 @@ def _coerce_numeric(value: Any) -> Optional[float]:
         return None
 
 
-def _extract_behavioral_event_row(doc: Dict[str, Any]) -> Optional[Tuple]:
+def _coerce_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_common_event_fields(doc: Dict[str, Any]) -> Optional[Tuple]:
+    """
+    The fields every Intent event document carries regardless of type
+    (event_id, event_name, client_id, visitor_id, session_id, url,
+    referrer, user_agent, occurred_at) - shared by both
+    _extract_behavioral_event_row and _extract_click_event_row. Returns
+    None (and logs) if event_id/occurred_at - both NOT NULL columns on
+    every table - are missing.
+    """
     event_id = str(doc.get("event_id") or "").strip()
     occurred_at = doc.get("occurred_at")
     if not event_id or not isinstance(occurred_at, datetime):
         logger.warning("Skipping intent event with missing event_id/occurred_at")
         return None
+
+    return (
+        event_id,
+        str(doc.get("event_name") or "").strip() or None,
+        (str(doc.get("client_id")).strip() or None) if doc.get("client_id") is not None else None,
+        (str(doc.get("visitor_id")).strip() or None) if doc.get("visitor_id") is not None else None,
+        (str(doc.get("session_id")).strip() or None) if doc.get("session_id") is not None else None,
+        doc.get("url") or None,
+        doc.get("referrer") or None,
+        doc.get("user_agent") or None,
+        occurred_at,
+    )
+
+
+def _extract_behavioral_event_row(doc: Dict[str, Any]) -> Optional[Tuple]:
+    common = _extract_common_event_fields(doc)
+    if common is None:
+        return None
+    (
+        event_id, event_name, client_id, visitor_id, session_id,
+        url, referrer, user_agent, occurred_at,
+    ) = common
 
     raw = doc.get("raw") or {}
     if not isinstance(raw, dict):
@@ -101,13 +163,13 @@ def _extract_behavioral_event_row(doc: Dict[str, Any]) -> Optional[Tuple]:
 
     return (
         event_id,
-        str(doc.get("event_name") or "").strip() or None,
-        (str(doc.get("client_id")).strip() or None) if doc.get("client_id") is not None else None,
-        (str(doc.get("visitor_id")).strip() or None) if doc.get("visitor_id") is not None else None,
-        (str(doc.get("session_id")).strip() or None) if doc.get("session_id") is not None else None,
-        doc.get("url") or None,
-        doc.get("referrer") or None,
-        doc.get("user_agent") or None,
+        event_name,
+        client_id,
+        visitor_id,
+        session_id,
+        url,
+        referrer,
+        user_agent,
         raw_values["product_id"],
         raw_values["variant_id"],
         raw_values["product_title"],
@@ -118,6 +180,58 @@ def _extract_behavioral_event_row(doc: Dict[str, Any]) -> Optional[Tuple]:
         raw_values["checkout_total"],
         raw_values["scroll_percent"],
         json.dumps(raw, default=str),
+        occurred_at,
+    )
+
+
+def _extract_click_event_row(doc: Dict[str, Any]) -> Optional[Tuple]:
+    common = _extract_common_event_fields(doc)
+    if common is None:
+        return None
+    (
+        event_id, event_name, client_id, visitor_id, session_id,
+        url, referrer, user_agent, occurred_at,
+    ) = common
+
+    click = doc.get("click") or {}
+    if not isinstance(click, dict):
+        click = {}
+    signals = doc.get("signals") or {}
+    if not isinstance(signals, dict):
+        signals = {}
+
+    click_bucket = doc.get("click_bucket")
+    if click_bucket not in _VALID_CLICK_BUCKETS:
+        click_bucket = None
+
+    data_payload = {
+        "click": {field: click.get(field) for field in _CLICK_FIELDS},
+        "signals": {field: signals.get(field) for field in _SIGNAL_FIELDS},
+    }
+
+    return (
+        event_id,
+        event_name,
+        client_id,
+        visitor_id,
+        session_id,
+        url,
+        referrer,
+        user_agent,
+        _coerce_int(click.get("x")),
+        _coerce_int(click.get("y")),
+        (str(click.get("tag_name")).strip() or None) if click.get("tag_name") is not None else None,
+        (str(click.get("element_id")).strip() or None) if click.get("element_id") is not None else None,
+        (str(click.get("element_name")).strip() or None) if click.get("element_name") is not None else None,
+        (str(click.get("element_type")).strip() or None) if click.get("element_type") is not None else None,
+        click.get("element_value") if click.get("element_value") is not None else None,
+        click.get("href") if click.get("href") is not None else None,
+        bool(signals["url_changed"]) if signals.get("url_changed") is not None else None,
+        bool(signals["cart_changed"]) if signals.get("cart_changed") is not None else None,
+        bool(signals["ui_changed"]) if signals.get("ui_changed") is not None else None,
+        bool(signals["meaningful_scroll"]) if signals.get("meaningful_scroll") is not None else None,
+        click_bucket,
+        json.dumps(data_payload, default=str),
         occurred_at,
     )
 
@@ -171,7 +285,73 @@ def _ensure_behavioral_events_table(cursor, connection) -> None:
     connection.commit()
 
 
-_UPSERT_COLUMNS = (
+def _ensure_click_events_table(cursor, connection) -> None:
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS click_events (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+
+            event_id VARCHAR(100) NOT NULL,
+            event_name VARCHAR(100) NOT NULL,
+
+            client_id VARCHAR(100) NULL,
+            visitor_id VARCHAR(100) NULL,
+            session_id VARCHAR(100) NULL,
+
+            url TEXT NULL,
+            referrer TEXT NULL,
+            user_agent TEXT NULL,
+
+            product_id VARCHAR(100) NULL,
+            variant_id VARCHAR(100) NULL,
+            product_title VARCHAR(500) NULL,
+            variant_title VARCHAR(500) NULL,
+
+            quantity INT NULL,
+            price DECIMAL(18, 4) NULL,
+            currency VARCHAR(10) NULL,
+
+            checkout_total DECIMAL(18, 4) NULL,
+
+            scroll_percent DECIMAL(5, 2) NULL,
+
+            click_x INT NULL,
+            click_y INT NULL,
+            click_tag VARCHAR(50) NULL,
+            click_element_id VARCHAR(255) NULL,
+            click_element_name VARCHAR(255) NULL,
+            click_element_type VARCHAR(100) NULL,
+            click_element_value TEXT NULL,
+            click_href TEXT NULL,
+
+            url_changed BOOLEAN NULL,
+            cart_changed BOOLEAN NULL,
+            ui_changed BOOLEAN NULL,
+            meaningful_scroll BOOLEAN NULL,
+
+            click_bucket ENUM('useful_click', 'dead_click') NULL,
+
+            data JSON NULL,
+
+            occurred_at DATETIME(6) NOT NULL,
+            ingested_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+
+            PRIMARY KEY (id),
+            UNIQUE KEY uq_event_id (event_id),
+            KEY idx_occurred_at (occurred_at),
+            KEY idx_session_time (session_id, occurred_at),
+            KEY idx_client_time (client_id, occurred_at),
+            KEY idx_event_time (event_name, occurred_at),
+            KEY idx_product_time (product_id, occurred_at),
+            KEY idx_variant_time (variant_id, occurred_at),
+            KEY idx_click_bucket_time (click_bucket, occurred_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """
+    )
+    connection.commit()
+
+
+_BEHAVIORAL_UPSERT_COLUMNS = (
     "event_id",
     "event_name",
     "client_id",
@@ -195,16 +375,16 @@ _UPSERT_COLUMNS = (
 # ingested_at is deliberately excluded from the UPDATE clause: it should
 # reflect the event's *first* ingestion, not be reset by a later re-upsert
 # of the same event_id (e.g. the watermark-overlap safety margin).
-_UPDATE_COLUMNS = tuple(c for c in _UPSERT_COLUMNS if c != "event_id")
+_BEHAVIORAL_UPDATE_COLUMNS = tuple(c for c in _BEHAVIORAL_UPSERT_COLUMNS if c != "event_id")
 
 
 def _upsert_behavioral_events(cursor, connection, rows: List[Tuple]) -> int:
     if not rows:
         return 0
 
-    columns_sql = ", ".join(_UPSERT_COLUMNS)
-    placeholders = ", ".join(["%s"] * len(_UPSERT_COLUMNS))
-    update_sql = ", ".join(f"{c} = VALUES({c})" for c in _UPDATE_COLUMNS)
+    columns_sql = ", ".join(_BEHAVIORAL_UPSERT_COLUMNS)
+    placeholders = ", ".join(["%s"] * len(_BEHAVIORAL_UPSERT_COLUMNS))
+    update_sql = ", ".join(f"{c} = VALUES({c})" for c in _BEHAVIORAL_UPDATE_COLUMNS)
     sql = (
         f"INSERT INTO behavioral_events ({columns_sql}) VALUES ({placeholders}) "
         f"ON DUPLICATE KEY UPDATE {update_sql}"
@@ -212,22 +392,80 @@ def _upsert_behavioral_events(cursor, connection, rows: List[Tuple]) -> int:
     return executemany_chunked(cursor, connection, sql, rows)
 
 
-def sync_intent_events_for_brand(
+_CLICK_EVENTS_UPSERT_COLUMNS = (
+    "event_id",
+    "event_name",
+    "client_id",
+    "visitor_id",
+    "session_id",
+    "url",
+    "referrer",
+    "user_agent",
+    "click_x",
+    "click_y",
+    "click_tag",
+    "click_element_id",
+    "click_element_name",
+    "click_element_type",
+    "click_element_value",
+    "click_href",
+    "url_changed",
+    "cart_changed",
+    "ui_changed",
+    "meaningful_scroll",
+    "click_bucket",
+    "data",
+    "occurred_at",
+)
+_CLICK_EVENTS_UPDATE_COLUMNS = tuple(
+    c for c in _CLICK_EVENTS_UPSERT_COLUMNS if c != "event_id"
+)
+
+
+def _upsert_click_events(cursor, connection, rows: List[Tuple]) -> int:
+    if not rows:
+        return 0
+
+    columns_sql = ", ".join(_CLICK_EVENTS_UPSERT_COLUMNS)
+    placeholders = ", ".join(["%s"] * len(_CLICK_EVENTS_UPSERT_COLUMNS))
+    update_sql = ", ".join(f"{c} = VALUES({c})" for c in _CLICK_EVENTS_UPDATE_COLUMNS)
+    sql = (
+        f"INSERT INTO click_events ({columns_sql}) VALUES ({placeholders}) "
+        f"ON DUPLICATE KEY UPDATE {update_sql}"
+    )
+    return executemany_chunked(cursor, connection, sql, rows)
+
+
+def _sync_intent_collection(
     brand_index: int,
     mongo_brand_id: str,
     brand_label: str,
+    *,
+    collection_resolver,
+    ensure_table_fn,
+    extract_row_fn,
+    upsert_fn,
+    metadata_key: str,
+    event_label: str,
     cursor=None,
     connection=None,
 ) -> None:
+    """
+    Shared sync flow for any Intent Mongo collection -> per-brand MySQL
+    table: watermark fetch, one bounded query, extract+track-max, bulk
+    upsert, advance watermark, log. sync_intent_events_for_brand and
+    sync_click_events_for_brand both call this with their collection/table/
+    row-extractor-specific pieces, rather than duplicating the flow.
+    """
     client = None
     try:
-        client, collection = _resolve_intent_events_collection()
+        client, collection = collection_resolver()
 
         def _do_sync(c, conn):
-            _ensure_behavioral_events_table(c, conn)
+            ensure_table_fn(c, conn)
 
             watermark = get_pipeline_metadata_timestamp(
-                c, INTENT_METADATA_KEY, default=datetime.now(IST) - INTENT_DEFAULT_LOOKBACK
+                c, metadata_key, default=datetime.now(IST) - INTENT_DEFAULT_LOOKBACK
             )
             query_lower_bound = (watermark - INTENT_OVERLAP).astimezone(timezone.utc)
 
@@ -241,7 +479,7 @@ def sync_intent_events_for_brand(
             rows: List[Tuple] = []
             max_occurred_at: Optional[datetime] = None
             for doc in docs:
-                row = _extract_behavioral_event_row(doc)
+                row = extract_row_fn(doc)
                 if row is None:
                     continue
                 rows.append(row)
@@ -251,15 +489,15 @@ def sync_intent_events_for_brand(
                 if max_occurred_at is None or occurred_at > max_occurred_at:
                     max_occurred_at = occurred_at
 
-            inserted = _upsert_behavioral_events(c, conn, rows)
+            inserted = upsert_fn(c, conn, rows)
 
             if max_occurred_at is not None:
                 update_pipeline_metadata_timestamp(
-                    c, conn, INTENT_METADATA_KEY, max_occurred_at.astimezone(IST)
+                    c, conn, metadata_key, max_occurred_at.astimezone(IST)
                 )
 
             logger.info(
-                f"Ingested intent behavioral events for brand={brand_label} "
+                f"Ingested intent {event_label} for brand={brand_label} "
                 f"(mongo_brand_id={mongo_brand_id}): {inserted} row(s)"
             )
 
@@ -270,9 +508,53 @@ def sync_intent_events_for_brand(
                 _do_sync(c, conn)
     except Exception as e:
         logger.error(
-            f"Error ingesting intent behavioral events for brand={brand_label} "
+            f"Error ingesting intent {event_label} for brand={brand_label} "
             f"(mongo_brand_id={mongo_brand_id}): {e}"
         )
     finally:
         if client is not None:
             client.close()
+
+
+def sync_intent_events_for_brand(
+    brand_index: int,
+    mongo_brand_id: str,
+    brand_label: str,
+    cursor=None,
+    connection=None,
+) -> None:
+    _sync_intent_collection(
+        brand_index,
+        mongo_brand_id,
+        brand_label,
+        collection_resolver=_resolve_intent_events_collection,
+        ensure_table_fn=_ensure_behavioral_events_table,
+        extract_row_fn=_extract_behavioral_event_row,
+        upsert_fn=_upsert_behavioral_events,
+        metadata_key=INTENT_METADATA_KEY,
+        event_label="behavioral events",
+        cursor=cursor,
+        connection=connection,
+    )
+
+
+def sync_click_events_for_brand(
+    brand_index: int,
+    mongo_brand_id: str,
+    brand_label: str,
+    cursor=None,
+    connection=None,
+) -> None:
+    _sync_intent_collection(
+        brand_index,
+        mongo_brand_id,
+        brand_label,
+        collection_resolver=_resolve_intent_click_events_collection,
+        ensure_table_fn=_ensure_click_events_table,
+        extract_row_fn=_extract_click_event_row,
+        upsert_fn=_upsert_click_events,
+        metadata_key=CLICK_EVENTS_METADATA_KEY,
+        event_label="click events",
+        cursor=cursor,
+        connection=connection,
+    )
