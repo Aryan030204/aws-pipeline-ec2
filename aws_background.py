@@ -381,6 +381,9 @@ from pipeline.orchestration import (
     manual_trigger,
     health_check,
 )
+# Registers GET /workers, POST /workers/<name>/trigger, GET /workers/<name>/status
+# on the same Flask app (manual knob for the standalone workers).
+import pipeline.worker_triggers  # noqa: E402,F401
 
 
 INVENTORY_PIPELINE_SWITCH = (
@@ -1215,6 +1218,7 @@ if __name__ == "__main__":
     logger.info("   - Async API fetching: Enabled")
     logger.info("   - Summary updates: INCREMENTAL (only affected dates) 🚀")
     logger.info("   - Manual Trigger API: POST /trigger (port 5000)")
+    logger.info("   - Worker Trigger API: POST /workers/<name>/trigger, GET /workers (port 5000)")
 
     try:
         # Run the Flask app (replaces the sleep loop)

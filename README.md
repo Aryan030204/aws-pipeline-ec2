@@ -143,6 +143,39 @@ The cache pipeline runs as its own container (`cache-pipeline`) on the same EC2 
 
 This request runs in a background thread, so the pipeline doesn't wait for the cache rebuild to finish before moving on. Whenever the response does come back, only a short summary (status + brand count) is logged — not the full per-brand/per-date result body.
 
+## Triggering a worker manually
+
+Every standalone worker (`pnl`, `events-summary`, `variant-wise-events`, `checkout-login-status`, `intent-events`) can be run on demand, once, without waiting for its daily schedule. Both knobs below use the same registry in `workers/registry.py`, so adding a worker there makes it available to both.
+
+### From a shell
+
+```bash
+python -m workers.run list                                      # what's available
+python -m workers.run pnl                                       # default window
+python -m workers.run pnl --start 2026-09-01 --end 2026-09-15   # backfill a range
+python -m workers.run checkout-login-status --as-of 2026-09-10T00:05:00+05:30
+python -m workers.run pnl --env-file env                        # load a specific dotenv file
+```
+
+It loads `.env` (or a file named `env`) unless `--env-file` says otherwise, forces the worker's `*_SELF_RUN` flag off, runs it in the foreground, and exits 0/1. Inside Docker:
+
+```bash
+docker compose exec -T shopify-pipeline python -m workers.run pnl
+```
+
+### Over HTTP (main pipeline container, port 5000)
+
+```bash
+curl http://localhost:5000/workers                                       # list + last run per worker
+curl -X POST http://localhost:5000/workers/pnl/trigger \
+  -H "x-pipeline-key: $PIPELINE_AUTH_HEADER" \
+  -H "Content-Type: application/json" \
+  -d '{"start": "2026-09-01", "end": "2026-09-15"}'                      # body optional
+curl http://localhost:5000/workers/pnl/status                            # running / succeeded / failed
+```
+
+The trigger spawns `python -m workers.run <name>` as a child process of the pipeline container, so the worker's output shows up in `docker logs shopify-pipeline`. One run per worker at a time; a second trigger while one is running returns 409.
+
 ## Testing
 
 ```bash
