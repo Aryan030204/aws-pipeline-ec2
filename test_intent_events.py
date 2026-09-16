@@ -28,9 +28,10 @@ class _DummyConnection:
 
 
 class _DummyCursor:
-    def __init__(self):
+    def __init__(self, fetchone_results=None):
         self.executed = []
         self.executemany_calls = []
+        self._fetchone_results = list(fetchone_results or [])
 
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
@@ -38,10 +39,16 @@ class _DummyCursor:
     def executemany(self, sql, rows):
         self.executemany_calls.append((sql, list(rows)))
 
+    def fetchone(self):
+        if self._fetchone_results:
+            return self._fetchone_results.pop(0)
+        return None
+
 
 def _sample_doc(**overrides):
     doc = {
         "event_id": "sh-9e2e4ee1-FF7F-4393-B700-DC477CFFAC90",
+        "actor_id": "actor_1789548948942_9vb1nu0pbtu17wri6c132t",
         "brand_id": "test_shop",
         "client_id": "574823dd-70b0-45fe-923c-be1c67793deb",
         "event_name": "product_viewed",
@@ -69,13 +76,14 @@ class ExtractBehavioralEventRowTests(unittest.TestCase):
         row = ie._extract_behavioral_event_row(_sample_doc())
         self.assertIsNotNone(row)
         (
-            event_id, event_name, client_id, visitor_id, session_id, url, referrer,
+            event_id, event_name, actor_id, client_id, visitor_id, session_id, url, referrer,
             user_agent, product_id, variant_id, product_title, variant_title,
             quantity, price, currency, checkout_total, scroll_percent, data, occurred_at,
         ) = row
 
         self.assertEqual(event_id, "sh-9e2e4ee1-FF7F-4393-B700-DC477CFFAC90")
         self.assertEqual(event_name, "product_viewed")
+        self.assertEqual(actor_id, "actor_1789548948942_9vb1nu0pbtu17wri6c132t")
         self.assertEqual(client_id, "574823dd-70b0-45fe-923c-be1c67793deb")
         self.assertIsNone(visitor_id)
         self.assertEqual(product_id, "10442243637429")
@@ -91,13 +99,26 @@ class ExtractBehavioralEventRowTests(unittest.TestCase):
     def test_missing_raw_fields_default_to_none(self):
         doc = _sample_doc(
             event_name="scroll",
-            raw={"scroll_percent": 75.5},
+            raw={"percent": 75.5},
         )
         row = ie._extract_behavioral_event_row(doc)
         self.assertIsNotNone(row)
-        self.assertIsNone(row[8])  # product_id
-        self.assertIsNone(row[9])  # variant_id
-        self.assertEqual(row[16], 75.5)  # scroll_percent
+        self.assertIsNone(row[9])  # product_id
+        self.assertIsNone(row[10])  # variant_id
+        self.assertEqual(row[17], 75.5)  # scroll_percent
+
+    def test_scroll_percent_reads_from_raw_percent_key(self):
+        # Real observed shape: scroll events store raw={"percent": N}, NOT
+        # raw={"scroll_percent": N} - the MySQL column name and the Mongo
+        # raw key genuinely differ for this one field.
+        doc = _sample_doc(event_name="scroll", raw={"percent": 50})
+        row = ie._extract_behavioral_event_row(doc)
+        self.assertEqual(row[17], 50.0)  # scroll_percent
+
+    def test_scroll_percent_stays_none_when_raw_has_no_percent_key(self):
+        doc = _sample_doc(event_name="scroll", raw={"scroll_percent": 999})
+        row = ie._extract_behavioral_event_row(doc)
+        self.assertIsNone(row[17])  # scroll_percent - wrong key name, ignored
 
     def test_missing_event_id_is_skipped(self):
         doc = _sample_doc(event_id="")
@@ -111,13 +132,14 @@ class ExtractBehavioralEventRowTests(unittest.TestCase):
         doc = _sample_doc(raw=None)
         row = ie._extract_behavioral_event_row(doc)
         self.assertIsNotNone(row)
-        self.assertIsNone(row[8])  # product_id
+        self.assertIsNone(row[9])  # product_id
 
 
 def _sample_click_doc(**overrides):
     # Matches a real dead_click document supplied by the user.
     doc = {
         "event_id": "shu-a44ac102-774D-41FD-85A8-F0018CCA492C",
+        "actor_id": "actor_1789548948942_9vb1nu0pbtu17wri6c132t",
         "brand_id": "bbb_shop",
         "click": {
             "x": 306,
@@ -154,7 +176,7 @@ class ExtractClickEventRowTests(unittest.TestCase):
         row = ie._extract_click_event_row(_sample_click_doc())
         self.assertIsNotNone(row)
         (
-            event_id, event_name, client_id, visitor_id, session_id, url, referrer,
+            event_id, event_name, actor_id, client_id, visitor_id, session_id, url, referrer,
             user_agent, click_x, click_y, click_tag, click_element_id, click_element_name,
             click_element_type, click_element_value, click_href, url_changed, cart_changed,
             ui_changed, meaningful_scroll, click_bucket, data, occurred_at,
@@ -162,6 +184,7 @@ class ExtractClickEventRowTests(unittest.TestCase):
 
         self.assertEqual(event_id, "shu-a44ac102-774D-41FD-85A8-F0018CCA492C")
         self.assertEqual(event_name, "click")
+        self.assertEqual(actor_id, "actor_1789548948942_9vb1nu0pbtu17wri6c132t")
         self.assertEqual(client_id, "6d351267-53c7-4a2d-b96e-cad5ce8c5587")
         self.assertEqual(visitor_id, "10198230171943")
         self.assertIsNone(session_id)
@@ -205,31 +228,54 @@ class ExtractClickEventRowTests(unittest.TestCase):
         )
         row = ie._extract_click_event_row(doc)
         self.assertIsNotNone(row)
-        self.assertEqual(row[9], 595)  # click_y
-        self.assertEqual(row[13], "submit")  # click_element_type
-        self.assertEqual(row[20], "dead_click")  # click_bucket
+        self.assertEqual(row[10], 595)  # click_y
+        self.assertEqual(row[14], "submit")  # click_element_type
+        self.assertEqual(row[21], "dead_click")  # click_bucket
 
     def test_missing_click_and_signals_objects_default_to_none(self):
         doc = _sample_click_doc(click=None, signals=None)
         row = ie._extract_click_event_row(doc)
         self.assertIsNotNone(row)
-        self.assertIsNone(row[8])  # click_x
-        self.assertIsNone(row[16])  # url_changed
+        self.assertIsNone(row[9])  # click_x
+        self.assertIsNone(row[17])  # url_changed
 
     def test_invalid_click_bucket_becomes_none(self):
         doc = _sample_click_doc(click_bucket="not_a_real_bucket")
         row = ie._extract_click_event_row(doc)
-        self.assertIsNone(row[20])
+        self.assertIsNone(row[21])
 
     def test_missing_click_bucket_becomes_none(self):
         doc = _sample_click_doc()
         del doc["click_bucket"]
         row = ie._extract_click_event_row(doc)
-        self.assertIsNone(row[20])
+        self.assertIsNone(row[21])
 
     def test_missing_event_id_is_skipped(self):
         doc = _sample_click_doc(event_id="")
         self.assertIsNone(ie._extract_click_event_row(doc))
+
+
+class EnsureColumnExistsTests(unittest.TestCase):
+    def test_adds_column_when_missing(self):
+        cursor = _DummyCursor(fetchone_results=[None])
+        connection = _DummyConnection()
+
+        ie._ensure_column_exists(cursor, connection, "behavioral_events", "actor_id", "VARCHAR(100) NULL")
+
+        alter_statements = [sql for sql, _ in cursor.executed if sql.startswith("ALTER TABLE")]
+        self.assertEqual(len(alter_statements), 1)
+        self.assertIn("ADD COLUMN actor_id VARCHAR(100) NULL", alter_statements[0])
+        self.assertEqual(connection.commit_count, 1)
+
+    def test_no_op_when_column_already_exists(self):
+        cursor = _DummyCursor(fetchone_results=[{"Field": "actor_id"}])
+        connection = _DummyConnection()
+
+        ie._ensure_column_exists(cursor, connection, "behavioral_events", "actor_id", "VARCHAR(100) NULL")
+
+        alter_statements = [sql for sql, _ in cursor.executed if sql.startswith("ALTER TABLE")]
+        self.assertEqual(alter_statements, [])
+        self.assertEqual(connection.commit_count, 0)
 
 
 class ParseIntentDbMapTests(unittest.TestCase):
@@ -267,6 +313,7 @@ class UpsertBehavioralEventsTests(unittest.TestCase):
         self.assertIn("INSERT INTO behavioral_events", sql)
         self.assertIn("ON DUPLICATE KEY UPDATE", sql)
         self.assertIn("event_name = VALUES(event_name)", sql)
+        self.assertIn("actor_id = VALUES(actor_id)", sql)
         self.assertNotIn("ingested_at", sql)
         self.assertNotIn("event_id = VALUES(event_id)", sql)  # key column not in UPDATE clause
         self.assertEqual(rows, [row])
@@ -293,6 +340,7 @@ class UpsertClickEventsTests(unittest.TestCase):
         self.assertIn("INSERT INTO click_events", sql)
         self.assertIn("ON DUPLICATE KEY UPDATE", sql)
         self.assertIn("click_bucket = VALUES(click_bucket)", sql)
+        self.assertIn("actor_id = VALUES(actor_id)", sql)
         self.assertNotIn("ingested_at", sql)
         self.assertNotIn("event_id = VALUES(event_id)", sql)  # key column not in UPDATE clause
         self.assertEqual(rows, [row])

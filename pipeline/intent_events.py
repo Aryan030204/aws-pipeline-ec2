@@ -58,6 +58,12 @@ _RAW_FIELDS = (
     "checkout_total",
     "scroll_percent",
 )
+# Most _RAW_FIELDS use the same key name in Mongo's raw payload as the MySQL
+# column - scroll events are the one exception observed so far: raw only
+# has {"percent": <value>}, not {"scroll_percent": <value>}.
+_RAW_FIELD_SOURCE_KEYS = {
+    "scroll_percent": "percent",
+}
 
 
 def _resolve_intent_events_collection():
@@ -114,8 +120,8 @@ def _coerce_int(value: Any) -> Optional[int]:
 def _extract_common_event_fields(doc: Dict[str, Any]) -> Optional[Tuple]:
     """
     The fields every Intent event document carries regardless of type
-    (event_id, event_name, client_id, visitor_id, session_id, url,
-    referrer, user_agent, occurred_at) - shared by both
+    (event_id, event_name, actor_id, client_id, visitor_id, session_id,
+    url, referrer, user_agent, occurred_at) - shared by both
     _extract_behavioral_event_row and _extract_click_event_row. Returns
     None (and logs) if event_id/occurred_at - both NOT NULL columns on
     every table - are missing.
@@ -129,6 +135,7 @@ def _extract_common_event_fields(doc: Dict[str, Any]) -> Optional[Tuple]:
     return (
         event_id,
         str(doc.get("event_name") or "").strip() or None,
+        (str(doc.get("actor_id")).strip() or None) if doc.get("actor_id") is not None else None,
         (str(doc.get("client_id")).strip() or None) if doc.get("client_id") is not None else None,
         (str(doc.get("visitor_id")).strip() or None) if doc.get("visitor_id") is not None else None,
         (str(doc.get("session_id")).strip() or None) if doc.get("session_id") is not None else None,
@@ -144,7 +151,7 @@ def _extract_behavioral_event_row(doc: Dict[str, Any]) -> Optional[Tuple]:
     if common is None:
         return None
     (
-        event_id, event_name, client_id, visitor_id, session_id,
+        event_id, event_name, actor_id, client_id, visitor_id, session_id,
         url, referrer, user_agent, occurred_at,
     ) = common
 
@@ -154,7 +161,8 @@ def _extract_behavioral_event_row(doc: Dict[str, Any]) -> Optional[Tuple]:
 
     raw_values = {}
     for field in _RAW_FIELDS:
-        value = raw.get(field)
+        source_key = _RAW_FIELD_SOURCE_KEYS.get(field, field)
+        value = raw.get(source_key)
         if field in _RAW_NUMERIC_FIELDS:
             value = _coerce_numeric(value)
         elif value is not None:
@@ -164,6 +172,7 @@ def _extract_behavioral_event_row(doc: Dict[str, Any]) -> Optional[Tuple]:
     return (
         event_id,
         event_name,
+        actor_id,
         client_id,
         visitor_id,
         session_id,
@@ -189,7 +198,7 @@ def _extract_click_event_row(doc: Dict[str, Any]) -> Optional[Tuple]:
     if common is None:
         return None
     (
-        event_id, event_name, client_id, visitor_id, session_id,
+        event_id, event_name, actor_id, client_id, visitor_id, session_id,
         url, referrer, user_agent, occurred_at,
     ) = common
 
@@ -212,6 +221,7 @@ def _extract_click_event_row(doc: Dict[str, Any]) -> Optional[Tuple]:
     return (
         event_id,
         event_name,
+        actor_id,
         client_id,
         visitor_id,
         session_id,
@@ -236,6 +246,21 @@ def _extract_click_event_row(doc: Dict[str, Any]) -> Optional[Tuple]:
     )
 
 
+def _ensure_column_exists(cursor, connection, table_name: str, column_name: str, column_def: str) -> None:
+    """
+    Idempotent ALTER for a column that was added to the schema after a
+    table already existed in some brand's database - CREATE TABLE IF NOT
+    EXISTS alone won't add it to a pre-existing table. Follows the same
+    SHOW COLUMNS-diff-then-ALTER pattern used elsewhere in this repo (see
+    pipeline/mongo_events.py's _ensure_variant_wise_event_columns).
+    """
+    cursor.execute(f"SHOW COLUMNS FROM {table_name} LIKE %s", (column_name,))
+    if cursor.fetchone() is not None:
+        return
+    cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
+    connection.commit()
+
+
 def _ensure_behavioral_events_table(cursor, connection) -> None:
     cursor.execute(
         """
@@ -244,6 +269,7 @@ def _ensure_behavioral_events_table(cursor, connection) -> None:
 
             event_id VARCHAR(100) NOT NULL,
             event_name VARCHAR(100) NOT NULL,
+            actor_id VARCHAR(100) NULL,
 
             client_id VARCHAR(100) NULL,
             visitor_id VARCHAR(100) NULL,
@@ -283,6 +309,7 @@ def _ensure_behavioral_events_table(cursor, connection) -> None:
         """
     )
     connection.commit()
+    _ensure_column_exists(cursor, connection, "behavioral_events", "actor_id", "VARCHAR(100) NULL")
 
 
 def _ensure_click_events_table(cursor, connection) -> None:
@@ -293,6 +320,7 @@ def _ensure_click_events_table(cursor, connection) -> None:
 
             event_id VARCHAR(100) NOT NULL,
             event_name VARCHAR(100) NOT NULL,
+            actor_id VARCHAR(100) NULL,
 
             client_id VARCHAR(100) NULL,
             visitor_id VARCHAR(100) NULL,
@@ -349,11 +377,13 @@ def _ensure_click_events_table(cursor, connection) -> None:
         """
     )
     connection.commit()
+    _ensure_column_exists(cursor, connection, "click_events", "actor_id", "VARCHAR(100) NULL")
 
 
 _BEHAVIORAL_UPSERT_COLUMNS = (
     "event_id",
     "event_name",
+    "actor_id",
     "client_id",
     "visitor_id",
     "session_id",
@@ -395,6 +425,7 @@ def _upsert_behavioral_events(cursor, connection, rows: List[Tuple]) -> int:
 _CLICK_EVENTS_UPSERT_COLUMNS = (
     "event_id",
     "event_name",
+    "actor_id",
     "client_id",
     "visitor_id",
     "session_id",
