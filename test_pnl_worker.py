@@ -1,6 +1,7 @@
 import unittest
 from datetime import date, datetime
 from decimal import Decimal
+from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from workers import pnl_worker
@@ -112,8 +113,84 @@ class PnlRowTests(unittest.TestCase):
         self.assertEqual(row["meta_spend_synced"], 0)
 
     def test_row_covers_every_table_column(self):
-        row = pnl_worker.compute_pnl_row(date(2026, 9, 15), None, None, None, [])
+        row = pnl_worker.compute_pnl_row(date(2026, 9, 15), None, None, None, [], brand_key="BBB")
         self.assertEqual(set(row), set(pnl_worker.ALL_COLUMNS))
+        self.assertEqual(row["cost_config_source"], pnl_worker.CONFIG_SOURCE_MONGO)
+        self.assertEqual(row["brand_key"], "BBB")
+
+    def test_default_configs_cost_every_line_as_percent_of_net_sales(self):
+        defaults = pnl_worker.default_cost_configs()
+        self.assertEqual({c["category"] for c in defaults}, set(pnl_worker.COST_COLUMNS))
+
+        sales = {"gross_sales": "1180.00", "discounts": "0", "total_orders": 1}
+        row = pnl_worker.compute_pnl_row(
+            date(2026, 9, 15), sales, None, None, defaults, pnl_worker.CONFIG_SOURCE_DEFAULT
+        )
+        # 1180 taxable -> GST 180 -> net 1000, so each default % is the amount
+        self.assertEqual(row["net_sales"], Decimal("1000.00"))
+        self.assertEqual(row["cogs"], Decimal("320.00"))
+        self.assertEqual(row["packaging"], Decimal("15.00"))
+        self.assertEqual(row["meta"], Decimal("80.00"))
+        self.assertEqual(row["meta_spend_synced"], 0)
+        self.assertEqual(row["cost_config_source"], "default")
+        total_pct = sum(Decimal(v) for v in pnl_worker.DEFAULT_COST_PERCENTAGES.values())
+        self.assertEqual(row["ebitda"], Decimal("1000.00") - Decimal("10") * total_pct)
+
+
+class ConfigSourceTests(unittest.TestCase):
+    def test_mongo_configs_win_when_present(self):
+        with patch.object(pnl_worker, "fetch_brand_cost_configs", return_value=[_config("rent", 1)]):
+            configs, source = pnl_worker.resolve_brand_cost_configs("BBB")
+        self.assertEqual(source, pnl_worker.CONFIG_SOURCE_MONGO)
+        self.assertEqual(configs[0]["category"], "rent")
+
+    def test_defaults_used_when_brand_has_no_documents(self):
+        with patch.object(pnl_worker, "fetch_brand_cost_configs", return_value=[]):
+            configs, source = pnl_worker.resolve_brand_cost_configs("BBB")
+        self.assertEqual(source, pnl_worker.CONFIG_SOURCE_DEFAULT)
+        self.assertEqual(len(configs), len(pnl_worker.COST_COLUMNS))
+
+    def test_missing_mongo_uri_falls_back_to_defaults(self):
+        with patch.object(pnl_worker, "PNL_CONFIG_MONGO_URI", ""):
+            self.assertEqual(pnl_worker.fetch_brand_cost_configs("BBB"), [])
+
+
+class ReturnsRowsTests(unittest.TestCase):
+    def test_cancels_refunds_and_rto_are_separate_buckets(self):
+        cursor = MagicMock()
+        cursor.fetchall.side_effect = [
+            [{"d": date(2026, 9, 15), "cancel_amount": "300.00", "rto_amount": "120.00"}],
+            [{"d": date(2026, 9, 15), "refund_amount": "45.50"}, {"d": date(2026, 9, 16), "refund_amount": "10.00"}],
+        ]
+        rows = pnl_worker.fetch_returns_rows(cursor, date(2026, 9, 15), date(2026, 9, 16))
+
+        self.assertEqual(rows[date(2026, 9, 15)], {"cancellations": Decimal("345.50"), "rto_returns": Decimal("120.00")})
+        self.assertEqual(rows[date(2026, 9, 16)], {"cancellations": Decimal("10.00"), "rto_returns": Decimal("0")})
+        refund_sql = cursor.execute.call_args_list[1][0][0]
+        self.assertIn("NOT EXISTS", refund_sql)
+
+
+class TableOwnershipTests(unittest.TestCase):
+    def test_only_overall_pnl_is_created(self):
+        cursor, connection = MagicMock(), MagicMock()
+        pnl_worker.ensure_overall_pnl_table(cursor, connection)
+        ddl = cursor.execute.call_args[0][0]
+        self.assertEqual(pnl_worker.PNL_TABLE, "overall_pnl")
+        self.assertIn("CREATE TABLE IF NOT EXISTS `overall_pnl`", ddl)
+        self.assertIn("`cost_config_source`", ddl)
+        self.assertIn("PRIMARY KEY (`brand_key`, `date`)", ddl)
+        self.assertEqual(cursor.execute.call_count, 1)
+
+    def test_upsert_never_overwrites_key_columns(self):
+        cursor, connection = MagicMock(), MagicMock()
+        row = pnl_worker.compute_pnl_row(date(2026, 9, 15), None, None, None, [], brand_key="BBB")
+        with patch("pipeline.db.executemany_chunked", return_value=1) as chunked:
+            pnl_worker.upsert_pnl_rows(cursor, connection, [row])
+        sql, values = chunked.call_args[0][2], chunked.call_args[0][3]
+        self.assertIn("INSERT INTO `overall_pnl`", sql)
+        self.assertNotIn("`brand_key` = VALUES", sql)
+        self.assertNotIn("`date` = VALUES", sql)
+        self.assertEqual(values[0][:2], ("BBB", date(2026, 9, 15)))
 
 
 if __name__ == "__main__":

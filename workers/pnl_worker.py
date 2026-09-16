@@ -1,20 +1,38 @@
 """
-Standalone worker: builds the daily brand-level P&L (pnl_daily) in each
+Standalone worker: builds the daily brand-level P&L (overall_pnl) in each
 brand's own database - overall only, not per product.
 
+The only table this worker ever creates or writes is `overall_pnl`. Every
+other table it touches (gross_summary, discount_summary, overall_summary,
+rto_summary, returns_fact, pnl_meta_ad_spend_rollup) is read-only here and
+owned by the main pipeline / the Meta sync.
+
+Reads and writes both use the brand's own database connection (the
+db_host/db_user/... the brand-config API returns for that tenant, loaded by
+aws_background.initialize_brand_configs()), exactly like the other
+per-brand workers. Nothing about the target is hard-coded or env-driven.
+Rows still carry `brand_key` so the table is self-describing.
+
 Revenue-side figures come from the summary tables the main pipeline already
-maintains in that brand DB; cost-side figures come from the cost configs
-the dashboard's "Brand Cost Configuration" page stores in Mongo
-(arch-auth.aggregate_configs, one document per brand+category+effective
-window). Meta ad spend is taken from pnl_meta_ad_spend_rollup when that
-table has a synced row for the day, else from a configured `meta` cost.
+maintains in that brand DB; cost-side figures come from the Mongo
+`pnl_config` collection (one document per brand+category+effective window,
+same shape the dashboard's "Brand Cost Configuration" page writes). A brand
+with no documents in that collection is costed with DEFAULT_COST_CONFIGS
+(percent-of-net-sales assumptions) and its rows are tagged
+cost_config_source='default' so the dashboard can tell. Meta ad spend is
+taken from pnl_meta_ad_spend_rollup when that table has a synced row for
+the day, else from the configured/default `meta` cost.
 
 Per date, for each brand:
 
     gross_sales   = gross_summary.overall_sale          (line items, before discounts)
     discounts     = discount_summary.actual_discounts   (net of cancelled-order discounts)
-    cancellations = returns_fact CANCEL - CANCEL (RTO)  (by order date)
-                  + returns_fact REFUND                 (by refund date)
+    cancellations = returns_fact CANCEL                 (full order value, by order date)
+                  + returns_fact REFUND                 (by refund date, only for orders
+                                                         that have no CANCEL / CANCEL (RTO)
+                                                         row, so a cancel+refund isn't
+                                                         counted twice)
+    rto_returns   = returns_fact CANCEL (RTO)           (by order date; informational)
     gst           = (gross - discounts - cancellations) * 18/118
     net_sales     = gross - discounts - cancellations - gst
     gross_margin  = net_sales - cogs - freight_inwards
@@ -26,6 +44,8 @@ Per date, for each brand:
 RTO follows the same convention as sales_summary: an RTO'd order is not a
 cancellation (its revenue stays in gross/net), it's surfaced separately as
 rto_orders / rto_returns, and the `rto` line is the configured RTO *cost*.
+CANCEL and CANCEL (RTO) are mutually exclusive event types in returns_fact
+(a cancelled order gets exactly one of them), so they are never combined.
 
 A configured cost resolves to a daily amount as:
     percentage          -> value% of that day's net_sales
@@ -42,7 +62,7 @@ import os
 import sys
 from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -63,18 +83,18 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-PNL_TABLE = "pnl_daily"
-META_SPEND_TABLE = "pnl_meta_ad_spend_rollup"
+PNL_TABLE = "overall_pnl"  # the only table this worker creates / writes
+META_SPEND_TABLE = "pnl_meta_ad_spend_rollup"  # read-only
 
-# The dashboard's aggregate_configs live in the arch-auth database, which is
-# not necessarily the cluster the pipeline's MONGO_URI (events) points at.
+# The cost configs live in the arch-auth database, which is not necessarily
+# the cluster the pipeline's MONGO_URI (events) points at.
 PNL_CONFIG_MONGO_URI = (
     os.environ.get("PNL_CONFIG_MONGO_URI", "").strip()
     or os.environ.get("MONGO_URI", "").strip()
 )
 PNL_CONFIG_MONGO_DB = os.environ.get("PNL_CONFIG_MONGO_DB", "arch-auth").strip() or "arch-auth"
 PNL_CONFIG_COLLECTION = (
-    os.environ.get("PNL_CONFIG_COLLECTION", "aggregate_configs").strip() or "aggregate_configs"
+    os.environ.get("PNL_CONFIG_COLLECTION", "pnl_config").strip() or "pnl_config"
 )
 
 # Rolling rebuild window (yesterday and the N-1 days before it), or an explicit
@@ -89,8 +109,11 @@ ZERO = Decimal("0")
 
 VALUE_TYPES = {"flat", "percentage"}
 
+CONFIG_SOURCE_MONGO = "mongo"
+CONFIG_SOURCE_DEFAULT = "default"
+
 # Cost lines a Mongo config category can populate, in P&L order. Keys are
-# both the Mongo `category` and the pnl_daily column.
+# both the Mongo `category` and the overall_pnl column.
 COST_COLUMNS = (
     "cogs",
     "freight_inwards",
@@ -111,6 +134,30 @@ COST_COLUMNS = (
     "agency_fees",
     "other_overheads",
 )
+
+# Used for a brand that has no documents in the pnl_config collection: each
+# cost is a percentage of that day's net sales. Every COST_COLUMNS entry has
+# an entry here so a defaulted row is fully populated.
+DEFAULT_COST_PERCENTAGES: Dict[str, str] = {
+    "cogs": "32",
+    "freight_inwards": "2",
+    "shipping": "6",
+    "rto": "3",
+    "payment_gateway": "2",
+    "packaging": "1.5",
+    "meta": "8",
+    "google": "5",
+    "other_paid": "1",
+    "influencers": "2",
+    "content": "1",
+    "sponsorships": "0.5",
+    "other_brand": "0.5",
+    "salaries": "6",
+    "rent": "1",
+    "technology": "1",
+    "agency_fees": "1",
+    "other_overheads": "1",
+}
 
 MONEY_COLUMNS = (
     "gross_sales",
@@ -147,7 +194,9 @@ MONEY_COLUMNS = (
     "partially_prepaid_sales",
 )
 INT_COLUMNS = ("total_orders", "rto_orders", "meta_spend_synced")
-ALL_COLUMNS = ("date", *MONEY_COLUMNS, *INT_COLUMNS)
+TEXT_COLUMNS = ("cost_config_source",)
+KEY_COLUMNS = ("brand_key", "date")
+ALL_COLUMNS = (*KEY_COLUMNS, *MONEY_COLUMNS, *INT_COLUMNS, *TEXT_COLUMNS)
 
 
 def money(value) -> Decimal:
@@ -180,11 +229,34 @@ def resolve_brand_key(brand_index: int) -> str:
 # ---------------------------
 # Cost configs (Mongo)
 # ---------------------------
+def default_cost_configs() -> List[Dict]:
+    """One percentage-of-net-sales config per cost line, effective forever."""
+    return [
+        {
+            "category": category,
+            "value_type": "percentage",
+            "value": pct,
+            "frequency": "recurring",
+            "effective_from": "1970-01-01",
+            "effective_to": None,
+        }
+        for category, pct in DEFAULT_COST_PERCENTAGES.items()
+    ]
+
+
 def fetch_brand_cost_configs(brand_key: str) -> List[Dict]:
+    """Active pnl_config documents for the brand. Empty when the brand has
+    none (or the collection doesn't exist yet - Mongo treats both the same).
+    Raises on a real connectivity/auth failure so a brand isn't silently
+    re-costed with defaults because Mongo hiccupped."""
     from pymongo import MongoClient
 
     if not PNL_CONFIG_MONGO_URI:
-        raise ValueError("PNL_CONFIG_MONGO_URI (or MONGO_URI) is not configured")
+        logger.warning(
+            "PNL_CONFIG_MONGO_URI / MONGO_URI not configured; using default cost configs for %s",
+            brand_key,
+        )
+        return []
 
     client = MongoClient(PNL_CONFIG_MONGO_URI, tz_aware=True)
     try:
@@ -204,6 +276,21 @@ def fetch_brand_cost_configs(brand_key: str) -> List[Dict]:
         )
     finally:
         client.close()
+
+
+def resolve_brand_cost_configs(brand_key: str) -> Tuple[List[Dict], str]:
+    """(configs, source): the brand's Mongo configs, or the defaults when it
+    has none in pnl_config."""
+    configs = fetch_brand_cost_configs(brand_key)
+    if configs:
+        return configs, CONFIG_SOURCE_MONGO
+    logger.info(
+        "No %s.%s documents for brand_id=%s; using DEFAULT_COST_PERCENTAGES",
+        PNL_CONFIG_MONGO_DB,
+        PNL_CONFIG_COLLECTION,
+        brand_key,
+    )
+    return default_cost_configs(), CONFIG_SOURCE_DEFAULT
 
 
 def _config_date(value) -> Optional[date]:
@@ -274,6 +361,9 @@ def fetch_sales_rows(cursor, start: date, end: date) -> Dict[date, Dict]:
 def fetch_returns_rows(cursor, start: date, end: date) -> Dict[date, Dict[str, Decimal]]:
     rows: Dict[date, Dict[str, Decimal]] = {}
 
+    # CANCEL and CANCEL (RTO) are mutually exclusive per order, so each is
+    # its own bucket: plain cancels are a revenue deduction, RTO cancels are
+    # reported alongside (their revenue stays in gross/net).
     cursor.execute(
         """
         SELECT
@@ -282,24 +372,32 @@ def fetch_returns_rows(cursor, start: date, end: date) -> Dict[date, Dict[str, D
             SUM(CASE WHEN event_type = 'CANCEL (RTO)' THEN amount ELSE 0 END) AS rto_amount
         FROM returns_fact
         WHERE order_created_date BETWEEN %s AND %s
+          AND event_type IN ('CANCEL', 'CANCEL (RTO)')
         GROUP BY order_created_date
         """,
         (start, end),
     )
     for row in cursor.fetchall() or []:
         day = _as_date(row["d"])
-        rto_amount = money(row["rto_amount"])
         rows[day] = {
-            "cancellations": money(row["cancel_amount"]) - rto_amount,
-            "rto_returns": rto_amount,
+            "cancellations": money(row["cancel_amount"]),
+            "rto_returns": money(row["rto_amount"]),
         }
 
+    # Refunds on orders that were never cancelled (a cancel with a refund is
+    # already counted in full through its CANCEL row).
     cursor.execute(
         """
-        SELECT event_date AS d, SUM(amount) AS refund_amount
-        FROM returns_fact
-        WHERE event_type = 'REFUND' AND event_date BETWEEN %s AND %s
-        GROUP BY event_date
+        SELECT rf.event_date AS d, SUM(rf.amount) AS refund_amount
+        FROM returns_fact rf
+        WHERE rf.event_type = 'REFUND'
+          AND rf.event_date BETWEEN %s AND %s
+          AND NOT EXISTS (
+              SELECT 1 FROM returns_fact c
+              WHERE c.order_id = rf.order_id
+                AND c.event_type IN ('CANCEL', 'CANCEL (RTO)')
+          )
+        GROUP BY rf.event_date
         """,
         (start, end),
     )
@@ -340,6 +438,8 @@ def compute_pnl_row(
     returns: Optional[Dict[str, Decimal]],
     meta_spend: Optional[Decimal],
     configs: Iterable[Dict],
+    config_source: str = CONFIG_SOURCE_MONGO,
+    brand_key: str = "",
 ) -> Dict[str, object]:
     sales = sales or {}
     returns = returns or {}
@@ -373,6 +473,7 @@ def compute_pnl_row(
     )
 
     return {
+        "brand_key": brand_key,
         "date": day,
         "gross_sales": gross_sales,
         "discounts": discounts,
@@ -392,25 +493,30 @@ def compute_pnl_row(
         "total_orders": int(sales.get("total_orders") or 0),
         "rto_orders": int(sales.get("rto_orders") or 0),
         "meta_spend_synced": int(meta_spend_synced),
+        "cost_config_source": config_source,
     }
 
 
 # ---------------------------
 # Target table (brand DB)
 # ---------------------------
-def ensure_pnl_daily_table(cursor, connection) -> None:
+def ensure_overall_pnl_table(cursor, connection) -> None:
+    """Creates overall_pnl if missing. This is the only DDL the worker runs."""
     money_defs = ",\n".join(f"    `{col}` DECIMAL(14,2) NOT NULL DEFAULT 0" for col in MONEY_COLUMNS)
     cursor.execute(
         f"""
         CREATE TABLE IF NOT EXISTS `{PNL_TABLE}` (
+            `brand_key` VARCHAR(64) NOT NULL,
             `date` DATE NOT NULL,
         {money_defs},
             `total_orders` INT NOT NULL DEFAULT 0,
             `rto_orders` INT NOT NULL DEFAULT 0,
             `meta_spend_synced` TINYINT(1) NOT NULL DEFAULT 0,
+            `cost_config_source` VARCHAR(16) NOT NULL DEFAULT 'mongo',
             `computed_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                 ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (`date`)
+            PRIMARY KEY (`brand_key`, `date`),
+            KEY `idx_overall_pnl_date` (`date`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """
     )
@@ -424,7 +530,7 @@ def upsert_pnl_rows(cursor, connection, rows: Sequence[Dict[str, object]]) -> in
 
     columns = ", ".join(f"`{col}`" for col in ALL_COLUMNS)
     placeholders = ", ".join(["%s"] * len(ALL_COLUMNS))
-    updates = ", ".join(f"`{col}` = VALUES(`{col}`)" for col in ALL_COLUMNS if col != "date")
+    updates = ", ".join(f"`{col}` = VALUES(`{col}`)" for col in ALL_COLUMNS if col not in KEY_COLUMNS)
     sql = (
         f"INSERT INTO `{PNL_TABLE}` ({columns}) VALUES ({placeholders}) "
         f"ON DUPLICATE KEY UPDATE {updates}"
@@ -445,13 +551,17 @@ def rebuild_brand_pnl(
     from pipeline.db import get_db_cursor
 
     start, end = min(target_dates), max(target_dates)
-    configs = fetch_brand_cost_configs(brand_key)
+    configs, config_source = resolve_brand_cost_configs(brand_key)
     logger.info(
-        "[%s] %s active cost config(s) in Mongo for brand_id=%s", brand_name, len(configs), brand_key
+        "[%s] %s cost config(s) for brand_id=%s (source=%s)",
+        brand_name,
+        len(configs),
+        brand_key,
+        config_source,
     )
 
     with get_db_cursor(brand_index, dictionary=True) as (cursor, connection):
-        ensure_pnl_daily_table(cursor, connection)
+        # Reads: the source tables are only ever SELECTed here.
         sales_rows = fetch_sales_rows(cursor, start, end)
         returns_rows = fetch_returns_rows(cursor, start, end)
         meta_rows = fetch_meta_spend_rows(cursor, start, end)
@@ -463,22 +573,29 @@ def rebuild_brand_pnl(
                 returns_rows.get(day),
                 meta_rows.get(day),
                 configs,
+                config_source,
+                brand_key=brand_key,
             )
             for day in target_dates
         ]
+
+        # Writes: overall_pnl only.
+        ensure_overall_pnl_table(cursor, connection)
         written = upsert_pnl_rows(cursor, connection, rows)
 
     for row in rows:
         logger.info(
-            "[%s] %s gross=%s net=%s cogs=%s meta=%s%s ebitda=%s",
+            "[%s] %s gross=%s cancel=%s net=%s cogs=%s meta=%s%s ebitda=%s costs=%s",
             brand_name,
             row["date"].isoformat(),
             row["gross_sales"],
+            row["cancellations"],
             row["net_sales"],
             row["cogs"],
             row["meta"],
             "" if row["meta_spend_synced"] else " (not synced)",
             row["ebitda"],
+            row["cost_config_source"],
         )
     return written
 
