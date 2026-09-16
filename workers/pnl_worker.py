@@ -14,14 +14,28 @@ per-brand workers. Nothing about the target is hard-coded or env-driven.
 Rows still carry `brand_key` so the table is self-describing.
 
 Revenue-side figures come from the summary tables the main pipeline already
-maintains in that brand DB; cost-side figures come from the Mongo
-`pnl_config` collection (one document per brand+category+effective window,
-same shape the dashboard's "Brand Cost Configuration" page writes). A brand
-with no documents in that collection is costed with DEFAULT_COST_CONFIGS
-(percent-of-net-sales assumptions) and its rows are tagged
-cost_config_source='default' so the dashboard can tell. Meta ad spend is
-taken from pnl_meta_ad_spend_rollup when that table has a synced row for
-the day, else from the configured/default `meta` cost.
+maintains in that brand DB; cost-side figures come from ONE Mongo document
+per brand in the `total_config` collection (arch-auth), the same document
+the dashboard's "Brand Cost Configuration" page edits:
+
+    {
+      "brand_id": "BBB",
+      "gst_pct": 18,
+      "costs": {
+        "cogs":  {"value_type": "percentage", "value": 32},
+        "rent":  {"value_type": "flat",       "value": 90000},
+        "meta":  null,          # not configured -> DEFAULT_COST_PERCENTAGES
+        ...one key per COST_COLUMNS entry
+      }
+    }
+
+A brand with no document at all is costed entirely from
+DEFAULT_COST_PERCENTAGES (and GST at DEFAULT_GST_PCT); its rows are tagged
+cost_config_source='default'. A brand with a document is tagged 'mongo',
+and any individual line that is null/missing in it falls back to that
+line's default. Meta ad spend is taken from pnl_meta_ad_spend_rollup when
+that table has a synced row for the day, else from the configured/default
+`meta` cost.
 
 Per date, for each brand:
 
@@ -33,7 +47,7 @@ Per date, for each brand:
                                                          row, so a cancel+refund isn't
                                                          counted twice)
     rto_returns   = returns_fact CANCEL (RTO)           (by order date; informational)
-    gst           = (gross - discounts - cancellations) * 18/118
+    gst           = (gross - discounts - cancellations) * gst_pct/(100+gst_pct)
     net_sales     = gross - discounts - cancellations - gst
     gross_margin  = net_sales - cogs - freight_inwards
     cm1           = gross_margin - shipping - rto - payment_gateway - packaging
@@ -47,10 +61,9 @@ rto_orders / rto_returns, and the `rto` line is the configured RTO *cost*.
 CANCEL and CANCEL (RTO) are mutually exclusive event types in returns_fact
 (a cancelled order gets exactly one of them), so they are never combined.
 
-A configured cost resolves to a daily amount as:
-    percentage          -> value% of that day's net_sales
-    flat + recurring    -> a monthly amount, prorated per calendar day
-    flat + one_time     -> the full value on effective_from only
+A configured cost line resolves to a daily amount as:
+    percentage -> value% of that day's net_sales
+    flat       -> a MONTHLY amount, prorated per calendar day
 
 Same shape as the other per-brand-DB workers (checkout_login_status_worker
 etc): brand discovery and DB access come from aws_background / pipeline.db.
@@ -62,7 +75,7 @@ import os
 import sys
 from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -94,7 +107,7 @@ PNL_CONFIG_MONGO_URI = (
 )
 PNL_CONFIG_MONGO_DB = os.environ.get("PNL_CONFIG_MONGO_DB", "arch-auth").strip() or "arch-auth"
 PNL_CONFIG_COLLECTION = (
-    os.environ.get("PNL_CONFIG_COLLECTION", "pnl_config").strip() or "pnl_config"
+    os.environ.get("PNL_CONFIG_COLLECTION", "total_config").strip() or "total_config"
 )
 
 # Rolling rebuild window (yesterday and the N-1 days before it), or an explicit
@@ -103,7 +116,7 @@ PNL_WORKER_LOOKBACK_DAYS = int(os.environ.get("PNL_WORKER_LOOKBACK_DAYS", "2"))
 PNL_WORKER_START_DATE = os.environ.get("PNL_WORKER_START_DATE", "").strip()
 PNL_WORKER_END_DATE = os.environ.get("PNL_WORKER_END_DATE", "").strip()
 
-GST_RATE = Decimal(18) / Decimal(118)
+DEFAULT_GST_PCT = Decimal("18")
 CENT = Decimal("0.01")
 ZERO = Decimal("0")
 
@@ -135,9 +148,10 @@ COST_COLUMNS = (
     "other_overheads",
 )
 
-# Used for a brand that has no documents in the pnl_config collection: each
-# cost is a percentage of that day's net sales. Every COST_COLUMNS entry has
-# an entry here so a defaulted row is fully populated.
+# Fallback for a brand with no total_config document, and for any single
+# cost line that is null/missing in its document: a percentage of that day's
+# net sales. Every COST_COLUMNS entry has an entry here so a row is always
+# fully populated.
 DEFAULT_COST_PERCENTAGES: Dict[str, str] = {
     "cogs": "32",
     "freight_inwards": "2",
@@ -194,9 +208,10 @@ MONEY_COLUMNS = (
     "partially_prepaid_sales",
 )
 INT_COLUMNS = ("total_orders", "rto_orders", "meta_spend_synced")
+RATE_COLUMNS = ("gst_pct",)
 TEXT_COLUMNS = ("cost_config_source",)
 KEY_COLUMNS = ("brand_key", "date")
-ALL_COLUMNS = (*KEY_COLUMNS, *MONEY_COLUMNS, *INT_COLUMNS, *TEXT_COLUMNS)
+ALL_COLUMNS = (*KEY_COLUMNS, *MONEY_COLUMNS, *RATE_COLUMNS, *INT_COLUMNS, *TEXT_COLUMNS)
 
 
 def money(value) -> Decimal:
@@ -227,108 +242,133 @@ def resolve_brand_key(brand_index: int) -> str:
 
 
 # ---------------------------
-# Cost configs (Mongo)
+# Cost config (Mongo: one total_config document per brand)
 # ---------------------------
-def default_cost_configs() -> List[Dict]:
-    """One percentage-of-net-sales config per cost line, effective forever."""
-    return [
-        {
-            "category": category,
-            "value_type": "percentage",
-            "value": pct,
-            "frequency": "recurring",
-            "effective_from": "1970-01-01",
-            "effective_to": None,
-        }
-        for category, pct in DEFAULT_COST_PERCENTAGES.items()
-    ]
+class BrandPnlConfig:
+    """Fully-resolved cost configuration for one brand: every COST_COLUMNS
+    line has a {"value_type", "value"} entry (from Mongo or the default), plus
+    the GST rate. `defaulted` names the lines that came from defaults."""
+
+    def __init__(self, brand_key: str, gst_pct: Decimal, costs: Dict[str, Dict], source: str, defaulted: Set[str]):
+        self.brand_key = brand_key
+        self.gst_pct = gst_pct
+        self.costs = costs
+        self.source = source
+        self.defaulted = defaulted
+
+    @property
+    def gst_rate(self) -> Decimal:
+        """Inclusive GST share of a gross figure: pct / (100 + pct)."""
+        return self.gst_pct / (Decimal(100) + self.gst_pct)
 
 
-def fetch_brand_cost_configs(brand_key: str) -> List[Dict]:
-    """Active pnl_config documents for the brand. Empty when the brand has
-    none (or the collection doesn't exist yet - Mongo treats both the same).
-    Raises on a real connectivity/auth failure so a brand isn't silently
-    re-costed with defaults because Mongo hiccupped."""
+def default_cost_line(column: str) -> Dict:
+    return {"value_type": "percentage", "value": Decimal(DEFAULT_COST_PERCENTAGES[column])}
+
+
+def _normalize_cost_line(column: str, raw) -> Optional[Dict]:
+    """A total_config `costs.<column>` value -> {"value_type","value"} or None
+    when it's null/missing/unusable (the caller then applies the default)."""
+    if not isinstance(raw, dict):
+        return None
+    value_type = str(raw.get("value_type") or "").strip()
+    if value_type not in VALUE_TYPES:
+        logger.warning("total_config %s: unknown value_type %r; using default", column, value_type)
+        return None
+    try:
+        value = Decimal(str(raw.get("value")))
+    except Exception:
+        logger.warning("total_config %s: non-numeric value %r; using default", column, raw.get("value"))
+        return None
+    if value < 0:
+        logger.warning("total_config %s: negative value %s; using default", column, value)
+        return None
+    return {"value_type": value_type, "value": value}
+
+
+def _normalize_gst_pct(raw) -> Decimal:
+    if raw is None or raw == "":
+        return DEFAULT_GST_PCT
+    try:
+        pct = Decimal(str(raw))
+    except Exception:
+        logger.warning("total_config gst_pct %r is not numeric; using %s", raw, DEFAULT_GST_PCT)
+        return DEFAULT_GST_PCT
+    if pct < 0 or pct > 100:
+        logger.warning("total_config gst_pct %s out of range; using %s", pct, DEFAULT_GST_PCT)
+        return DEFAULT_GST_PCT
+    return pct
+
+
+def build_brand_config(brand_key: str, doc: Optional[Dict]) -> BrandPnlConfig:
+    """Resolves a total_config document (or None) into a BrandPnlConfig."""
+    if not doc:
+        return BrandPnlConfig(
+            brand_key,
+            DEFAULT_GST_PCT,
+            {column: default_cost_line(column) for column in COST_COLUMNS},
+            CONFIG_SOURCE_DEFAULT,
+            set(COST_COLUMNS),
+        )
+    raw_costs = doc.get("costs") if isinstance(doc.get("costs"), dict) else {}
+    costs: Dict[str, Dict] = {}
+    defaulted: Set[str] = set()
+    for column in COST_COLUMNS:
+        line = _normalize_cost_line(column, raw_costs.get(column))
+        if line is None:
+            line = default_cost_line(column)
+            defaulted.add(column)
+        costs[column] = line
+    return BrandPnlConfig(brand_key, _normalize_gst_pct(doc.get("gst_pct")), costs, CONFIG_SOURCE_MONGO, defaulted)
+
+
+def fetch_total_config_doc(brand_key: str) -> Optional[Dict]:
+    """The brand's total_config document, or None when it has none (or the
+    collection doesn't exist yet). Raises on a real connectivity/auth failure
+    so a brand isn't silently re-costed with defaults because Mongo hiccupped."""
     from pymongo import MongoClient
 
     if not PNL_CONFIG_MONGO_URI:
         logger.warning(
-            "PNL_CONFIG_MONGO_URI / MONGO_URI not configured; using default cost configs for %s",
+            "PNL_CONFIG_MONGO_URI / MONGO_URI not configured; using default cost config for %s",
             brand_key,
         )
-        return []
+        return None
 
     client = MongoClient(PNL_CONFIG_MONGO_URI, tz_aware=True)
     try:
         collection = client[PNL_CONFIG_MONGO_DB][PNL_CONFIG_COLLECTION]
-        return list(
-            collection.find(
-                {"brand_id": brand_key, "is_active": True},
-                {
-                    "category": 1,
-                    "value_type": 1,
-                    "value": 1,
-                    "frequency": 1,
-                    "effective_from": 1,
-                    "effective_to": 1,
-                },
-            )
-        )
+        return collection.find_one({"brand_id": brand_key}, {"gst_pct": 1, "costs": 1})
     finally:
         client.close()
 
 
-def resolve_brand_cost_configs(brand_key: str) -> Tuple[List[Dict], str]:
-    """(configs, source): the brand's Mongo configs, or the defaults when it
-    has none in pnl_config."""
-    configs = fetch_brand_cost_configs(brand_key)
-    if configs:
-        return configs, CONFIG_SOURCE_MONGO
-    logger.info(
-        "No %s.%s documents for brand_id=%s; using DEFAULT_COST_PERCENTAGES",
-        PNL_CONFIG_MONGO_DB,
-        PNL_CONFIG_COLLECTION,
-        brand_key,
-    )
-    return default_cost_configs(), CONFIG_SOURCE_DEFAULT
+def resolve_brand_config(brand_key: str) -> BrandPnlConfig:
+    config = build_brand_config(brand_key, fetch_total_config_doc(brand_key))
+    if config.source == CONFIG_SOURCE_DEFAULT:
+        logger.info(
+            "No %s.%s document for brand_id=%s; using DEFAULT_COST_PERCENTAGES and GST %s%%",
+            PNL_CONFIG_MONGO_DB,
+            PNL_CONFIG_COLLECTION,
+            brand_key,
+            DEFAULT_GST_PCT,
+        )
+    elif config.defaulted:
+        logger.info(
+            "total_config for brand_id=%s leaves %s line(s) unset; defaults applied to: %s",
+            brand_key,
+            len(config.defaulted),
+            ", ".join(sorted(config.defaulted)),
+        )
+    return config
 
 
-def _config_date(value) -> Optional[date]:
-    if value is None or value == "":
-        return None
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    return date.fromisoformat(str(value)[:10])
-
-
-def configs_effective_on(configs: Iterable[Dict], day: date) -> Dict[str, Dict]:
-    """One config per category for the given day - where windows overlap, the
-    latest effective_from wins (same rule as the dashboard's summary)."""
-    chosen: Dict[str, Dict] = {}
-    for config in configs:
-        category = str(config.get("category") or "").strip()
-        if category not in COST_COLUMNS or config.get("value_type") not in VALUE_TYPES:
-            continue
-        effective_from = _config_date(config.get("effective_from"))
-        effective_to = _config_date(config.get("effective_to"))
-        if effective_from is None or effective_from > day:
-            continue
-        if effective_to is not None and effective_to < day:
-            continue
-        current = chosen.get(category)
-        if current is None or effective_from > _config_date(current.get("effective_from")):
-            chosen[category] = config
-    return chosen
-
-
-def configured_amount(config: Dict, day: date, net_sales: Decimal) -> Decimal:
-    value = Decimal(str(config.get("value") or 0))
-    if config.get("value_type") == "percentage":
+def cost_line_amount(line: Dict, day: date, net_sales: Decimal) -> Decimal:
+    """percentage -> share of the day's net sales; flat -> monthly amount
+    prorated per calendar day of that month."""
+    value = Decimal(str(line.get("value") or 0))
+    if line.get("value_type") == "percentage":
         return money(net_sales * value / Decimal(100))
-    if config.get("frequency") == "one_time":
-        return money(value) if _config_date(config.get("effective_from")) == day else ZERO
     return money(value / Decimal(calendar.monthrange(day.year, day.month)[1]))
 
 
@@ -437,8 +477,7 @@ def compute_pnl_row(
     sales: Optional[Dict],
     returns: Optional[Dict[str, Decimal]],
     meta_spend: Optional[Decimal],
-    configs: Iterable[Dict],
-    config_source: str = CONFIG_SOURCE_MONGO,
+    config: BrandPnlConfig,
     brand_key: str = "",
 ) -> Dict[str, object]:
     sales = sales or {}
@@ -447,14 +486,10 @@ def compute_pnl_row(
     gross_sales = money(sales.get("gross_sales"))
     discounts = money(sales.get("discounts"))
     cancellations = money(returns.get("cancellations"))
-    gst = money((gross_sales - discounts - cancellations) * GST_RATE)
+    gst = money((gross_sales - discounts - cancellations) * config.gst_rate)
     net_sales = gross_sales - discounts - cancellations - gst
 
-    active = configs_effective_on(configs, day)
-    cost = {
-        column: (configured_amount(active[column], day, net_sales) if column in active else ZERO)
-        for column in COST_COLUMNS
-    }
+    cost = {column: cost_line_amount(config.costs[column], day, net_sales) for column in COST_COLUMNS}
     meta_spend_synced = meta_spend is not None
     if meta_spend_synced:
         cost["meta"] = money(meta_spend)
@@ -492,8 +527,9 @@ def compute_pnl_row(
         "partially_prepaid_sales": money(sales.get("partially_prepaid_sales")),
         "total_orders": int(sales.get("total_orders") or 0),
         "rto_orders": int(sales.get("rto_orders") or 0),
+        "gst_pct": config.gst_pct.quantize(CENT, rounding=ROUND_HALF_UP),
         "meta_spend_synced": int(meta_spend_synced),
-        "cost_config_source": config_source,
+        "cost_config_source": config.source,
     }
 
 
@@ -511,6 +547,7 @@ def ensure_overall_pnl_table(cursor, connection) -> None:
         {money_defs},
             `total_orders` INT NOT NULL DEFAULT 0,
             `rto_orders` INT NOT NULL DEFAULT 0,
+            `gst_pct` DECIMAL(5,2) NOT NULL DEFAULT 18.00,
             `meta_spend_synced` TINYINT(1) NOT NULL DEFAULT 0,
             `cost_config_source` VARCHAR(16) NOT NULL DEFAULT 'mongo',
             `computed_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -520,6 +557,13 @@ def ensure_overall_pnl_table(cursor, connection) -> None:
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """
     )
+    # Columns added after the table first shipped (still only overall_pnl).
+    for column, definition in (
+        ("gst_pct", "DECIMAL(5,2) NOT NULL DEFAULT 18.00 AFTER `partially_prepaid_sales`"),
+    ):
+        cursor.execute(f"SHOW COLUMNS FROM `{PNL_TABLE}` LIKE %s", (column,))
+        if not cursor.fetchone():
+            cursor.execute(f"ALTER TABLE `{PNL_TABLE}` ADD COLUMN `{column}` {definition}")
     connection.commit()
 
 
@@ -551,13 +595,14 @@ def rebuild_brand_pnl(
     from pipeline.db import get_db_cursor
 
     start, end = min(target_dates), max(target_dates)
-    configs, config_source = resolve_brand_cost_configs(brand_key)
+    config = resolve_brand_config(brand_key)
     logger.info(
-        "[%s] %s cost config(s) for brand_id=%s (source=%s)",
+        "[%s] cost config for brand_id=%s: source=%s gst=%s%% defaulted_lines=%s",
         brand_name,
-        len(configs),
         brand_key,
-        config_source,
+        config.source,
+        config.gst_pct,
+        len(config.defaulted),
     )
 
     with get_db_cursor(brand_index, dictionary=True) as (cursor, connection):
@@ -572,8 +617,7 @@ def rebuild_brand_pnl(
                 sales_rows.get(day),
                 returns_rows.get(day),
                 meta_rows.get(day),
-                configs,
-                config_source,
+                config,
                 brand_key=brand_key,
             )
             for day in target_dates
