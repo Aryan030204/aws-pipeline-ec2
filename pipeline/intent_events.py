@@ -28,8 +28,21 @@ from pipeline.db import (
 
 INTENT_METADATA_KEY = "intent_events_last_occurred_at"
 CLICK_EVENTS_METADATA_KEY = "intent_click_events_last_occurred_at"
+INTENT_SESSION_HISTORY_METADATA_KEY = "intent_session_history_last_updated_at"
 INTENT_OVERLAP = timedelta(minutes=5)
 INTENT_DEFAULT_LOOKBACK = timedelta(hours=1)
+
+# event_name -> intent_sessions counter column. Anything not in this map
+# still counts toward event_count but not a specific typed counter -
+# forward-compatible with future event types.
+_SESSION_EVENT_NAME_COUNTERS = {
+    "page_viewed": "page_view_count",
+    "product_viewed": "product_view_count",
+    "click": "click_count",
+    "product_added_to_cart": "add_to_cart_count",
+    "checkout_started": "checkout_started_count",
+    "scroll_depth": "scroll_count",
+}
 
 _VALID_CLICK_BUCKETS = {"useful_click", "dead_click"}
 _CLICK_FIELDS = (
@@ -82,6 +95,15 @@ def _resolve_intent_click_events_collection():
 
     client = MongoClient(mongo_uri, tz_aware=True)
     return client, client["intent_sessions"]["click_events"]
+
+
+def _resolve_intent_session_history_collection():
+    mongo_uri = os.environ.get("INTENT_MONGO_URI")
+    if not mongo_uri:
+        raise ValueError("INTENT_MONGO_URI is not configured")
+
+    client = MongoClient(mongo_uri, tz_aware=True)
+    return client, client["intent_sessions"]["session_history"]
 
 
 def _parse_intent_db_map() -> Dict[str, str]:
@@ -246,6 +268,100 @@ def _extract_click_event_row(doc: Dict[str, Any]) -> Optional[Tuple]:
     )
 
 
+def _extract_session_history_row(doc: Dict[str, Any]) -> Optional[Tuple]:
+    """
+    session_history documents are mutable rollups of an entire session:
+    identity/timing at the top level, plus a nested events_seq object
+    ({"1": {...full sub-event...}, "2": {...}, ...}) holding every
+    sub-event that happened in the session, in order. This derives the
+    intent_sessions row from that - counts per event type, the session's
+    final (last-known-non-null) client_id/visitor_id, and a compact
+    {step: {event_name: event_id}} event_sequence, not the full sub-event
+    payloads (those are already ingested separately via
+    behavioral_events/click_events).
+    """
+    session_id = str(doc.get("session_id") or "").strip()
+    actor_id = str(doc.get("actor_id") or "").strip()
+    updated_at = doc.get("updatedAt")
+    session_start = doc.get("session_start")
+    if (
+        not session_id
+        or not actor_id
+        or not isinstance(updated_at, datetime)
+        or not isinstance(session_start, datetime)
+    ):
+        logger.warning(
+            "Skipping session_history document with missing session_id/actor_id/"
+            "updatedAt/session_start"
+        )
+        return None
+
+    events_seq = doc.get("events_seq") or {}
+    if not isinstance(events_seq, dict):
+        events_seq = {}
+
+    ordered_steps: List[Tuple[int, Dict[str, Any]]] = []
+    for key, sub_event in events_seq.items():
+        if not isinstance(sub_event, dict):
+            continue
+        try:
+            step = int(key)
+        except (TypeError, ValueError):
+            continue
+        ordered_steps.append((step, sub_event))
+    ordered_steps.sort(key=lambda item: item[0])
+
+    counters = {column: 0 for column in set(_SESSION_EVENT_NAME_COUNTERS.values())}
+    counters["useful_click_count"] = 0
+    counters["dead_click_count"] = 0
+    client_id: Optional[str] = None
+    visitor_id: Optional[str] = None
+    event_sequence: Dict[str, Dict[str, Any]] = {}
+
+    for step, sub_event in ordered_steps:
+        sub_event_name = str(sub_event.get("event_name") or "").strip()
+        sub_event_id = sub_event.get("event_id")
+
+        counter_column = _SESSION_EVENT_NAME_COUNTERS.get(sub_event_name)
+        if counter_column:
+            counters[counter_column] += 1
+        if sub_event_name == "click":
+            click_bucket = sub_event.get("click_bucket")
+            if click_bucket in _VALID_CLICK_BUCKETS:
+                counters[f"{click_bucket}_count"] += 1
+
+        if sub_event.get("client_id") is not None:
+            client_id = str(sub_event.get("client_id")).strip() or client_id
+        if sub_event.get("visitor_id") is not None:
+            visitor_id = str(sub_event.get("visitor_id")).strip() or visitor_id
+
+        event_sequence[str(step)] = {sub_event_name: sub_event_id}
+
+    session_end = doc.get("session_end")
+    session_time_spent_ms = _coerce_int(doc.get("session_time_spent"))
+
+    return (
+        session_id,
+        actor_id,
+        client_id,
+        visitor_id,
+        session_start,
+        session_end if isinstance(session_end, datetime) else None,
+        session_time_spent_ms,
+        len(ordered_steps),
+        counters["page_view_count"],
+        counters["product_view_count"],
+        counters["click_count"],
+        counters["useful_click_count"],
+        counters["dead_click_count"],
+        counters["add_to_cart_count"],
+        counters["checkout_started_count"],
+        counters["scroll_count"],
+        json.dumps(event_sequence, default=str),
+        updated_at,
+    )
+
+
 def _ensure_column_exists(cursor, connection, table_name: str, column_name: str, column_def: str) -> None:
     """
     Idempotent ALTER for a column that was added to the schema after a
@@ -380,6 +496,53 @@ def _ensure_click_events_table(cursor, connection) -> None:
     _ensure_column_exists(cursor, connection, "click_events", "actor_id", "VARCHAR(100) NULL")
 
 
+def _ensure_intent_sessions_table(cursor, connection) -> None:
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS intent_sessions (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+
+            session_id VARCHAR(100) NOT NULL,
+            actor_id VARCHAR(100) NOT NULL,
+
+            client_id VARCHAR(100) NULL,
+            visitor_id VARCHAR(100) NULL,
+
+            session_start DATETIME(6) NOT NULL,
+            session_end DATETIME(6) NULL,
+
+            session_time_spent_ms BIGINT UNSIGNED NULL,
+
+            event_count INT UNSIGNED NOT NULL DEFAULT 0,
+
+            page_view_count INT UNSIGNED NOT NULL DEFAULT 0,
+            product_view_count INT UNSIGNED NOT NULL DEFAULT 0,
+
+            click_count INT UNSIGNED NOT NULL DEFAULT 0,
+            useful_click_count INT UNSIGNED NOT NULL DEFAULT 0,
+            dead_click_count INT UNSIGNED NOT NULL DEFAULT 0,
+
+            add_to_cart_count INT UNSIGNED NOT NULL DEFAULT 0,
+            checkout_started_count INT UNSIGNED NOT NULL DEFAULT 0,
+            scroll_count INT UNSIGNED NOT NULL DEFAULT 0,
+
+            event_sequence JSON NULL,
+
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                ON UPDATE CURRENT_TIMESTAMP(6),
+
+            PRIMARY KEY (id),
+            UNIQUE KEY uq_session_id (session_id),
+            KEY idx_actor_session (actor_id, session_start),
+            KEY idx_visitor_session (visitor_id, session_start),
+            KEY idx_session_start (session_start)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """
+    )
+    connection.commit()
+
+
 _BEHAVIORAL_UPSERT_COLUMNS = (
     "event_id",
     "event_name",
@@ -467,6 +630,49 @@ def _upsert_click_events(cursor, connection, rows: List[Tuple]) -> int:
     return executemany_chunked(cursor, connection, sql, rows)
 
 
+_INTENT_SESSIONS_UPSERT_COLUMNS = (
+    "session_id",
+    "actor_id",
+    "client_id",
+    "visitor_id",
+    "session_start",
+    "session_end",
+    "session_time_spent_ms",
+    "event_count",
+    "page_view_count",
+    "product_view_count",
+    "click_count",
+    "useful_click_count",
+    "dead_click_count",
+    "add_to_cart_count",
+    "checkout_started_count",
+    "scroll_count",
+    "event_sequence",
+)
+_INTENT_SESSIONS_UPDATE_COLUMNS = tuple(
+    c for c in _INTENT_SESSIONS_UPSERT_COLUMNS if c != "session_id"
+)
+
+
+def _upsert_intent_sessions(cursor, connection, rows: List[Tuple]) -> int:
+    if not rows:
+        return 0
+
+    # extract_row_fn's tuples end with updatedAt (for _sync_intent_collection's
+    # watermark tracking only) - not an actual column here, since
+    # created_at/updated_at are entirely DB-managed. Drop it before inserting.
+    insert_rows = [row[:-1] for row in rows]
+
+    columns_sql = ", ".join(_INTENT_SESSIONS_UPSERT_COLUMNS)
+    placeholders = ", ".join(["%s"] * len(_INTENT_SESSIONS_UPSERT_COLUMNS))
+    update_sql = ", ".join(f"{c} = VALUES({c})" for c in _INTENT_SESSIONS_UPDATE_COLUMNS)
+    sql = (
+        f"INSERT INTO intent_sessions ({columns_sql}) VALUES ({placeholders}) "
+        f"ON DUPLICATE KEY UPDATE {update_sql}"
+    )
+    return executemany_chunked(cursor, connection, sql, insert_rows)
+
+
 def _sync_intent_collection(
     brand_index: int,
     mongo_brand_id: str,
@@ -478,15 +684,26 @@ def _sync_intent_collection(
     upsert_fn,
     metadata_key: str,
     event_label: str,
+    watermark_field: str = "occurred_at",
     cursor=None,
     connection=None,
 ) -> None:
     """
     Shared sync flow for any Intent Mongo collection -> per-brand MySQL
     table: watermark fetch, one bounded query, extract+track-max, bulk
-    upsert, advance watermark, log. sync_intent_events_for_brand and
-    sync_click_events_for_brand both call this with their collection/table/
-    row-extractor-specific pieces, rather than duplicating the flow.
+    upsert, advance watermark, log. sync_intent_events_for_brand,
+    sync_click_events_for_brand, and sync_session_history_for_brand all
+    call this with their collection/table/row-extractor-specific pieces,
+    rather than duplicating the flow.
+
+    watermark_field controls which document field the incremental query
+    and watermark are based on - occurred_at (default) for the two
+    immutable per-event streams, but updatedAt for session_history, whose
+    documents get updated in place as a still-open session accumulates
+    more events (occurred_at/createdAt alone would miss those updates).
+    Regardless of which field is used, extract_row_fn's returned tuple must
+    end with the corresponding timestamp - _do_sync only ever reads it via
+    row[-1], never by field name.
     """
     client = None
     try:
@@ -503,28 +720,28 @@ def _sync_intent_collection(
             docs = collection.find(
                 {
                     "brand_id": mongo_brand_id,
-                    "occurred_at": {"$gt": query_lower_bound},
+                    watermark_field: {"$gt": query_lower_bound},
                 }
-            ).sort("occurred_at", 1)
+            ).sort(watermark_field, 1)
 
             rows: List[Tuple] = []
-            max_occurred_at: Optional[datetime] = None
+            max_watermark_value: Optional[datetime] = None
             for doc in docs:
                 row = extract_row_fn(doc)
                 if row is None:
                     continue
                 rows.append(row)
-                occurred_at = row[-1]
-                if occurred_at.tzinfo is None:
-                    occurred_at = occurred_at.replace(tzinfo=timezone.utc)
-                if max_occurred_at is None or occurred_at > max_occurred_at:
-                    max_occurred_at = occurred_at
+                watermark_value = row[-1]
+                if watermark_value.tzinfo is None:
+                    watermark_value = watermark_value.replace(tzinfo=timezone.utc)
+                if max_watermark_value is None or watermark_value > max_watermark_value:
+                    max_watermark_value = watermark_value
 
             inserted = upsert_fn(c, conn, rows)
 
-            if max_occurred_at is not None:
+            if max_watermark_value is not None:
                 update_pipeline_metadata_timestamp(
-                    c, conn, metadata_key, max_occurred_at.astimezone(IST)
+                    c, conn, metadata_key, max_watermark_value.astimezone(IST)
                 )
 
             logger.info(
@@ -586,6 +803,29 @@ def sync_click_events_for_brand(
         upsert_fn=_upsert_click_events,
         metadata_key=CLICK_EVENTS_METADATA_KEY,
         event_label="click events",
+        cursor=cursor,
+        connection=connection,
+    )
+
+
+def sync_session_history_for_brand(
+    brand_index: int,
+    mongo_brand_id: str,
+    brand_label: str,
+    cursor=None,
+    connection=None,
+) -> None:
+    _sync_intent_collection(
+        brand_index,
+        mongo_brand_id,
+        brand_label,
+        collection_resolver=_resolve_intent_session_history_collection,
+        ensure_table_fn=_ensure_intent_sessions_table,
+        extract_row_fn=_extract_session_history_row,
+        upsert_fn=_upsert_intent_sessions,
+        metadata_key=INTENT_SESSION_HISTORY_METADATA_KEY,
+        event_label="session history",
+        watermark_field="updatedAt",
         cursor=cursor,
         connection=connection,
     )

@@ -86,11 +86,13 @@ class IntentEventsWorkerTests(unittest.TestCase):
              mock.patch.object(worker.aws_background, "_parse_intent_db_map", return_value={"bbb_shop": "NOT_A_REAL_DB"}), \
              mock.patch.object(worker.aws_background, "active_brand_indices", []), \
              mock.patch.object(worker.aws_background, "sync_intent_events_for_brand") as mock_sync_events, \
-             mock.patch.object(worker.aws_background, "sync_click_events_for_brand") as mock_sync_clicks:
+             mock.patch.object(worker.aws_background, "sync_click_events_for_brand") as mock_sync_clicks, \
+             mock.patch.object(worker.aws_background, "sync_session_history_for_brand") as mock_sync_sessions:
             worker.run_worker()  # must not raise
 
         mock_sync_events.assert_not_called()
         mock_sync_clicks.assert_not_called()
+        mock_sync_sessions.assert_not_called()
 
     def test_mapped_db_database_is_synced(self):
         with mock.patch.object(worker.aws_background, "initialize_brand_configs"), \
@@ -98,13 +100,17 @@ class IntentEventsWorkerTests(unittest.TestCase):
              mock.patch.object(worker.aws_background, "active_brand_indices", [1]), \
              mock.patch.dict(os.environ, {"DB_DATABASE_1": "BBB"}), \
              mock.patch.object(worker.aws_background, "sync_intent_events_for_brand") as mock_sync_events, \
-             mock.patch.object(worker.aws_background, "sync_click_events_for_brand") as mock_sync_clicks:
+             mock.patch.object(worker.aws_background, "sync_click_events_for_brand") as mock_sync_clicks, \
+             mock.patch.object(worker.aws_background, "sync_session_history_for_brand") as mock_sync_sessions:
             worker.run_worker()
 
         mock_sync_events.assert_called_once_with(
             brand_index=1, mongo_brand_id="bbb_shop", brand_label="BBB"
         )
         mock_sync_clicks.assert_called_once_with(
+            brand_index=1, mongo_brand_id="bbb_shop", brand_label="BBB"
+        )
+        mock_sync_sessions.assert_called_once_with(
             brand_index=1, mongo_brand_id="bbb_shop", brand_label="BBB"
         )
 
@@ -117,11 +123,30 @@ class IntentEventsWorkerTests(unittest.TestCase):
              mock.patch.object(
                  worker.aws_background, "sync_click_events_for_brand",
                  side_effect=RuntimeError("boom"),
-             ) as mock_sync_clicks:
+             ) as mock_sync_clicks, \
+             mock.patch.object(worker.aws_background, "sync_session_history_for_brand") as mock_sync_sessions:
             worker.run_worker()  # must not raise despite the click-sync failure
 
         mock_sync_events.assert_called_once()
         mock_sync_clicks.assert_called_once()
+        mock_sync_sessions.assert_called_once()
+
+    def test_session_history_failure_does_not_block_the_other_two_syncs(self):
+        with mock.patch.object(worker.aws_background, "initialize_brand_configs"), \
+             mock.patch.object(worker.aws_background, "_parse_intent_db_map", return_value={"bbb_shop": "BBB"}), \
+             mock.patch.object(worker.aws_background, "active_brand_indices", [1]), \
+             mock.patch.dict(os.environ, {"DB_DATABASE_1": "BBB"}), \
+             mock.patch.object(worker.aws_background, "sync_intent_events_for_brand") as mock_sync_events, \
+             mock.patch.object(worker.aws_background, "sync_click_events_for_brand") as mock_sync_clicks, \
+             mock.patch.object(
+                 worker.aws_background, "sync_session_history_for_brand",
+                 side_effect=RuntimeError("boom"),
+             ) as mock_sync_sessions:
+            worker.run_worker()  # must not raise despite the session-history failure
+
+        mock_sync_events.assert_called_once()
+        mock_sync_clicks.assert_called_once()
+        mock_sync_sessions.assert_called_once()
 
 
 if __name__ == "__main__":

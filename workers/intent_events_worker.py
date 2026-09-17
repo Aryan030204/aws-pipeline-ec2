@@ -1,9 +1,10 @@
 """
 Standalone worker: ingests tracking events from the Intent MongoDB cluster
 (INTENT_MONGO_URI) into each mapped brand's own database - behavioral events
-(intent_sessions.events -> behavioral_events table) and click events
-(intent_sessions.click_events -> click_events table), two independent
-streams ingested per brand on every run.
+(intent_sessions.events -> behavioral_events table), click events
+(intent_sessions.click_events -> click_events table), and session rollups
+(intent_sessions.session_history -> intent_sessions table), three
+independent streams ingested per brand on every run.
 
 Same shape as the other per-brand-DB workers (workers/variant_wise_events_worker.py,
 workers/checkout_login_status_worker.py): writes into each brand's own
@@ -11,9 +12,10 @@ database, so it reuses the main pipeline's existing brand infrastructure
 (aws_background) rather than reimplementing per-brand DB config loading.
 The actual Mongo fetch/upsert/watermark logic lives in
 pipeline/intent_events.py (sync_intent_events_for_brand,
-sync_click_events_for_brand) and is shared with the rest of the pipeline;
-this file is just the scheduling/orchestration wrapper that runs both, per
-mapped brand, on its own schedule.
+sync_click_events_for_brand, sync_session_history_for_brand) and is shared
+with the rest of the pipeline; this file is just the scheduling/
+orchestration wrapper that runs all three, per mapped brand, on its own
+schedule.
 
 Unlike the other workers, brand applicability here is NOT driven by
 CI_EVENTS_BRANDS/is_ci_events_brand - it's driven entirely by INTENT_DB_MAP
@@ -112,6 +114,22 @@ def run_worker() -> None:
         except Exception as e:
             logger.error(
                 "Error running click events sync for mongo_brand_id=%s db_database=%s: %s",
+                mongo_brand_id,
+                db_database_value,
+                e,
+            )
+
+        # Independent try/except: a failure ingesting session history must
+        # not block either of the other two syncs, or vice versa.
+        try:
+            aws_background.sync_session_history_for_brand(
+                brand_index=brand_index,
+                mongo_brand_id=mongo_brand_id,
+                brand_label=db_database_value,
+            )
+        except Exception as e:
+            logger.error(
+                "Error running session history sync for mongo_brand_id=%s db_database=%s: %s",
                 mongo_brand_id,
                 db_database_value,
                 e,

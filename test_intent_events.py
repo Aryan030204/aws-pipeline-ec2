@@ -278,6 +278,194 @@ class EnsureColumnExistsTests(unittest.TestCase):
         self.assertEqual(connection.commit_count, 0)
 
 
+def _sample_session_history_doc(**overrides):
+    # Matches the real 6-step session document supplied by the user:
+    # 2x page_viewed, 3x click (all dead_click), 1x scroll_depth. visitor_id
+    # changes mid-session (starts equal to client_id, later resolves to a
+    # real persistent value) - deliberately preserved from the real example
+    # to exercise the "last non-null wins" rule.
+    doc = {
+        "brand_id": "bbb_shop",
+        "actor_id": "actor_1789628294501_tluczosx4encyuydxtzcb",
+        "session_id": "dd0bbbc3-03c2-471d-9493-ca71f4c71804",
+        "session_start": datetime(2026, 9, 17, 6, 58, 14, 199000, tzinfo=timezone.utc),
+        "session_end": datetime(2026, 9, 17, 6, 58, 47, 270000, tzinfo=timezone.utc),
+        "session_time_spent": 33071,
+        "events_seq": {
+            "1": {
+                "event_id": "sh-ae28a850-8466-4F13-302E-C090D7EA9BE1",
+                "event_name": "page_viewed",
+                "client_id": "ae28a842-C5FD-4EAD-9F78-D6EF4DA67710",
+                "visitor_id": "ae28a842-C5FD-4EAD-9F78-D6EF4DA67710",
+            },
+            "2": {
+                "event_id": "shu-ae28bc31-872D-4EC5-4191-67945EE6B014",
+                "event_name": "click",
+                "client_id": "ae28a842-c5fd-4ead-9f78-d6ef4da67710",
+                "visitor_id": "ae28a842-c5fd-4ead-9f78-d6ef4da67710",
+                "click_bucket": "dead_click",
+            },
+            "3": {
+                "event_id": "shu-ae28f708-F41A-46AE-A6CD-6C1964A0753B",
+                "event_name": "click",
+                "client_id": "ae28a842-c5fd-4ead-9f78-d6ef4da67710",
+                "visitor_id": "ae28a842-c5fd-4ead-9f78-d6ef4da67710",
+                "click_bucket": "dead_click",
+            },
+            "4": {
+                "event_id": "shu-ae29006c-0CED-4E2A-18AB-56143EB66A3B",
+                "event_name": "click",
+                "client_id": "ae28a842-c5fd-4ead-9f78-d6ef4da67710",
+                "visitor_id": "ae28a842-c5fd-4ead-9f78-d6ef4da67710",
+                "click_bucket": "dead_click",
+            },
+            "5": {
+                "event_id": "sh-ae292473-9B00-4C12-A70F-40F21346B13A",
+                "event_name": "page_viewed",
+                "client_id": "ae28a842-c5fd-4ead-9f78-d6ef4da67710",
+                "visitor_id": "9947030683943",
+            },
+            "6": {
+                "event_id": "baa768f8-e535-42cd-bc25-51f4ba7df120",
+                "event_name": "scroll_depth",
+                "client_id": "ae28a842-c5fd-4ead-9f78-d6ef4da67710",
+                "visitor_id": "9947030683943",
+            },
+        },
+        "updatedAt": datetime(2026, 9, 17, 6, 58, 48, 698000, tzinfo=timezone.utc),
+    }
+    doc.update(overrides)
+    return doc
+
+
+class ExtractSessionHistoryRowTests(unittest.TestCase):
+    def test_extracts_all_fields_from_real_session_document(self):
+        row = ie._extract_session_history_row(_sample_session_history_doc())
+        self.assertIsNotNone(row)
+        (
+            session_id, actor_id, client_id, visitor_id, session_start, session_end,
+            session_time_spent_ms, event_count, page_view_count, product_view_count,
+            click_count, useful_click_count, dead_click_count, add_to_cart_count,
+            checkout_started_count, scroll_count, event_sequence, updated_at,
+        ) = row
+
+        self.assertEqual(session_id, "dd0bbbc3-03c2-471d-9493-ca71f4c71804")
+        self.assertEqual(actor_id, "actor_1789628294501_tluczosx4encyuydxtzcb")
+        self.assertEqual(session_time_spent_ms, 33071)
+        self.assertEqual(event_count, 6)
+        self.assertEqual(page_view_count, 2)
+        self.assertEqual(product_view_count, 0)
+        self.assertEqual(click_count, 3)
+        self.assertEqual(dead_click_count, 3)
+        self.assertEqual(useful_click_count, 0)
+        self.assertEqual(add_to_cart_count, 0)
+        self.assertEqual(checkout_started_count, 0)
+        self.assertEqual(scroll_count, 1)
+        # visitor_id changes mid-session (steps 1-4: same as client_id;
+        # steps 5-6: resolves to "9947030683943") - last non-null wins.
+        self.assertEqual(visitor_id, "9947030683943")
+        self.assertEqual(client_id, "ae28a842-c5fd-4ead-9f78-d6ef4da67710")
+        self.assertEqual(
+            json.loads(event_sequence),
+            {
+                "1": {"page_viewed": "sh-ae28a850-8466-4F13-302E-C090D7EA9BE1"},
+                "2": {"click": "shu-ae28bc31-872D-4EC5-4191-67945EE6B014"},
+                "3": {"click": "shu-ae28f708-F41A-46AE-A6CD-6C1964A0753B"},
+                "4": {"click": "shu-ae29006c-0CED-4E2A-18AB-56143EB66A3B"},
+                "5": {"page_viewed": "sh-ae292473-9B00-4C12-A70F-40F21346B13A"},
+                "6": {"scroll_depth": "baa768f8-e535-42cd-bc25-51f4ba7df120"},
+            },
+        )
+        self.assertEqual(updated_at, _sample_session_history_doc()["updatedAt"])
+
+    def test_missing_session_id_is_skipped(self):
+        doc = _sample_session_history_doc(session_id="")
+        self.assertIsNone(ie._extract_session_history_row(doc))
+
+    def test_missing_actor_id_is_skipped(self):
+        doc = _sample_session_history_doc(actor_id="")
+        self.assertIsNone(ie._extract_session_history_row(doc))
+
+    def test_missing_updated_at_is_skipped(self):
+        doc = _sample_session_history_doc(updatedAt=None)
+        self.assertIsNone(ie._extract_session_history_row(doc))
+
+    def test_missing_session_start_is_skipped(self):
+        doc = _sample_session_history_doc(session_start=None)
+        self.assertIsNone(ie._extract_session_history_row(doc))
+
+    def test_missing_session_end_defaults_to_none(self):
+        # session_end is nullable - a still-open session hasn't closed yet.
+        doc = _sample_session_history_doc(session_end=None)
+        row = ie._extract_session_history_row(doc)
+        self.assertIsNotNone(row)
+        self.assertIsNone(row[5])  # session_end
+
+    def test_missing_events_seq_yields_zero_counts(self):
+        doc = _sample_session_history_doc(events_seq=None)
+        row = ie._extract_session_history_row(doc)
+        self.assertIsNotNone(row)
+        self.assertEqual(row[7], 0)  # event_count
+        self.assertEqual(json.loads(row[16]), {})  # event_sequence
+
+    def test_unrecognized_event_name_only_contributes_to_event_count(self):
+        doc = _sample_session_history_doc(
+            events_seq={
+                "1": {
+                    "event_id": "evt-1",
+                    "event_name": "some_future_event_type",
+                    "client_id": "c1",
+                    "visitor_id": "v1",
+                },
+            },
+        )
+        row = ie._extract_session_history_row(doc)
+        self.assertEqual(row[7], 1)  # event_count
+        self.assertEqual(row[8], 0)  # page_view_count
+        self.assertEqual(row[10], 0)  # click_count
+
+    def test_add_to_cart_and_checkout_started_counters(self):
+        doc = _sample_session_history_doc(
+            events_seq={
+                "1": {"event_id": "e1", "event_name": "product_added_to_cart"},
+                "2": {"event_id": "e2", "event_name": "checkout_started"},
+            },
+        )
+        row = ie._extract_session_history_row(doc)
+        self.assertEqual(row[7], 2)  # event_count
+        self.assertEqual(row[13], 1)  # add_to_cart_count
+        self.assertEqual(row[14], 1)  # checkout_started_count
+
+
+class UpsertIntentSessionsTests(unittest.TestCase):
+    def test_builds_full_upsert_and_drops_trailing_watermark(self):
+        cursor = _DummyCursor()
+        connection = _DummyConnection()
+        row = ie._extract_session_history_row(_sample_session_history_doc())
+
+        inserted = ie._upsert_intent_sessions(cursor, connection, [row])
+
+        self.assertEqual(inserted, 1)
+        self.assertEqual(len(cursor.executemany_calls), 1)
+        sql, rows = cursor.executemany_calls[0]
+        self.assertIn("INSERT INTO intent_sessions", sql)
+        self.assertIn("ON DUPLICATE KEY UPDATE", sql)
+        self.assertIn("event_count = VALUES(event_count)", sql)
+        self.assertNotIn("session_id = VALUES(session_id)", sql)  # key column not in UPDATE clause
+        self.assertNotIn("created_at", sql)
+        self.assertNotIn("updated_at", sql)
+        # The trailing updatedAt (watermark-tracking only) must be dropped
+        # before the row reaches the actual INSERT params.
+        self.assertEqual(len(rows[0]), len(row) - 1)
+
+    def test_empty_rows_is_a_no_op(self):
+        cursor = _DummyCursor()
+        connection = _DummyConnection()
+        inserted = ie._upsert_intent_sessions(cursor, connection, [])
+        self.assertEqual(inserted, 0)
+        self.assertEqual(cursor.executemany_calls, [])
+
+
 class ParseIntentDbMapTests(unittest.TestCase):
     def test_valid_json_object(self):
         with mock.patch.dict("os.environ", {"INTENT_DB_MAP": '{"test_shop": "tmc"}'}):

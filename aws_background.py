@@ -362,6 +362,7 @@ from pipeline.intent_events import (
     _parse_intent_db_map,
     sync_intent_events_for_brand,
     sync_click_events_for_brand,
+    sync_session_history_for_brand,
 )
 from pipeline.utm_traffic import (
     fetch_shopify_utm_sessions_daily,
