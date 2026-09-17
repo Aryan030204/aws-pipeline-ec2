@@ -358,6 +358,7 @@ def _extract_session_history_row(doc: Dict[str, Any]) -> Optional[Tuple]:
         counters["checkout_started_count"],
         counters["scroll_count"],
         json.dumps(event_sequence, default=str),
+        session_start,  # occurred_at - a session spans a range, so this mirrors session_start
         updated_at,
     )
 
@@ -528,6 +529,8 @@ def _ensure_intent_sessions_table(cursor, connection) -> None:
 
             event_sequence JSON NULL,
 
+            occurred_at DATETIME(6) NULL,
+
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
                 ON UPDATE CURRENT_TIMESTAMP(6),
@@ -541,6 +544,7 @@ def _ensure_intent_sessions_table(cursor, connection) -> None:
         """
     )
     connection.commit()
+    _ensure_column_exists(cursor, connection, "intent_sessions", "occurred_at", "DATETIME(6) NULL")
 
 
 _BEHAVIORAL_UPSERT_COLUMNS = (
@@ -648,6 +652,7 @@ _INTENT_SESSIONS_UPSERT_COLUMNS = (
     "checkout_started_count",
     "scroll_count",
     "event_sequence",
+    "occurred_at",
 )
 _INTENT_SESSIONS_UPDATE_COLUMNS = tuple(
     c for c in _INTENT_SESSIONS_UPSERT_COLUMNS if c != "session_id"

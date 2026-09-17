@@ -346,7 +346,7 @@ class ExtractSessionHistoryRowTests(unittest.TestCase):
             session_id, actor_id, client_id, visitor_id, session_start, session_end,
             session_time_spent_ms, event_count, page_view_count, product_view_count,
             click_count, useful_click_count, dead_click_count, add_to_cart_count,
-            checkout_started_count, scroll_count, event_sequence, updated_at,
+            checkout_started_count, scroll_count, event_sequence, occurred_at, updated_at,
         ) = row
 
         self.assertEqual(session_id, "dd0bbbc3-03c2-471d-9493-ca71f4c71804")
@@ -376,6 +376,7 @@ class ExtractSessionHistoryRowTests(unittest.TestCase):
                 "6": {"scroll_depth": "baa768f8-e535-42cd-bc25-51f4ba7df120"},
             },
         )
+        self.assertEqual(occurred_at, _sample_session_history_doc()["session_start"])
         self.assertEqual(updated_at, _sample_session_history_doc()["updatedAt"])
 
     def test_missing_session_id_is_skipped(self):
@@ -451,6 +452,7 @@ class UpsertIntentSessionsTests(unittest.TestCase):
         self.assertIn("INSERT INTO intent_sessions", sql)
         self.assertIn("ON DUPLICATE KEY UPDATE", sql)
         self.assertIn("event_count = VALUES(event_count)", sql)
+        self.assertIn("occurred_at = VALUES(occurred_at)", sql)
         self.assertNotIn("session_id = VALUES(session_id)", sql)  # key column not in UPDATE clause
         self.assertNotIn("created_at", sql)
         self.assertNotIn("updated_at", sql)
