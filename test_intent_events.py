@@ -543,5 +543,100 @@ class UpsertClickEventsTests(unittest.TestCase):
         self.assertEqual(cursor.executemany_calls, [])
 
 
+class SyncIntentCollectionDeletionTests(unittest.TestCase):
+    """
+    Exercises _sync_intent_collection's delete-after-ingest behavior
+    directly, with fake collection_resolver/ensure_table_fn/extract_row_fn/
+    upsert_fn - simplest way to test the delete/no-delete decision without
+    needing real Mongo documents or real table schemas.
+    """
+
+    @staticmethod
+    def _extract_row_fn(doc):
+        return (doc["event_id"], doc["occurred_at"])
+
+    @staticmethod
+    def _sample_docs(event_ids):
+        return [
+            {"event_id": eid, "occurred_at": datetime(2026, 9, 18, 10, 0, tzinfo=timezone.utc)}
+            for eid in event_ids
+        ]
+
+    def _make_fake_collection(self, docs):
+        # collection.find(...) returns a chainable pymongo-style cursor;
+        # .sort(field, direction) returns the actual iterable of docs.
+        fake_cursor = mock.Mock()
+        fake_cursor.sort.return_value = list(docs)
+
+        fake_collection = mock.Mock()
+        fake_collection.find.return_value = fake_cursor
+        fake_collection.delete_many.return_value = mock.Mock(deleted_count=len(docs))
+        return fake_collection
+
+    def _run(self, fake_collection, *, delete_after_ingest=False, upsert_fn=None):
+        ie._sync_intent_collection(
+            brand_index=1,
+            mongo_brand_id="bbb_shop",
+            brand_label="BBB",
+            collection_resolver=lambda: (None, fake_collection),
+            ensure_table_fn=lambda c, conn: None,
+            extract_row_fn=self._extract_row_fn,
+            upsert_fn=upsert_fn or (lambda c, conn, rows: len(rows)),
+            metadata_key="test_watermark_key",
+            event_label="test events",
+            delete_after_ingest=delete_after_ingest,
+            cursor=_DummyCursor(),
+            connection=_DummyConnection(),
+        )
+
+    def test_deletes_by_event_id_after_successful_upsert(self):
+        fake_collection = self._make_fake_collection(self._sample_docs(["e1", "e2"]))
+
+        self._run(fake_collection, delete_after_ingest=True)
+
+        fake_collection.delete_many.assert_called_once_with({"event_id": {"$in": ["e1", "e2"]}})
+
+    def test_does_not_delete_when_upsert_raises(self):
+        fake_collection = self._make_fake_collection(self._sample_docs(["e1"]))
+
+        def failing_upsert(c, conn, rows):
+            raise RuntimeError("boom")
+
+        self._run(fake_collection, delete_after_ingest=True, upsert_fn=failing_upsert)  # must not raise
+
+        fake_collection.delete_many.assert_not_called()
+
+    def test_session_history_never_deletes_by_default(self):
+        # sync_session_history_for_brand doesn't pass delete_after_ingest,
+        # so it stays at its default (False) - simulated here directly.
+        fake_collection = self._make_fake_collection(self._sample_docs(["e1"]))
+
+        self._run(fake_collection)  # delete_after_ingest defaults to False
+
+        fake_collection.delete_many.assert_not_called()
+
+    def test_kill_switch_disables_deletion(self):
+        fake_collection = self._make_fake_collection(self._sample_docs(["e1"]))
+
+        with mock.patch.object(ie, "INTENT_DELETE_INGESTED_DOCS", False):
+            self._run(fake_collection, delete_after_ingest=True)
+
+        fake_collection.delete_many.assert_not_called()
+
+    def test_delete_failure_is_caught_and_does_not_raise(self):
+        fake_collection = self._make_fake_collection(self._sample_docs(["e1"]))
+        fake_collection.delete_many.side_effect = RuntimeError("mongo boom")
+
+        self._run(fake_collection, delete_after_ingest=True)  # must not raise
+
+    def test_deletes_are_chunked_at_executemany_chunk_size(self):
+        fake_collection = self._make_fake_collection(self._sample_docs(["e1", "e2", "e3"]))
+
+        with mock.patch.object(ie, "EXECUTEMANY_CHUNK_SIZE", 2):
+            self._run(fake_collection, delete_after_ingest=True)
+
+        self.assertEqual(fake_collection.delete_many.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

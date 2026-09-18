@@ -24,6 +24,7 @@ from pipeline.db import (
     executemany_chunked,
     get_pipeline_metadata_timestamp,
     update_pipeline_metadata_timestamp,
+    EXECUTEMANY_CHUNK_SIZE,
 )
 
 INTENT_METADATA_KEY = "intent_events_last_occurred_at"
@@ -31,6 +32,12 @@ CLICK_EVENTS_METADATA_KEY = "intent_click_events_last_occurred_at"
 INTENT_SESSION_HISTORY_METADATA_KEY = "intent_session_history_last_updated_at"
 INTENT_OVERLAP = timedelta(minutes=5)
 INTENT_DEFAULT_LOOKBACK = timedelta(hours=1)
+
+# Kill-switch for the delete-after-ingest behavior below - flip to "false"
+# to disable without a code revert/redeploy if anything looks wrong.
+INTENT_DELETE_INGESTED_DOCS = (
+    os.environ.get("INTENT_DELETE_INGESTED_DOCS", "true").strip().lower() == "true"
+)
 
 # event_name -> intent_sessions counter column. Anything not in this map
 # still counts toward event_count but not a specific typed counter -
@@ -678,6 +685,21 @@ def _upsert_intent_sessions(cursor, connection, rows: List[Tuple]) -> int:
     return executemany_chunked(cursor, connection, sql, insert_rows)
 
 
+def _delete_ingested_documents(collection, event_ids: List[str]) -> int:
+    """
+    Deletes documents by event_id, chunked at EXECUTEMANY_CHUNK_SIZE (same
+    constant the MySQL side chunks on). Only ever called after upsert_fn has
+    already returned successfully for these exact rows - see the
+    delete_after_ingest usage in _sync_intent_collection below.
+    """
+    deleted = 0
+    for i in range(0, len(event_ids), EXECUTEMANY_CHUNK_SIZE):
+        chunk = event_ids[i : i + EXECUTEMANY_CHUNK_SIZE]
+        result = collection.delete_many({"event_id": {"$in": chunk}})
+        deleted += result.deleted_count
+    return deleted
+
+
 def _sync_intent_collection(
     brand_index: int,
     mongo_brand_id: str,
@@ -690,6 +712,7 @@ def _sync_intent_collection(
     metadata_key: str,
     event_label: str,
     watermark_field: str = "occurred_at",
+    delete_after_ingest: bool = False,
     cursor=None,
     connection=None,
 ) -> None:
@@ -709,6 +732,18 @@ def _sync_intent_collection(
     Regardless of which field is used, extract_row_fn's returned tuple must
     end with the corresponding timestamp - _do_sync only ever reads it via
     row[-1], never by field name.
+
+    delete_after_ingest (default False - only sync_intent_events_for_brand
+    and sync_click_events_for_brand opt in) deletes each row's source
+    document from Mongo by event_id, but ONLY after upsert_fn has already
+    returned successfully - i.e. the whole batch is durably committed to
+    MySQL. Deliberately NOT used for session_history: those documents get
+    updated in place as a session continues, so deleting one after a
+    successful-but-mid-session ingest would silently truncate that
+    session's eventual rollup. A delete failure is caught and logged, never
+    re-raised - it must not undo or block a MySQL write that already
+    succeeded; the document just stays in Mongo for a retry next run (or a
+    TTL backstop, if one is configured).
     """
     client = None
     try:
@@ -754,6 +789,20 @@ def _sync_intent_collection(
                 f"(mongo_brand_id={mongo_brand_id}): {inserted} row(s)"
             )
 
+            if delete_after_ingest and INTENT_DELETE_INGESTED_DOCS and rows:
+                try:
+                    event_ids = [row[0] for row in rows]
+                    deleted = _delete_ingested_documents(collection, event_ids)
+                    logger.info(
+                        f"Deleted {deleted} ingested {event_label} document(s) from Mongo "
+                        f"for brand={brand_label} (mongo_brand_id={mongo_brand_id})"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Error deleting ingested {event_label} documents from Mongo for "
+                        f"brand={brand_label} (mongo_brand_id={mongo_brand_id}): {e}"
+                    )
+
         if cursor is not None:
             _do_sync(cursor, connection)
         else:
@@ -786,6 +835,7 @@ def sync_intent_events_for_brand(
         upsert_fn=_upsert_behavioral_events,
         metadata_key=INTENT_METADATA_KEY,
         event_label="behavioral events",
+        delete_after_ingest=True,
         cursor=cursor,
         connection=connection,
     )
@@ -808,6 +858,7 @@ def sync_click_events_for_brand(
         upsert_fn=_upsert_click_events,
         metadata_key=CLICK_EVENTS_METADATA_KEY,
         event_label="click events",
+        delete_after_ingest=True,
         cursor=cursor,
         connection=connection,
     )
