@@ -2,11 +2,13 @@
 Standalone worker: builds the daily brand-level P&L (overall_pnl) in each
 brand's own database - overall only, not per product.
 
-The only table this worker ever writes is `overall_pnl`, which is created
-by migrations/003_overall_pnl.sql (run once per brand DB); the worker runs
-no DDL of its own. Every other table it touches (gross_summary, discount_summary, overall_summary,
-rto_summary, returns_fact, pnl_meta_ad_spend_rollup) is read-only here and
-owned by the main pipeline / the Meta sync.
+The tables this worker writes are `overall_pnl` (migrations/003_overall_pnl.sql)
+and the two ad-spend rollups `pnl_meta_ad_spend_rollup` /
+`pnl_google_ad_spend_rollup` (migrations/004_pnl_ad_spend_rollups.sql), all
+created once per brand DB by those migrations; the worker runs no DDL of its
+own. Every other table it touches (gross_summary, discount_summary,
+overall_summary, rto_summary, returns_fact) is read-only here and owned by
+the main pipeline.
 
 Reads and writes both use the brand's own database connection (the
 db_host/db_user/... the brand-config API returns for that tenant, loaded by
@@ -34,9 +36,27 @@ A brand with no document at all is costed entirely from
 DEFAULT_COST_PERCENTAGES (and GST at DEFAULT_GST_PCT); its rows are tagged
 cost_config_source='default'. A brand with a document is tagged 'mongo',
 and any individual line that is null/missing in it falls back to that
-line's default. Meta ad spend is taken from pnl_meta_ad_spend_rollup when
-that table has a synced row for the day, else from the configured/default
-`meta` cost.
+line's default.
+
+Paid-ads spend (the `meta` and `google` lines) is synced from the ad
+platforms themselves, per brand, right before the P&L is built - but only
+when the brand has pasted its credentials on the dashboard's P&L page. Those
+land in the same arch-auth Mongo database as total_config, one document per
+brand, keyed by the same brand_id:
+
+    meta_ads_credentials   {brand_id, ad_account_id, access_token_encrypted, ...}
+    google_ads_credentials {brand_id, customer_id, login_customer_id, token_encrypted, ...}
+
+Tokens are AES-256-CBC encrypted with PASSWORD_AES_KEY (same helper the
+dashboard uses). For each channel with a document the worker pulls spend
+for exactly the target dates (never more), upserts one row per date into
+that channel's rollup table, and records any API failure on the document's
+`last_error` so the dashboard can show it. A brand without a document for a
+channel is simply skipped for that channel - nothing is fetched. The P&L row
+then takes the rollup figure when the day has one (meta_spend_synced /
+google_spend_synced = 1), else the configured/default cost for that line.
+The dashboard reads the rollup tables directly for those two lines, so an
+unsynced day shows "-" there rather than the estimate written here.
 
 Per date, for each brand:
 
@@ -70,13 +90,15 @@ Same shape as the other per-brand-DB workers (checkout_login_status_worker
 etc): brand discovery and DB access come from aws_background / pipeline.db.
 """
 
+import base64
 import calendar
+import json
 import logging
 import os
 import sys
 from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Dict, List, Optional, Sequence, Set
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -97,8 +119,14 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-PNL_TABLE = "overall_pnl"  # the only table this worker writes; DDL in migrations/003_overall_pnl.sql
-META_SPEND_TABLE = "pnl_meta_ad_spend_rollup"  # read-only
+PNL_TABLE = "overall_pnl"  # DDL in migrations/003_overall_pnl.sql
+# Daily ad spend per channel, one row per date; DDL in migrations/004_pnl_ad_spend_rollups.sql.
+META_SPEND_TABLE = "pnl_meta_ad_spend_rollup"
+GOOGLE_SPEND_TABLE = "pnl_google_ad_spend_rollup"
+SPEND_TABLES = {"meta": META_SPEND_TABLE, "google": GOOGLE_SPEND_TABLE}
+# Which account the rollup row was pulled for, per channel's own id column.
+SPEND_ACCOUNT_COLUMNS = {"meta": "ad_account_id", "google": "customer_id"}
+AD_CHANNELS = ("meta", "google")
 
 # The cost configs live in the arch-auth database, which is not necessarily
 # the cluster the pipeline's MONGO_URI (events) points at.
@@ -110,6 +138,35 @@ PNL_CONFIG_MONGO_DB = os.environ.get("PNL_CONFIG_MONGO_DB", "arch-auth").strip()
 PNL_CONFIG_COLLECTION = (
     os.environ.get("PNL_CONFIG_COLLECTION", "total_config").strip() or "total_config"
 )
+# Per-brand ad credentials pasted on the dashboard's P&L page, same database.
+PNL_META_CREDENTIALS_COLLECTION = (
+    os.environ.get("PNL_META_CREDENTIALS_COLLECTION", "meta_ads_credentials").strip() or "meta_ads_credentials"
+)
+PNL_GOOGLE_CREDENTIALS_COLLECTION = (
+    os.environ.get("PNL_GOOGLE_CREDENTIALS_COLLECTION", "google_ads_credentials").strip()
+    or "google_ads_credentials"
+)
+CREDENTIAL_COLLECTIONS = {
+    "meta": PNL_META_CREDENTIALS_COLLECTION,
+    "google": PNL_GOOGLE_CREDENTIALS_COLLECTION,
+}
+
+# Shared secret the dashboard encrypts pasted tokens with (analytics/shared/utils/crypto.js).
+PASSWORD_AES_KEY = os.environ.get("PASSWORD_AES_KEY", "")
+
+# Ad platform APIs. Meta only needs the brand's own token; Google Ads also
+# needs this deployment's OAuth client (to turn the brand's refresh token into
+# an access token) and a developer token, none of which are per brand.
+META_GRAPH_URL = "https://graph.facebook.com"
+META_API_VERSION = os.environ.get("META_API_VERSION", "v21.0").strip() or "v21.0"
+GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_ADS_BASE_URL = "https://googleads.googleapis.com"
+GOOGLE_ADS_API_VERSION = os.environ.get("GOOGLE_ADS_API_VERSION", "v25").strip() or "v25"
+GOOGLE_ADS_CLIENT_ID = os.environ.get("GOOGLE_ADS_CLIENT_ID", "").strip()
+GOOGLE_ADS_CLIENT_SECRET = os.environ.get("GOOGLE_ADS_CLIENT_SECRET", "").strip()
+GOOGLE_ADS_DEVELOPER_TOKEN = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN", "").strip()
+AD_API_TIMEOUT_S = int(os.environ.get("PNL_AD_API_TIMEOUT_S", "30"))
+AD_API_MAX_PAGES = 50
 
 # Rolling rebuild window (yesterday and the N-1 days before it), or an explicit
 # range for backfills.
@@ -208,7 +265,7 @@ MONEY_COLUMNS = (
     "prepaid_sales",
     "partially_prepaid_sales",
 )
-INT_COLUMNS = ("total_orders", "rto_orders", "meta_spend_synced")
+INT_COLUMNS = ("total_orders", "rto_orders", "meta_spend_synced", "google_spend_synced")
 RATE_COLUMNS = ("gst_pct",)
 TEXT_COLUMNS = ("cost_config_source",)
 KEY_COLUMNS = ("brand_key", "date")
@@ -450,13 +507,18 @@ def fetch_returns_rows(cursor, start: date, end: date) -> Dict[date, Dict[str, D
     return rows
 
 
-def fetch_meta_spend_rows(cursor, start: date, end: date) -> Dict[date, Decimal]:
-    """Empty when the rollup table hasn't been created for this brand yet."""
-    cursor.execute("SHOW TABLES LIKE %s", (META_SPEND_TABLE,))
-    if not cursor.fetchone():
+def table_exists(cursor, table: str) -> bool:
+    cursor.execute("SHOW TABLES LIKE %s", (table,))
+    return bool(cursor.fetchone())
+
+
+def fetch_spend_rows(cursor, table: str, start: date, end: date) -> Dict[date, Decimal]:
+    """Synced daily spend from one ad-spend rollup table. Empty when the
+    table hasn't been migrated into this brand DB yet."""
+    if not table_exists(cursor, table):
         return {}
     cursor.execute(
-        f"SELECT `date`, spend FROM `{META_SPEND_TABLE}` WHERE `date` BETWEEN %s AND %s",
+        f"SELECT `date`, spend FROM `{table}` WHERE `date` BETWEEN %s AND %s",
         (start, end),
     )
     return {_as_date(row["date"]): money(row["spend"]) for row in cursor.fetchall() or []}
@@ -471,6 +533,341 @@ def _as_date(value) -> date:
 
 
 # ---------------------------
+# Ad credentials (Mongo) + token decryption
+# ---------------------------
+class AdSpendSyncError(Exception):
+    """A channel's spend couldn't be pulled; the message is safe to store on
+    the brand's credential document and show on the dashboard."""
+
+
+def _aes_key(raw: str) -> bytes:
+    """Same key convention as the dashboard's crypto.js: utf-8 bytes, cut to
+    32 or zero-padded up to 32."""
+    return raw.encode("utf-8")[:32].ljust(32, b"\0")
+
+
+def decrypt_text(enc: str, key: str = "") -> str:
+    """Inverse of the dashboard's encryptText: "<iv b64>:<AES-256-CBC b64>"."""
+    from cryptography.hazmat.primitives import padding
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    secret = key or PASSWORD_AES_KEY
+    if not secret:
+        raise AdSpendSyncError("PASSWORD_AES_KEY is not configured on the worker; cannot decrypt the token")
+    if not isinstance(enc, str) or enc.count(":") != 1:
+        raise AdSpendSyncError("Stored token has an invalid encrypted format")
+    iv_b64, body_b64 = enc.split(":")
+    iv, body = base64.b64decode(iv_b64), base64.b64decode(body_b64)
+    decryptor = Cipher(algorithms.AES(_aes_key(secret)), modes.CBC(iv)).decryptor()
+    padded = decryptor.update(body) + decryptor.finalize()
+    unpadder = padding.PKCS7(128).unpadder()
+    return (unpadder.update(padded) + unpadder.finalize()).decode("utf-8")
+
+
+def fetch_ad_credential_docs(brand_key: str) -> Dict[str, Optional[Dict]]:
+    """{"meta": doc | None, "google": doc | None} for the brand, from the
+    arch-auth Mongo database. A channel with no document is one the brand
+    never connected: nothing is fetched for it."""
+    from pymongo import MongoClient
+
+    empty: Dict[str, Optional[Dict]] = {channel: None for channel in AD_CHANNELS}
+    if not PNL_CONFIG_MONGO_URI:
+        return empty
+
+    client = MongoClient(PNL_CONFIG_MONGO_URI, tz_aware=True)
+    try:
+        db = client[PNL_CONFIG_MONGO_DB]
+        return {
+            channel: db[CREDENTIAL_COLLECTIONS[channel]].find_one({"brand_id": brand_key})
+            for channel in AD_CHANNELS
+        }
+    finally:
+        client.close()
+
+
+def record_credential_error(brand_key: str, channel: str, message: Optional[str]) -> None:
+    """Best-effort: stores (or clears, with None) the last sync failure on the
+    brand's credential document so the dashboard can surface it."""
+    from pymongo import MongoClient
+
+    if not PNL_CONFIG_MONGO_URI:
+        return
+    try:
+        client = MongoClient(PNL_CONFIG_MONGO_URI, tz_aware=True)
+        try:
+            client[PNL_CONFIG_MONGO_DB][CREDENTIAL_COLLECTIONS[channel]].update_one(
+                {"brand_id": brand_key},
+                {"$set": {"last_error": (message or "")[:500] or None}},
+            )
+        finally:
+            client.close()
+    except Exception as e:  # noqa: BLE001 - never let bookkeeping break the sync
+        logger.warning("Could not record %s credential status for %s: %s", channel, brand_key, e)
+
+
+# ---------------------------
+# Ad platform APIs (spend for exactly the target dates)
+# ---------------------------
+def _api_error_message(payload) -> str:
+    body = payload[0] if isinstance(payload, list) and payload else payload
+    if not isinstance(body, dict):
+        return "request failed"
+    err = body.get("error")
+    if isinstance(err, dict):
+        details = err.get("details") or []
+        first = details[0] if details and isinstance(details[0], dict) else {}
+        errors = first.get("errors") or []
+        nested = errors[0].get("message") if errors and isinstance(errors[0], dict) else None
+        return str(nested or err.get("message") or err)
+    return str(body.get("error_description") or err or "request failed")
+
+
+def _json_or_raise(response, label: str) -> Dict:
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    if response.status_code >= 400 or (isinstance(payload, dict) and payload.get("error")):
+        raise AdSpendSyncError(f"{label}: {_api_error_message(payload) or response.status_code}")
+    return payload if isinstance(payload, dict) else {}
+
+
+def normalize_meta_ad_account_id(raw) -> str:
+    value = str(raw or "").strip()
+    return value if value.startswith("act_") else f"act_{value}"
+
+
+def normalize_google_customer_id(raw) -> str:
+    return "".join(ch for ch in str(raw or "") if ch.isdigit())
+
+
+def fetch_meta_spend_from_api(access_token: str, ad_account_id: str, start: date, end: date) -> Dict[date, Dict]:
+    """Account-level daily spend from the Marketing API insights edge, for
+    [start, end] only. {date: {"spend", "currency", "account_id"}}; days Meta
+    returns nothing for are absent (the caller writes them as 0)."""
+    import requests
+
+    account = normalize_meta_ad_account_id(ad_account_id)
+    url = f"{META_GRAPH_URL}/{META_API_VERSION}/{account}/insights"
+    params: Optional[Dict] = {
+        "fields": "spend,account_currency",
+        "level": "account",
+        "time_increment": 1,
+        "time_range": json.dumps({"since": start.isoformat(), "until": end.isoformat()}),
+        "limit": 500,
+        "access_token": access_token,
+    }
+    rows: Dict[date, Dict] = {}
+    for _ in range(AD_API_MAX_PAGES):
+        try:
+            response = requests.get(url, params=params, timeout=AD_API_TIMEOUT_S)
+        except requests.RequestException as e:
+            raise AdSpendSyncError(f"Meta insights request failed: {e.__class__.__name__}") from e
+        payload = _json_or_raise(response, "Meta insights")
+        for item in payload.get("data") or []:
+            if not item.get("date_start"):
+                continue
+            day = _as_date(item["date_start"])
+            entry = rows.setdefault(day, {"spend": ZERO, "currency": None, "account_id": account})
+            entry["spend"] = money(entry["spend"] + money(item.get("spend")))
+            entry["currency"] = entry["currency"] or item.get("account_currency") or None
+        next_url = (payload.get("paging") or {}).get("next")
+        if not next_url:
+            break
+        url, params = next_url, None  # paging.next already carries the token + params
+    return rows
+
+
+def google_access_token(refresh_token: str) -> str:
+    import requests
+
+    if not GOOGLE_ADS_CLIENT_ID or not GOOGLE_ADS_CLIENT_SECRET:
+        raise AdSpendSyncError("GOOGLE_ADS_CLIENT_ID / GOOGLE_ADS_CLIENT_SECRET are not configured on the worker")
+    try:
+        response = requests.post(
+            GOOGLE_OAUTH_TOKEN_URL,
+            data={
+                "client_id": GOOGLE_ADS_CLIENT_ID,
+                "client_secret": GOOGLE_ADS_CLIENT_SECRET,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+            timeout=AD_API_TIMEOUT_S,
+        )
+    except requests.RequestException as e:
+        raise AdSpendSyncError(f"Google token refresh failed: {e.__class__.__name__}") from e
+    payload = _json_or_raise(response, "Google token refresh")
+    token = payload.get("access_token")
+    if not token:
+        raise AdSpendSyncError("Google token refresh returned no access token")
+    return str(token)
+
+
+def fetch_google_spend_from_api(
+    refresh_token: str,
+    customer_id: str,
+    login_customer_id: Optional[str],
+    start: date,
+    end: date,
+) -> Dict[date, Dict]:
+    """Daily cost for one Google Ads customer via googleAds:search, for
+    [start, end] only. Same shape as fetch_meta_spend_from_api; cost_micros
+    / 1e6 = currency units."""
+    import requests
+
+    if not GOOGLE_ADS_DEVELOPER_TOKEN:
+        raise AdSpendSyncError("GOOGLE_ADS_DEVELOPER_TOKEN is not configured on the worker")
+    cid = normalize_google_customer_id(customer_id)
+    if not cid:
+        raise AdSpendSyncError("Google Ads credential has no customer_id")
+
+    headers = {
+        "Authorization": f"Bearer {google_access_token(refresh_token)}",
+        "developer-token": GOOGLE_ADS_DEVELOPER_TOKEN,
+    }
+    login = normalize_google_customer_id(login_customer_id)
+    if login:
+        headers["login-customer-id"] = login
+
+    url = f"{GOOGLE_ADS_BASE_URL}/{GOOGLE_ADS_API_VERSION}/customers/{cid}/googleAds:search"
+    query = (
+        "SELECT segments.date, metrics.cost_micros, customer.currency_code FROM customer "
+        f"WHERE segments.date BETWEEN '{start.isoformat()}' AND '{end.isoformat()}' ORDER BY segments.date"
+    )
+    rows: Dict[date, Dict] = {}
+    page_token = None
+    for _ in range(AD_API_MAX_PAGES):
+        body = {"query": query, "pageToken": page_token} if page_token else {"query": query}
+        try:
+            response = requests.post(url, json=body, headers=headers, timeout=AD_API_TIMEOUT_S)
+        except requests.RequestException as e:
+            raise AdSpendSyncError(f"Google Ads request failed: {e.__class__.__name__}") from e
+        payload = _json_or_raise(response, "Google Ads")
+        for result in payload.get("results") or []:
+            day_str = (result.get("segments") or {}).get("date")
+            if not day_str:
+                continue
+            day = _as_date(day_str)
+            micros = Decimal(str((result.get("metrics") or {}).get("costMicros") or 0))
+            entry = rows.setdefault(day, {"spend": ZERO, "currency": None, "account_id": cid})
+            entry["spend"] += micros / Decimal(1_000_000)
+            entry["currency"] = entry["currency"] or (result.get("customer") or {}).get("currencyCode") or None
+        page_token = payload.get("nextPageToken")
+        if not page_token:
+            break
+    for entry in rows.values():
+        entry["spend"] = money(entry["spend"])
+    return rows
+
+
+def fetch_channel_spend(channel: str, doc: Dict, start: date, end: date) -> Dict[date, Dict]:
+    """Decrypts the brand's token and pulls that channel's spend for the range."""
+    if channel == "meta":
+        return fetch_meta_spend_from_api(
+            decrypt_text(doc.get("access_token_encrypted")),
+            doc.get("ad_account_id"),
+            start,
+            end,
+        )
+    if channel == "google":
+        return fetch_google_spend_from_api(
+            decrypt_text(doc.get("token_encrypted")),
+            doc.get("customer_id"),
+            doc.get("login_customer_id"),
+            start,
+            end,
+        )
+    raise AdSpendSyncError(f"Unknown ad channel {channel!r}")
+
+
+# ---------------------------
+# Ad-spend rollups (brand DB)
+# ---------------------------
+def build_spend_rollup_rows(api_rows: Dict[date, Dict], target_dates: Sequence[date], account_id: str) -> List[Tuple]:
+    """One (date, account_id, spend, currency) per target date. A day the API
+    returned nothing for was still fetched, so it's written as 0 spend rather
+    than left missing - the sync did cover it."""
+    currency = next((entry.get("currency") for entry in api_rows.values() if entry.get("currency")), None)
+    rows = []
+    for day in target_dates:
+        entry = api_rows.get(day) or {}
+        rows.append((day, entry.get("account_id") or account_id, money(entry.get("spend")), entry.get("currency") or currency))
+    return rows
+
+
+def upsert_spend_rollup_rows(cursor, connection, table: str, account_column: str, rows: Sequence[Tuple]) -> int:
+    if not rows:
+        return 0
+    from pipeline.db import executemany_chunked
+
+    sql = (
+        f"INSERT INTO `{table}` (`date`, `{account_column}`, `spend`, `currency`) VALUES (%s, %s, %s, %s) "
+        f"ON DUPLICATE KEY UPDATE `{account_column}` = VALUES(`{account_column}`), "
+        "`spend` = VALUES(`spend`), `currency` = VALUES(`currency`)"
+    )
+    return executemany_chunked(cursor, connection, sql, list(rows))
+
+
+def sync_ad_spend(
+    cursor,
+    connection,
+    brand_key: str,
+    brand_name: str,
+    credentials: Dict[str, Optional[Dict]],
+    target_dates: Sequence[date],
+) -> Dict[str, str]:
+    """For every channel the brand has credentials for, pulls spend for the
+    target dates and upserts it into that channel's rollup table. Never
+    raises: a failed channel is logged, recorded on the credential document,
+    and the P&L still builds (that line falls back to the configured cost).
+    Returns {channel: "synced" | "no-credentials" | "no-table" | "failed"}."""
+    start, end = min(target_dates), max(target_dates)
+    outcomes: Dict[str, str] = {}
+    for channel in AD_CHANNELS:
+        doc = credentials.get(channel)
+        if not doc:
+            outcomes[channel] = "no-credentials"
+            logger.info("[%s] no %s credentials in Mongo; %s spend not fetched", brand_name, channel, channel)
+            continue
+        table = SPEND_TABLES[channel]
+        if not table_exists(cursor, table):
+            outcomes[channel] = "no-table"
+            logger.warning(
+                "[%s] %s credentials found but `%s` is missing in the brand DB; run migrations/004_pnl_ad_spend_rollups.sql",
+                brand_name,
+                channel,
+                table,
+            )
+            continue
+        try:
+            api_rows = fetch_channel_spend(channel, doc, start, end)
+            account_id = (
+                normalize_meta_ad_account_id(doc.get("ad_account_id"))
+                if channel == "meta"
+                else normalize_google_customer_id(doc.get("customer_id"))
+            )
+            rows = build_spend_rollup_rows(api_rows, target_dates, account_id)
+            written = upsert_spend_rollup_rows(cursor, connection, table, SPEND_ACCOUNT_COLUMNS[channel], rows)
+            record_credential_error(brand_key, channel, None)
+            outcomes[channel] = "synced"
+            logger.info(
+                "[%s] %s spend synced for %s..%s: %s day(s) written, total %s",
+                brand_name,
+                channel,
+                start,
+                end,
+                written,
+                sum(row[2] for row in rows),
+            )
+        except Exception as e:  # noqa: BLE001 - one channel failing must not sink the P&L
+            message = str(e) if isinstance(e, AdSpendSyncError) else f"{e.__class__.__name__}: {e}"
+            outcomes[channel] = "failed"
+            logger.error("[%s] %s spend sync failed: %s", brand_name, channel, message)
+            record_credential_error(brand_key, channel, message)
+    return outcomes
+
+
+# ---------------------------
 # P&L math
 # ---------------------------
 def compute_pnl_row(
@@ -480,6 +877,7 @@ def compute_pnl_row(
     meta_spend: Optional[Decimal],
     config: BrandPnlConfig,
     brand_key: str = "",
+    google_spend: Optional[Decimal] = None,
 ) -> Dict[str, object]:
     sales = sales or {}
     returns = returns or {}
@@ -494,6 +892,9 @@ def compute_pnl_row(
     meta_spend_synced = meta_spend is not None
     if meta_spend_synced:
         cost["meta"] = money(meta_spend)
+    google_spend_synced = google_spend is not None
+    if google_spend_synced:
+        cost["google"] = money(google_spend)
 
     gross_margin = net_sales - cost["cogs"] - cost["freight_inwards"]
     cm1 = gross_margin - cost["shipping"] - cost["rto"] - cost["payment_gateway"] - cost["packaging"]
@@ -530,6 +931,7 @@ def compute_pnl_row(
         "rto_orders": int(sales.get("rto_orders") or 0),
         "gst_pct": config.gst_pct.quantize(CENT, rounding=ROUND_HALF_UP),
         "meta_spend_synced": int(meta_spend_synced),
+        "google_spend_synced": int(google_spend_synced),
         "cost_config_source": config.source,
     }
 
@@ -574,12 +976,19 @@ def rebuild_brand_pnl(
         config.gst_pct,
         len(config.defaulted),
     )
+    credentials = fetch_ad_credential_docs(brand_key)
 
     with get_db_cursor(brand_index, dictionary=True) as (cursor, connection):
+        # Ad spend first, so the rollups already hold today's target dates
+        # when the P&L rows below read them. Only runs for channels the
+        # brand has credentials for; failures are logged and skipped.
+        outcomes = sync_ad_spend(cursor, connection, brand_key, brand_name, credentials, target_dates)
+
         # Reads: the source tables are only ever SELECTed here.
         sales_rows = fetch_sales_rows(cursor, start, end)
         returns_rows = fetch_returns_rows(cursor, start, end)
-        meta_rows = fetch_meta_spend_rows(cursor, start, end)
+        meta_rows = fetch_spend_rows(cursor, META_SPEND_TABLE, start, end)
+        google_rows = fetch_spend_rows(cursor, GOOGLE_SPEND_TABLE, start, end)
 
         rows = [
             compute_pnl_row(
@@ -589,16 +998,18 @@ def rebuild_brand_pnl(
                 meta_rows.get(day),
                 config,
                 brand_key=brand_key,
+                google_spend=google_rows.get(day),
             )
             for day in target_dates
         ]
 
-        # Writes: overall_pnl only (created by migrations/003_overall_pnl.sql).
+        # Writes: overall_pnl (created by migrations/003_overall_pnl.sql).
         written = upsert_pnl_rows(cursor, connection, rows)
 
+    logger.info("[%s] ad spend sync: %s", brand_name, ", ".join(f"{k}={v}" for k, v in outcomes.items()))
     for row in rows:
         logger.info(
-            "[%s] %s gross=%s cancel=%s net=%s cogs=%s meta=%s%s ebitda=%s costs=%s",
+            "[%s] %s gross=%s cancel=%s net=%s cogs=%s meta=%s%s google=%s%s ebitda=%s costs=%s",
             brand_name,
             row["date"].isoformat(),
             row["gross_sales"],
@@ -607,6 +1018,8 @@ def rebuild_brand_pnl(
             row["cogs"],
             row["meta"],
             "" if row["meta_spend_synced"] else " (not synced)",
+            row["google"],
+            "" if row["google_spend_synced"] else " (not synced)",
             row["ebitda"],
             row["cost_config_source"],
         )

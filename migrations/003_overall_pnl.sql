@@ -4,9 +4,9 @@
 -- Run this PER BRAND DATABASE before the P&L worker is deployed. The worker
 -- itself runs no DDL; it only upserts into this table.
 --
--- Idempotent: the CREATE uses IF NOT EXISTS, and the ADD COLUMN for `gst_pct`
--- (added after the table first shipped) is gated on information_schema, so
--- re-running the file is safe.
+-- Idempotent: the CREATE uses IF NOT EXISTS, and the ADD COLUMNs for
+-- `gst_pct` and `google_spend_synced` (added after the table first shipped)
+-- are gated on information_schema, so re-running the file is safe.
 --
 -- Usage, per brand database:
 --     mysql -h <host> -u <user> -p<pwd> <brand_db> < 003_overall_pnl.sql
@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS `overall_pnl` (
     `rto_orders`              INT           NOT NULL DEFAULT 0,
     `gst_pct`                 DECIMAL(5,2)  NOT NULL DEFAULT 18.00,
     `meta_spend_synced`       TINYINT(1)    NOT NULL DEFAULT 0,
+    `google_spend_synced`     TINYINT(1)    NOT NULL DEFAULT 0,
     `cost_config_source`      VARCHAR(16)   NOT NULL DEFAULT 'mongo',
     `computed_at`             TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP
                                             ON UPDATE CURRENT_TIMESTAMP,
@@ -87,6 +88,11 @@ DELIMITER ;
 
 CALL _overall_pnl_add_column_if_missing(
     'gst_pct', 'DECIMAL(5,2) NOT NULL DEFAULT 18.00 AFTER `partially_prepaid_sales`'
+);
+-- 1 when the day's `google` line came from pnl_google_ad_spend_rollup (see
+-- migrations/004_pnl_ad_spend_rollups.sql), mirroring meta_spend_synced.
+CALL _overall_pnl_add_column_if_missing(
+    'google_spend_synced', 'TINYINT(1) NOT NULL DEFAULT 0 AFTER `meta_spend_synced`'
 );
 
 DROP PROCEDURE IF EXISTS _overall_pnl_add_column_if_missing;
