@@ -1,4 +1,5 @@
-URBAN HINDUimport unittest
+import os
+import unittest
 from datetime import date, datetime
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
@@ -202,18 +203,25 @@ class ReturnsRowsTests(unittest.TestCase):
 
 
 class TableOwnershipTests(unittest.TestCase):
-    def test_only_overall_pnl_is_created_and_migrated(self):
-        cursor, connection = MagicMock(), MagicMock()
-        cursor.fetchone.return_value = None  # gst_pct column missing -> gets added
-        pnl_worker.ensure_overall_pnl_table(cursor, connection)
-        statements = [c[0][0] for c in cursor.execute.call_args_list]
+    def test_worker_runs_no_ddl(self):
+        """Table creation lives in migrations/003_overall_pnl.sql, not here."""
+        import inspect
+        import re
+
         self.assertEqual(pnl_worker.PNL_TABLE, "overall_pnl")
-        self.assertIn("CREATE TABLE IF NOT EXISTS `overall_pnl`", statements[0])
-        self.assertIn("`gst_pct` DECIMAL(5,2)", statements[0])
-        self.assertIn("PRIMARY KEY (`brand_key`, `date`)", statements[0])
-        self.assertTrue(any("ALTER TABLE `overall_pnl` ADD COLUMN `gst_pct`" in s for s in statements))
-        for statement in statements:
-            self.assertIn("overall_pnl", statement)
+        self.assertFalse(hasattr(pnl_worker, "ensure_overall_pnl_table"))
+        src = inspect.getsource(pnl_worker)
+        for verb in ("CREATE TABLE", "ALTER TABLE", "DROP TABLE"):
+            self.assertIsNone(re.search(rf"\b{verb}\b", src, re.IGNORECASE), f"worker contains {verb}")
+
+    def test_migration_creates_overall_pnl_if_not_exists(self):
+        migration_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migrations", "003_overall_pnl.sql")
+        with open(migration_path) as fh:
+            sql = fh.read()
+        self.assertIn("CREATE TABLE IF NOT EXISTS `overall_pnl`", sql)
+        self.assertIn("PRIMARY KEY (`brand_key`, `date`)", sql)
+        for column in pnl_worker.ALL_COLUMNS:
+            self.assertIn(f"`{column}`", sql, f"migration is missing column {column}")
 
     def test_upsert_never_overwrites_key_columns(self):
         cursor, connection = MagicMock(), MagicMock()

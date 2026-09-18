@@ -2,8 +2,9 @@
 Standalone worker: builds the daily brand-level P&L (overall_pnl) in each
 brand's own database - overall only, not per product.
 
-The only table this worker ever creates or writes is `overall_pnl`. Every
-other table it touches (gross_summary, discount_summary, overall_summary,
+The only table this worker ever writes is `overall_pnl`, which is created
+by migrations/003_overall_pnl.sql (run once per brand DB); the worker runs
+no DDL of its own. Every other table it touches (gross_summary, discount_summary, overall_summary,
 rto_summary, returns_fact, pnl_meta_ad_spend_rollup) is read-only here and
 owned by the main pipeline / the Meta sync.
 
@@ -96,7 +97,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-PNL_TABLE = "overall_pnl"  # the only table this worker creates / writes
+PNL_TABLE = "overall_pnl"  # the only table this worker writes; DDL in migrations/003_overall_pnl.sql
 META_SPEND_TABLE = "pnl_meta_ad_spend_rollup"  # read-only
 
 # The cost configs live in the arch-auth database, which is not necessarily
@@ -536,37 +537,6 @@ def compute_pnl_row(
 # ---------------------------
 # Target table (brand DB)
 # ---------------------------
-def ensure_overall_pnl_table(cursor, connection) -> None:
-    """Creates overall_pnl if missing. This is the only DDL the worker runs."""
-    money_defs = ",\n".join(f"    `{col}` DECIMAL(14,2) NOT NULL DEFAULT 0" for col in MONEY_COLUMNS)
-    cursor.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS `{PNL_TABLE}` (
-            `brand_key` VARCHAR(64) NOT NULL,
-            `date` DATE NOT NULL,
-        {money_defs},
-            `total_orders` INT NOT NULL DEFAULT 0,
-            `rto_orders` INT NOT NULL DEFAULT 0,
-            `gst_pct` DECIMAL(5,2) NOT NULL DEFAULT 18.00,
-            `meta_spend_synced` TINYINT(1) NOT NULL DEFAULT 0,
-            `cost_config_source` VARCHAR(16) NOT NULL DEFAULT 'mongo',
-            `computed_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-                ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (`brand_key`, `date`),
-            KEY `idx_overall_pnl_date` (`date`)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-        """
-    )
-    # Columns added after the table first shipped (still only overall_pnl).
-    for column, definition in (
-        ("gst_pct", "DECIMAL(5,2) NOT NULL DEFAULT 18.00 AFTER `partially_prepaid_sales`"),
-    ):
-        cursor.execute(f"SHOW COLUMNS FROM `{PNL_TABLE}` LIKE %s", (column,))
-        if not cursor.fetchone():
-            cursor.execute(f"ALTER TABLE `{PNL_TABLE}` ADD COLUMN `{column}` {definition}")
-    connection.commit()
-
-
 def upsert_pnl_rows(cursor, connection, rows: Sequence[Dict[str, object]]) -> int:
     if not rows:
         return 0
@@ -623,8 +593,7 @@ def rebuild_brand_pnl(
             for day in target_dates
         ]
 
-        # Writes: overall_pnl only.
-        ensure_overall_pnl_table(cursor, connection)
+        # Writes: overall_pnl only (created by migrations/003_overall_pnl.sql).
         written = upsert_pnl_rows(cursor, connection, rows)
 
     for row in rows:
