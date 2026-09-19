@@ -788,7 +788,12 @@ def _sync_intent_collection(
                 ]
             else:
                 query[watermark_field] = {"$gt": query_lower_bound}
-            docs = collection.find(query).sort(watermark_field, 1)
+            # Deliberately no server-side .sort(): order doesn't matter here
+            # (upserts are idempotent, the watermark is a max over all rows),
+            # and sorting on an unindexed field makes Mongo sort in memory,
+            # which fails past 32MB (QueryExceededMemoryLimitNoDiskUseAllowed)
+            # on large backlogs - and this cluster can't add indexes.
+            docs = collection.find(query)
 
             rows: List[Tuple] = []
             max_watermark_value: Optional[datetime] = None

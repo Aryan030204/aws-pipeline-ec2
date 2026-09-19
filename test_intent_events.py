@@ -563,13 +563,8 @@ class SyncIntentCollectionDeletionTests(unittest.TestCase):
         ]
 
     def _make_fake_collection(self, docs):
-        # collection.find(...) returns a chainable pymongo-style cursor;
-        # .sort(field, direction) returns the actual iterable of docs.
-        fake_cursor = mock.Mock()
-        fake_cursor.sort.return_value = list(docs)
-
         fake_collection = mock.Mock()
-        fake_collection.find.return_value = fake_cursor
+        fake_collection.find.return_value = list(docs)
         fake_collection.delete_many.return_value = mock.Mock(deleted_count=len(docs))
         return fake_collection
 
@@ -646,10 +641,8 @@ class SyncIntentCollectionWatermarkTests(unittest.TestCase):
     """
 
     def _run(self, docs, **kwargs):
-        fake_cursor = mock.Mock()
-        fake_cursor.sort.return_value = list(docs)
         fake_collection = mock.Mock()
-        fake_collection.find.return_value = fake_cursor
+        fake_collection.find.return_value = list(docs)
 
         stored = {}
         with mock.patch.object(
@@ -707,7 +700,9 @@ class SyncIntentCollectionWatermarkTests(unittest.TestCase):
         self.assertIn("createdAt", query["$or"][0])
         self.assertEqual(query["$or"][1]["createdAt"], {"$exists": False})
         self.assertIn("occurred_at", query["$or"][1])
-        fake_collection.find.return_value.sort.assert_called_once_with("createdAt", 1)
+        # No server-side sort: unindexed sorts fail past Mongo's 32MB limit.
+        fake_collection.find.assert_called_once()
+        self.assertEqual(len(fake_collection.find.call_args.args), 1)
 
     def test_query_without_fallback_is_a_plain_range_on_the_watermark_field(self):
         fake_collection, _ = self._run([], watermark_field="updatedAt")
