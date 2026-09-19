@@ -27,6 +27,7 @@ case-insensitively), a separate and independent gate.
 import logging
 import os
 import sys
+import time
 
 from dotenv import load_dotenv
 
@@ -71,6 +72,7 @@ def _resolve_brand_index_by_db_database(db_database_value: str):
 
 
 def run_worker() -> None:
+    run_started_at = time.monotonic()
     # initialize_brand_configs() appends to active_brand_indices without
     # resetting it; harmless for the once-a-day workers, but this runs every
     # 15 minutes in a long-lived process, so the list would grow unbounded.
@@ -82,7 +84,17 @@ def run_worker() -> None:
         logger.warning("INTENT_DB_MAP is empty. Nothing to do.")
         return
 
-    for mongo_brand_id, db_database_value in intent_db_map.items():
+    logger.info(
+        f"===== Intent events worker run started: {len(intent_db_map)} mapped brand(s) "
+        f"{sorted(intent_db_map)} ====="
+    )
+
+    for brand_number, (mongo_brand_id, db_database_value) in enumerate(intent_db_map.items(), start=1):
+        brand_started_at = time.monotonic()
+        logger.info(
+            f"--- Brand {brand_number}/{len(intent_db_map)}: mongo_brand_id={mongo_brand_id} "
+            f"-> db_database={db_database_value} ---"
+        )
         brand_index = _resolve_brand_index_by_db_database(db_database_value)
         if brand_index is None:
             logger.warning(
@@ -93,6 +105,7 @@ def run_worker() -> None:
             )
             continue
 
+        logger.info(f"Starting behavioral events ingestion for brand={db_database_value}")
         try:
             aws_background.sync_intent_events_for_brand(
                 brand_index=brand_index,
@@ -109,6 +122,7 @@ def run_worker() -> None:
 
         # Independent try/except: a failure ingesting click events must not
         # block behavioral-event ingestion for this brand, or vice versa.
+        logger.info(f"Starting click events ingestion for brand={db_database_value}")
         try:
             aws_background.sync_click_events_for_brand(
                 brand_index=brand_index,
@@ -125,6 +139,7 @@ def run_worker() -> None:
 
         # Independent try/except: a failure ingesting session history must
         # not block either of the other two syncs, or vice versa.
+        logger.info(f"Starting session history ingestion for brand={db_database_value}")
         try:
             aws_background.sync_session_history_for_brand(
                 brand_index=brand_index,
@@ -139,7 +154,13 @@ def run_worker() -> None:
                 e,
             )
 
-    logger.info("Intent events worker complete.")
+        logger.info(
+            f"--- Brand {db_database_value} done in {time.monotonic() - brand_started_at:.1f}s ---"
+        )
+
+    logger.info(
+        f"Intent events worker complete in {time.monotonic() - run_started_at:.1f}s."
+    )
 
 
 def _run_scheduled() -> None:

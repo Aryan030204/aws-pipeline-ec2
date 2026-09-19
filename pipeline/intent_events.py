@@ -13,6 +13,7 @@ gating used by pipeline/mongo_events.py.
 
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -43,6 +44,9 @@ INTENT_DEFAULT_LOOKBACK = timedelta(hours=1)
 # is idempotent and ingested docs are deleted from Mongo, so what's left is
 # small.
 INTENT_EVENT_STREAM_DEFAULT_LOOKBACK = timedelta(hours=24)
+# Log a "read N documents so far" line every this many docs while streaming
+# from Mongo, so a large backlog isn't a silent multi-minute gap.
+INTENT_READ_PROGRESS_EVERY = 5000
 
 # Kill-switch for the delete-after-ingest behavior below - flip to "false"
 # to disable without a code revert/redeploy if anything looks wrong.
@@ -770,12 +774,26 @@ def _sync_intent_collection(
         client, collection = collection_resolver()
 
         def _do_sync(c, conn):
+            started_at = time.monotonic()
+            log_prefix = f"[intent {event_label}] brand={brand_label} (mongo_brand_id={mongo_brand_id})"
+            logger.info(f"{log_prefix}: starting ingestion")
+
             ensure_table_fn(c, conn)
 
-            watermark = get_pipeline_metadata_timestamp(
-                c, metadata_key, default=datetime.now(IST) - default_lookback
-            )
+            stored_watermark = get_pipeline_metadata_timestamp(c, metadata_key)
+            watermark = stored_watermark or (datetime.now(IST) - default_lookback)
             query_lower_bound = (watermark - INTENT_OVERLAP).astimezone(timezone.utc)
+            if stored_watermark is None:
+                logger.info(
+                    f"{log_prefix}: no stored watermark (first run) - looking back "
+                    f"{default_lookback}"
+                )
+            logger.info(
+                f"{log_prefix}: querying Mongo for {watermark_field} > "
+                f"{query_lower_bound.strftime('%Y-%m-%d %H:%M:%S')} UTC "
+                f"(stored watermark {watermark.strftime('%Y-%m-%d %H:%M:%S')} IST "
+                f"minus {int(INTENT_OVERLAP.total_seconds() // 60)}m overlap)"
+            )
 
             query: Dict[str, Any] = {"brand_id": mongo_brand_id}
             if fallback_field:
@@ -797,9 +815,18 @@ def _sync_intent_collection(
 
             rows: List[Tuple] = []
             max_watermark_value: Optional[datetime] = None
+            docs_seen = 0
+            skipped = 0
             for doc in docs:
+                docs_seen += 1
+                if docs_seen % INTENT_READ_PROGRESS_EVERY == 0:
+                    logger.info(
+                        f"{log_prefix}: read {docs_seen} document(s) from Mongo so far "
+                        f"({time.monotonic() - started_at:.1f}s elapsed)"
+                    )
                 row = extract_row_fn(doc)
                 if row is None:
+                    skipped += 1
                     continue
                 rows.append(row)
                 watermark_value = doc.get(watermark_field)
@@ -810,12 +837,31 @@ def _sync_intent_collection(
                 if max_watermark_value is None or watermark_value > max_watermark_value:
                     max_watermark_value = watermark_value
 
+            logger.info(
+                f"{log_prefix}: read {docs_seen} document(s) from Mongo "
+                f"({len(rows)} valid, {skipped} skipped as malformed) in "
+                f"{time.monotonic() - started_at:.1f}s"
+            )
+
+            upsert_started_at = time.monotonic()
+            if rows:
+                logger.info(f"{log_prefix}: upserting {len(rows)} row(s) into MySQL")
             inserted = upsert_fn(c, conn, rows)
+            if rows:
+                logger.info(
+                    f"{log_prefix}: MySQL upsert done in "
+                    f"{time.monotonic() - upsert_started_at:.1f}s"
+                )
 
             if max_watermark_value is not None:
-                update_pipeline_metadata_timestamp(
-                    c, conn, metadata_key, max_watermark_value.astimezone(IST)
+                new_watermark = max_watermark_value.astimezone(IST)
+                update_pipeline_metadata_timestamp(c, conn, metadata_key, new_watermark)
+                logger.info(
+                    f"{log_prefix}: watermark advanced to "
+                    f"{new_watermark.strftime('%Y-%m-%d %H:%M:%S')} IST"
                 )
+            else:
+                logger.info(f"{log_prefix}: no new documents, watermark unchanged")
 
             logger.info(
                 f"Ingested intent {event_label} for brand={brand_label} "
@@ -825,6 +871,9 @@ def _sync_intent_collection(
             if delete_after_ingest and INTENT_DELETE_INGESTED_DOCS and rows:
                 try:
                     event_ids = [row[0] for row in rows]
+                    logger.info(
+                        f"{log_prefix}: deleting {len(event_ids)} ingested document(s) from Mongo"
+                    )
                     deleted = _delete_ingested_documents(collection, event_ids)
                     logger.info(
                         f"Deleted {deleted} ingested {event_label} document(s) from Mongo "
@@ -835,6 +884,10 @@ def _sync_intent_collection(
                         f"Error deleting ingested {event_label} documents from Mongo for "
                         f"brand={brand_label} (mongo_brand_id={mongo_brand_id}): {e}"
                     )
+
+            logger.info(
+                f"{log_prefix}: finished in {time.monotonic() - started_at:.1f}s"
+            )
 
         if cursor is not None:
             _do_sync(cursor, connection)
