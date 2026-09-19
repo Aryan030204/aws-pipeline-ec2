@@ -27,11 +27,22 @@ from pipeline.db import (
     EXECUTEMANY_CHUNK_SIZE,
 )
 
-INTENT_METADATA_KEY = "intent_events_last_occurred_at"
-CLICK_EVENTS_METADATA_KEY = "intent_click_events_last_occurred_at"
+# The two per-event streams are watermarked on createdAt (server-set insert
+# time), NOT occurred_at: occurred_at is written by the tracker and can be
+# skewed (e.g. IST wall-clock labelled as UTC = +5h30m), which pushed the old
+# occurred_at-based watermark into the future and made later runs match 0
+# docs. Fresh key names (vs. the old *_last_occurred_at rows) deliberately
+# discard those possibly-poisoned watermarks.
+INTENT_METADATA_KEY = "intent_events_last_created_at"
+CLICK_EVENTS_METADATA_KEY = "intent_click_events_last_created_at"
 INTENT_SESSION_HISTORY_METADATA_KEY = "intent_session_history_last_updated_at"
 INTENT_OVERLAP = timedelta(minutes=5)
 INTENT_DEFAULT_LOOKBACK = timedelta(hours=1)
+# First run under a fresh per-event watermark key: look further back to
+# recover docs the old occurred_at watermark skipped. Safe because the upsert
+# is idempotent and ingested docs are deleted from Mongo, so what's left is
+# small.
+INTENT_EVENT_STREAM_DEFAULT_LOOKBACK = timedelta(hours=24)
 
 # Kill-switch for the delete-after-ingest behavior below - flip to "false"
 # to disable without a code revert/redeploy if anything looks wrong.
@@ -712,6 +723,8 @@ def _sync_intent_collection(
     metadata_key: str,
     event_label: str,
     watermark_field: str = "occurred_at",
+    fallback_field: Optional[str] = None,
+    default_lookback: timedelta = INTENT_DEFAULT_LOOKBACK,
     delete_after_ingest: bool = False,
     cursor=None,
     connection=None,
@@ -725,13 +738,20 @@ def _sync_intent_collection(
     rather than duplicating the flow.
 
     watermark_field controls which document field the incremental query
-    and watermark are based on - occurred_at (default) for the two
-    immutable per-event streams, but updatedAt for session_history, whose
-    documents get updated in place as a still-open session accumulates
-    more events (occurred_at/createdAt alone would miss those updates).
-    Regardless of which field is used, extract_row_fn's returned tuple must
-    end with the corresponding timestamp - _do_sync only ever reads it via
-    row[-1], never by field name.
+    and watermark are based on - createdAt for the two immutable per-event
+    streams (server-set, so unaffected by tracker clock/timezone skew in
+    occurred_at), but updatedAt for session_history, whose documents get
+    updated in place as a still-open session accumulates more events
+    (createdAt alone would miss those updates). The watermark is read from
+    doc[watermark_field].
+
+    fallback_field (optional) covers documents that lack watermark_field
+    entirely (a plain $gt would never match them): they're matched and
+    watermarked on fallback_field instead, and row[-1] (which extract_row_fn
+    ends with the fallback timestamp) is used for their watermark value.
+
+    default_lookback is how far back the very first run (no stored
+    watermark yet) looks.
 
     delete_after_ingest (default False - only sync_intent_events_for_brand
     and sync_click_events_for_brand opt in) deletes each row's source
@@ -753,16 +773,22 @@ def _sync_intent_collection(
             ensure_table_fn(c, conn)
 
             watermark = get_pipeline_metadata_timestamp(
-                c, metadata_key, default=datetime.now(IST) - INTENT_DEFAULT_LOOKBACK
+                c, metadata_key, default=datetime.now(IST) - default_lookback
             )
             query_lower_bound = (watermark - INTENT_OVERLAP).astimezone(timezone.utc)
 
-            docs = collection.find(
-                {
-                    "brand_id": mongo_brand_id,
-                    watermark_field: {"$gt": query_lower_bound},
-                }
-            ).sort(watermark_field, 1)
+            query: Dict[str, Any] = {"brand_id": mongo_brand_id}
+            if fallback_field:
+                query["$or"] = [
+                    {watermark_field: {"$gt": query_lower_bound}},
+                    {
+                        watermark_field: {"$exists": False},
+                        fallback_field: {"$gt": query_lower_bound},
+                    },
+                ]
+            else:
+                query[watermark_field] = {"$gt": query_lower_bound}
+            docs = collection.find(query).sort(watermark_field, 1)
 
             rows: List[Tuple] = []
             max_watermark_value: Optional[datetime] = None
@@ -771,7 +797,9 @@ def _sync_intent_collection(
                 if row is None:
                     continue
                 rows.append(row)
-                watermark_value = row[-1]
+                watermark_value = doc.get(watermark_field)
+                if not isinstance(watermark_value, datetime):
+                    watermark_value = row[-1]
                 if watermark_value.tzinfo is None:
                     watermark_value = watermark_value.replace(tzinfo=timezone.utc)
                 if max_watermark_value is None or watermark_value > max_watermark_value:
@@ -835,6 +863,9 @@ def sync_intent_events_for_brand(
         upsert_fn=_upsert_behavioral_events,
         metadata_key=INTENT_METADATA_KEY,
         event_label="behavioral events",
+        watermark_field="createdAt",
+        fallback_field="occurred_at",
+        default_lookback=INTENT_EVENT_STREAM_DEFAULT_LOOKBACK,
         delete_after_ingest=True,
         cursor=cursor,
         connection=connection,
@@ -858,6 +889,9 @@ def sync_click_events_for_brand(
         upsert_fn=_upsert_click_events,
         metadata_key=CLICK_EVENTS_METADATA_KEY,
         event_label="click events",
+        watermark_field="createdAt",
+        fallback_field="occurred_at",
+        default_lookback=INTENT_EVENT_STREAM_DEFAULT_LOOKBACK,
         delete_after_ingest=True,
         cursor=cursor,
         connection=connection,

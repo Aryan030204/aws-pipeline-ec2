@@ -71,6 +71,10 @@ def _resolve_brand_index_by_db_database(db_database_value: str):
 
 
 def run_worker() -> None:
+    # initialize_brand_configs() appends to active_brand_indices without
+    # resetting it; harmless for the once-a-day workers, but this runs every
+    # 15 minutes in a long-lived process, so the list would grow unbounded.
+    aws_background.active_brand_indices.clear()
     aws_background.initialize_brand_configs()
 
     intent_db_map = aws_background._parse_intent_db_map()

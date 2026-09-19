@@ -638,5 +638,102 @@ class SyncIntentCollectionDeletionTests(unittest.TestCase):
         self.assertEqual(fake_collection.delete_many.call_count, 2)
 
 
+class SyncIntentCollectionWatermarkTests(unittest.TestCase):
+    """
+    The per-event streams watermark on createdAt (server-set), never on the
+    tracker-written occurred_at, which can be skewed (+5h30m) and would push
+    the watermark into the future.
+    """
+
+    def _run(self, docs, **kwargs):
+        fake_cursor = mock.Mock()
+        fake_cursor.sort.return_value = list(docs)
+        fake_collection = mock.Mock()
+        fake_collection.find.return_value = fake_cursor
+
+        stored = {}
+        with mock.patch.object(
+            ie, "get_pipeline_metadata_timestamp",
+            return_value=datetime(2026, 9, 19, 12, 0, tzinfo=ie.IST),
+        ), mock.patch.object(
+            ie, "update_pipeline_metadata_timestamp",
+            side_effect=lambda c, conn, key, ts: stored.update(ts=ts),
+        ):
+            ie._sync_intent_collection(
+                brand_index=1,
+                mongo_brand_id="bbb_shop",
+                brand_label="BBB",
+                collection_resolver=lambda: (None, fake_collection),
+                ensure_table_fn=lambda c, conn: None,
+                extract_row_fn=lambda doc: (doc["event_id"], doc["occurred_at"]),
+                upsert_fn=lambda c, conn, rows: len(rows),
+                metadata_key="k",
+                event_label="test events",
+                cursor=_DummyCursor(),
+                connection=_DummyConnection(),
+                **kwargs,
+            )
+        return fake_collection, stored
+
+    def test_watermark_advances_to_created_at_not_skewed_occurred_at(self):
+        docs = [{
+            "event_id": "e1",
+            "createdAt": datetime(2026, 9, 19, 5, 56, tzinfo=timezone.utc),
+            "occurred_at": datetime(2026, 9, 19, 11, 26, tzinfo=timezone.utc),  # +5h30m skew
+        }]
+
+        _, stored = self._run(docs, watermark_field="createdAt")
+
+        self.assertEqual(stored["ts"], datetime(2026, 9, 19, 5, 56, tzinfo=timezone.utc))
+
+    def test_falls_back_to_row_timestamp_when_created_at_missing(self):
+        docs = [{
+            "event_id": "e1",
+            "occurred_at": datetime(2026, 9, 19, 5, 0, tzinfo=timezone.utc),
+        }]
+
+        _, stored = self._run(docs, watermark_field="createdAt", fallback_field="occurred_at")
+
+        self.assertEqual(stored["ts"], datetime(2026, 9, 19, 5, 0, tzinfo=timezone.utc))
+
+    def test_query_with_fallback_matches_docs_lacking_created_at(self):
+        fake_collection, _ = self._run(
+            [], watermark_field="createdAt", fallback_field="occurred_at"
+        )
+
+        query = fake_collection.find.call_args.args[0]
+        self.assertEqual(query["brand_id"], "bbb_shop")
+        self.assertEqual(len(query["$or"]), 2)
+        self.assertIn("createdAt", query["$or"][0])
+        self.assertEqual(query["$or"][1]["createdAt"], {"$exists": False})
+        self.assertIn("occurred_at", query["$or"][1])
+        fake_collection.find.return_value.sort.assert_called_once_with("createdAt", 1)
+
+    def test_query_without_fallback_is_a_plain_range_on_the_watermark_field(self):
+        fake_collection, _ = self._run([], watermark_field="updatedAt")
+
+        query = fake_collection.find.call_args.args[0]
+        self.assertNotIn("$or", query)
+        self.assertIn("updatedAt", query)
+
+    def test_event_streams_use_created_at_with_occurred_at_fallback(self):
+        for fn, key in (
+            (ie.sync_intent_events_for_brand, ie.INTENT_METADATA_KEY),
+            (ie.sync_click_events_for_brand, ie.CLICK_EVENTS_METADATA_KEY),
+        ):
+            with mock.patch.object(ie, "_sync_intent_collection") as sync:
+                fn(brand_index=1, mongo_brand_id="bbb_shop", brand_label="BBB")
+            kwargs = sync.call_args.kwargs
+            self.assertEqual(kwargs["watermark_field"], "createdAt")
+            self.assertEqual(kwargs["fallback_field"], "occurred_at")
+            self.assertEqual(kwargs["metadata_key"], key)
+            self.assertIn("created_at", key)
+
+    def test_session_history_still_uses_updated_at(self):
+        with mock.patch.object(ie, "_sync_intent_collection") as sync:
+            ie.sync_session_history_for_brand(brand_index=1, mongo_brand_id="bbb_shop", brand_label="BBB")
+        self.assertEqual(sync.call_args.kwargs["watermark_field"], "updatedAt")
+
+
 if __name__ == "__main__":
     unittest.main()
