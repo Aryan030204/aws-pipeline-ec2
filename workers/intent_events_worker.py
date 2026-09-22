@@ -71,7 +71,25 @@ def _resolve_brand_index_by_db_database(db_database_value: str):
     return None
 
 
+def _is_worker_enabled() -> bool:
+    """
+    Kill switch: the worker only runs when INTENT_WORKER_SWITCH is present
+    and set to "true" - absent (unset) or any other value means disabled.
+    Checked fresh on every run (not just at process startup) so flipping the
+    env var and restarting the container is enough, without relying on a
+    stale in-process value.
+    """
+    return os.environ.get("INTENT_WORKER_SWITCH", "").strip().lower() == "true"
+
+
 def run_worker() -> None:
+    if not _is_worker_enabled():
+        logger.info(
+            "Intent events worker is disabled (INTENT_WORKER_SWITCH is not set to "
+            "true). Skipping this run."
+        )
+        return
+
     run_started_at = time.monotonic()
     # initialize_brand_configs() appends to active_brand_indices without
     # resetting it; harmless for the once-a-day workers, but this runs every

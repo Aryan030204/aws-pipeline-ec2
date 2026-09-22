@@ -13,6 +13,14 @@ def _fake_init_brands():
 
 
 class IntentEventsWorkerTests(unittest.TestCase):
+    def setUp(self):
+        # Default all tests to "switch on" so existing run_worker() behavior
+        # tests don't have to know about the switch; the switch's own tests
+        # below override this explicitly.
+        patcher = mock.patch.dict(os.environ, {"INTENT_WORKER_SWITCH": "true"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_dockerfile_runs_worker_as_a_service(self):
         dockerfile_path = "Dockerfile.intent-events-worker"
         with open(dockerfile_path, "r", encoding="utf-8") as handle:
@@ -86,6 +94,36 @@ class IntentEventsWorkerTests(unittest.TestCase):
         with mock.patch.object(worker.aws_background, "active_brand_indices", [1]), \
              mock.patch.dict(os.environ, {"DB_DATABASE_1": "BBB"}):
             self.assertIsNone(worker._resolve_brand_index_by_db_database("Some Other DB"))
+
+    def test_worker_disabled_when_switch_var_is_absent(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("INTENT_WORKER_SWITCH", None)
+            with mock.patch.object(worker.aws_background, "initialize_brand_configs") as mock_init:
+                worker.run_worker()
+
+        mock_init.assert_not_called()
+
+    def test_worker_disabled_when_switch_var_is_false(self):
+        with mock.patch.dict(os.environ, {"INTENT_WORKER_SWITCH": "false"}), \
+             mock.patch.object(worker.aws_background, "initialize_brand_configs") as mock_init:
+            worker.run_worker()
+
+        mock_init.assert_not_called()
+
+    def test_worker_disabled_when_switch_var_is_garbage(self):
+        with mock.patch.dict(os.environ, {"INTENT_WORKER_SWITCH": "yes please"}), \
+             mock.patch.object(worker.aws_background, "initialize_brand_configs") as mock_init:
+            worker.run_worker()
+
+        mock_init.assert_not_called()
+
+    def test_worker_enabled_when_switch_var_is_true_case_insensitive(self):
+        with mock.patch.dict(os.environ, {"INTENT_WORKER_SWITCH": "TRUE"}), \
+             mock.patch.object(worker.aws_background, "initialize_brand_configs", side_effect=_fake_init_brands) as mock_init, \
+             mock.patch.object(worker.aws_background, "_parse_intent_db_map", return_value={}):
+            worker.run_worker()
+
+        mock_init.assert_called_once()
 
     def test_run_worker_resets_active_brand_indices_before_each_init(self):
         # initialize_brand_configs() appends without resetting; the list must
