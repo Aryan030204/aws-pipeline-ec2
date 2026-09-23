@@ -52,7 +52,12 @@ dashboard uses). For each channel with a document the worker pulls spend
 for exactly the target dates (never more), upserts one row per date into
 that channel's rollup table, and records any API failure on the document's
 `last_error` so the dashboard can show it. A brand without a document for a
-channel is simply skipped for that channel - nothing is fetched. The P&L row
+channel is simply skipped for that channel - nothing is fetched. Meta
+credentials are additionally only synced when `token_type` is
+"system_user": a System User token (generated in Business Settings) doesn't
+expire, so it's the only kind this unattended nightly job trusts - a brand
+still on the OAuth "user" token is skipped (with `last_error` pointing at
+reconnecting with a System User token) until it reconnects. The P&L row
 then takes the rollup figure when the day has one (meta_spend_synced /
 google_spend_synced = 1), else the configured/default cost for that line.
 The dashboard reads the rollup tables directly for those two lines, so an
@@ -127,6 +132,13 @@ SPEND_TABLES = {"meta": META_SPEND_TABLE, "google": GOOGLE_SPEND_TABLE}
 # Which account the rollup row was pulled for, per channel's own id column.
 SPEND_ACCOUNT_COLUMNS = {"meta": "ad_account_id", "google": "customer_id"}
 AD_CHANNELS = ("meta", "google")
+# Meta credentials can be a regular OAuth "user" token or a Business-Settings
+# "system_user" token (see analytics/shared/db/models/MetaAdsCredential.mongo.js
+# on the dashboard side). Only System User tokens are used to drive this
+# unattended nightly sync - they don't expire, so a brand that reconnects
+# with the OAuth login won't have its rollup silently go stale weeks later.
+# Google has no such distinction (it always refreshes via OAuth refresh_token).
+META_REQUIRED_TOKEN_TYPE = "system_user"
 
 # The cost configs live in the arch-auth database, which is not necessarily
 # the cluster the pipeline's MONGO_URI (events) points at.
@@ -820,7 +832,7 @@ def sync_ad_spend(
     target dates and upserts it into that channel's rollup table. Never
     raises: a failed channel is logged, recorded on the credential document,
     and the P&L still builds (that line falls back to the configured cost).
-    Returns {channel: "synced" | "no-credentials" | "no-table" | "failed"}."""
+    Returns {channel: "synced" | "no-credentials" | "not-system-user" | "no-table" | "failed"}."""
     start, end = min(target_dates), max(target_dates)
     outcomes: Dict[str, str] = {}
     for channel in AD_CHANNELS:
@@ -828,6 +840,20 @@ def sync_ad_spend(
         if not doc:
             outcomes[channel] = "no-credentials"
             logger.info("[%s] no %s credentials in Mongo; %s spend not fetched", brand_name, channel, channel)
+            continue
+        if channel == "meta" and doc.get("token_type") != META_REQUIRED_TOKEN_TYPE:
+            outcomes[channel] = "not-system-user"
+            message = (
+                "Automated P&L spend sync only uses a Meta System User token (it doesn't expire); "
+                "reconnect this brand's Meta Ads account with a System User token to resume syncing."
+            )
+            logger.warning(
+                "[%s] meta credentials are a %r token, not %r; skipping automated sync",
+                brand_name,
+                doc.get("token_type") or "user",
+                META_REQUIRED_TOKEN_TYPE,
+            )
+            record_credential_error(brand_key, channel, message)
             continue
         table = SPEND_TABLES[channel]
         if not table_exists(cursor, table):

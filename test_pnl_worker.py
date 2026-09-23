@@ -466,7 +466,7 @@ class AdSpendSyncTests(unittest.TestCase):
         cursor, connection = MagicMock(), MagicMock()
         cursor.fetchone.return_value = ("pnl_meta_ad_spend_rollup",)
         api_rows = {date(2026, 9, 15): {"spend": Decimal("80.00"), "currency": "INR", "account_id": "act_1"}}
-        creds = {"meta": {"ad_account_id": "1", "access_token_encrypted": "x:y"}, "google": None}
+        creds = {"meta": {"ad_account_id": "1", "access_token_encrypted": "x:y", "token_type": "system_user"}, "google": None}
         with patch.object(pnl_worker, "fetch_channel_spend", return_value=api_rows) as fetch, patch(
             "pipeline.db.executemany_chunked", return_value=2
         ) as chunked, patch.object(pnl_worker, "record_credential_error") as record:
@@ -486,6 +486,29 @@ class AdSpendSyncTests(unittest.TestCase):
             ],
         )
         record.assert_called_once_with("BBB", "meta", None)
+
+    def test_meta_oauth_user_token_is_skipped_until_reconnected_with_system_user(self):
+        cursor, connection = MagicMock(), MagicMock()
+        creds = {"meta": {"ad_account_id": "1", "access_token_encrypted": "x:y", "token_type": "user"}, "google": None}
+        with patch.object(pnl_worker, "fetch_channel_spend") as fetch, patch.object(
+            pnl_worker, "record_credential_error"
+        ) as record:
+            outcomes = pnl_worker.sync_ad_spend(cursor, connection, "BBB", "Brand", creds, self.DATES)
+        self.assertEqual(outcomes["meta"], "not-system-user")
+        fetch.assert_not_called()
+        cursor.execute.assert_not_called()
+        record.assert_called_once()
+        self.assertEqual(record.call_args[0][0], "BBB")
+        self.assertEqual(record.call_args[0][1], "meta")
+        self.assertIn("System User token", record.call_args[0][2])
+
+    def test_meta_credential_missing_token_type_is_treated_as_user(self):
+        cursor, connection = MagicMock(), MagicMock()
+        creds = {"meta": {"ad_account_id": "1", "access_token_encrypted": "x:y"}, "google": None}
+        with patch.object(pnl_worker, "fetch_channel_spend") as fetch:
+            outcomes = pnl_worker.sync_ad_spend(cursor, connection, "BBB", "Brand", creds, self.DATES)
+        self.assertEqual(outcomes["meta"], "not-system-user")
+        fetch.assert_not_called()
 
     def test_missing_rollup_table_skips_the_channel(self):
         cursor, connection = MagicMock(), MagicMock()
