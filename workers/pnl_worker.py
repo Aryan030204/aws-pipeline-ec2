@@ -1183,7 +1183,10 @@ def rebuild_brand_pnl(
     return written
 
 
-def run_worker(current_dt: Optional[datetime] = None) -> None:
+def run_worker(current_dt: Optional[datetime] = None, brand_key: Optional[str] = None) -> None:
+    """brand_key, when given (the dashboard's brand_id, e.g. "BBB"), restricts
+    the rebuild to that one brand instead of every active brand - matched
+    case-insensitively against resolve_brand_key() for each active brand."""
     import aws_background
 
     aws_background.initialize_brand_configs()
@@ -1191,7 +1194,19 @@ def run_worker(current_dt: Optional[datetime] = None) -> None:
         logger.warning("No active brands with valid database configs. Nothing to do.")
         return
 
-    for brand_index in aws_background.active_brand_indices:
+    target_brand_key = brand_key.strip().upper() if brand_key else None
+    brand_indices = aws_background.active_brand_indices
+    if target_brand_key:
+        brand_indices = [i for i in brand_indices if resolve_brand_key(i) == target_brand_key]
+        if not brand_indices:
+            logger.warning(
+                "No active brand matches brand_id=%s (active: %s). Nothing to do.",
+                target_brand_key,
+                ", ".join(sorted(resolve_brand_key(i) for i in aws_background.active_brand_indices)),
+            )
+            return
+
+    for brand_index in brand_indices:
         brand_name = os.environ.get(f"BRAND_NAME_{brand_index}", f"Brand_{brand_index}")
         brand_key = resolve_brand_key(brand_index)
         tz = aws_background.get_brand_timezone(brand_index)

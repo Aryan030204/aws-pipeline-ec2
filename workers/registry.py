@@ -33,6 +33,9 @@ class WorkerSpec:
     # Whether run_worker() accepts current_dt=<datetime> to pretend it is
     # running at another time (shifts the rolling window).
     accepts_as_of: bool = True
+    # Whether run_worker() accepts brand_key=<brand_id> to restrict the run
+    # to one brand instead of every active brand.
+    accepts_brand: bool = False
 
 
 WORKERS: Dict[str, WorkerSpec] = {
@@ -44,6 +47,7 @@ WORKERS: Dict[str, WorkerSpec] = {
             description="Daily brand-level P&L -> overall_pnl in each brand DB",
             self_run_env="PNL_WORKER_SELF_RUN",
             range_env=("PNL_WORKER_START_DATE", "PNL_WORKER_END_DATE"),
+            accepts_brand=True,
         ),
         WorkerSpec(
             name="events-summary",
@@ -99,6 +103,7 @@ def validate_options(
     start: Optional[str] = None,
     end: Optional[str] = None,
     as_of: Optional[str] = None,
+    brand: Optional[str] = None,
 ) -> Dict[str, Optional[str]]:
     """Normalises/validates the run options for a worker; raises ValueError
     on anything the worker can't honour."""
@@ -120,7 +125,11 @@ def validate_options(
         except ValueError as exc:
             raise ValueError(f"as_of must be an ISO datetime, got '{as_of}'") from exc
 
-    return {"start": start, "end": end, "as_of": as_of_norm}
+    brand_norm = brand.strip().upper() if brand else None
+    if brand_norm and not spec.accepts_brand:
+        raise ValueError(f"worker '{spec.name}' does not take a brand_id")
+
+    return {"start": start, "end": end, "as_of": as_of_norm, "brand": brand_norm}
 
 
 def build_cli_command(
@@ -128,16 +137,19 @@ def build_cli_command(
     start: Optional[str] = None,
     end: Optional[str] = None,
     as_of: Optional[str] = None,
+    brand: Optional[str] = None,
     env_file: Optional[str] = None,
 ) -> List[str]:
     """argv for running the worker once via the CLI (what the HTTP knob spawns)."""
     spec = get_spec(name)
-    opts = validate_options(spec, start, end, as_of)
+    opts = validate_options(spec, start, end, as_of, brand)
     cmd = [sys.executable, "-m", "workers.run", spec.name]
     if opts["start"]:
         cmd += ["--start", opts["start"], "--end", opts["end"]]
     if opts["as_of"]:
         cmd += ["--as-of", opts["as_of"]]
+    if opts["brand"]:
+        cmd += ["--brand-id", opts["brand"]]
     if env_file:
         cmd += ["--env-file", env_file]
     return cmd
@@ -148,11 +160,12 @@ def run_in_process(
     start: Optional[str] = None,
     end: Optional[str] = None,
     as_of: Optional[str] = None,
+    brand: Optional[str] = None,
 ) -> None:
     """Runs the worker once in this process. Env for the range is set before
     the module is imported, because workers read it at import time."""
     spec = get_spec(name)
-    opts = validate_options(spec, start, end, as_of)
+    opts = validate_options(spec, start, end, as_of, brand)
 
     os.environ[spec.self_run_env] = "false"
     if opts["start"] and spec.range_env:
@@ -163,7 +176,9 @@ def run_in_process(
         sys.path.insert(0, PROJECT_ROOT)
     module = importlib.import_module(spec.module)
 
+    kwargs = {}
     if opts["as_of"]:
-        module.run_worker(current_dt=datetime.fromisoformat(opts["as_of"]))
-    else:
-        module.run_worker()
+        kwargs["current_dt"] = datetime.fromisoformat(opts["as_of"])
+    if opts["brand"]:
+        kwargs["brand_key"] = opts["brand"]
+    module.run_worker(**kwargs)

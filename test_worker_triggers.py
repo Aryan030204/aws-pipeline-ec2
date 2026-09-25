@@ -31,6 +31,17 @@ class RegistryTests(unittest.TestCase):
         cmd = registry.build_cli_command("PNL", start="2026-09-01", end="2026-09-03")
         self.assertEqual(cmd[1:], ["-m", "workers.run", "pnl", "--start", "2026-09-01", "--end", "2026-09-03"])
 
+    def test_cli_command_for_pnl_with_brand(self):
+        cmd = registry.build_cli_command("pnl", start="2026-09-01", end="2026-09-03", brand="bbb")
+        self.assertEqual(
+            cmd[1:],
+            ["-m", "workers.run", "pnl", "--start", "2026-09-01", "--end", "2026-09-03", "--brand-id", "BBB"],
+        )
+
+    def test_brand_rejected_for_worker_that_does_not_accept_it(self):
+        with self.assertRaises(ValueError):
+            registry.build_cli_command("checkout-login-status", brand="BBB")
+
     def test_range_requires_both_ends_and_a_range_worker(self):
         with self.assertRaises(ValueError):
             registry.build_cli_command("pnl", start="2026-09-01")
@@ -59,6 +70,12 @@ class RegistryTests(unittest.TestCase):
             registry.run_in_process("checkout-login-status", as_of="2026-09-10T00:05:00+05:30")
         current_dt = fake_module.run_worker.call_args.kwargs["current_dt"]
         self.assertEqual(current_dt.isoformat(), "2026-09-10T00:05:00+05:30")
+
+    def test_run_in_process_passes_brand(self):
+        fake_module = MagicMock()
+        with patch("importlib.import_module", return_value=fake_module):
+            registry.run_in_process("pnl", brand="bbb")
+        fake_module.run_worker.assert_called_once_with(brand_key="BBB")
 
 
 class CliTests(unittest.TestCase):
@@ -128,6 +145,43 @@ class HttpTriggerTests(unittest.TestCase):
         with patch.object(self.module, "_spawn", return_value=self._fake_popen()):
             self.client.post("/workers/pnl/trigger", headers={"x-pipeline-key": "secret"})
             resp = self.client.post("/workers/pnl/trigger", headers={"x-pipeline-key": "secret"})
+        self.assertEqual(resp.status_code, 409)
+
+    def test_brand_scoped_trigger_spawns_with_brand_id_and_reports_status(self):
+        proc = self._fake_popen()
+        with patch.object(self.module, "_spawn", return_value=proc) as spawn:
+            resp = self.client.post(
+                "/workers/pnl/trigger",
+                json={"start": "2026-09-01", "end": "2026-09-02", "brand_id": "bbb"},
+                headers={"x-pipeline-key": "secret"},
+            )
+        self.assertEqual(resp.status_code, 202)
+        self.assertEqual(
+            spawn.call_args[0][0][1:],
+            ["-m", "workers.run", "pnl", "--start", "2026-09-01", "--end", "2026-09-02", "--brand-id", "BBB"],
+        )
+        status = self.client.get("/workers/pnl/status?brand_id=BBB").get_json()
+        self.assertEqual(status["state"], "running")
+        # The bare (all-brands) slot is untouched by a brand-scoped run.
+        self.assertEqual(self.client.get("/workers/pnl/status").get_json()["state"], "idle")
+
+    def test_different_brands_do_not_409_each_other(self):
+        with patch.object(self.module, "_spawn", return_value=self._fake_popen()):
+            first = self.client.post(
+                "/workers/pnl/trigger", json={"brand_id": "aaa"}, headers={"x-pipeline-key": "secret"}
+            )
+            second = self.client.post(
+                "/workers/pnl/trigger", json={"brand_id": "bbb"}, headers={"x-pipeline-key": "secret"}
+            )
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(second.status_code, 202)
+
+    def test_same_brand_twice_is_409(self):
+        with patch.object(self.module, "_spawn", return_value=self._fake_popen()):
+            self.client.post("/workers/pnl/trigger", json={"brand_id": "aaa"}, headers={"x-pipeline-key": "secret"})
+            resp = self.client.post(
+                "/workers/pnl/trigger", json={"brand_id": "aaa"}, headers={"x-pipeline-key": "secret"}
+            )
         self.assertEqual(resp.status_code, 409)
 
     def test_bad_input_is_400_and_unknown_is_404(self):

@@ -675,5 +675,50 @@ class AdSpendSyncTests(unittest.TestCase):
         self.assertEqual(dec.call_count, 2)
 
 
+class RunWorkerBrandFilterTests(unittest.TestCase):
+    """run_worker(brand_key=...) restricts the rebuild to one brand_id."""
+
+    def _fake_aws_background(self, indices):
+        fake = MagicMock()
+        fake.active_brand_indices = indices
+        fake.get_brand_timezone.return_value = ZoneInfo("UTC")
+        return fake
+
+    def test_matching_brand_is_the_only_one_rebuilt(self):
+        fake_aws_background = self._fake_aws_background([1, 2])
+        env = {
+            "BRAND_TAG_1": "aaa", "BRAND_NAME_1": "Alpha",
+            "BRAND_TAG_2": "bbb", "BRAND_NAME_2": "Beta",
+        }
+        with patch.dict(os.environ, env, clear=False), patch.dict(
+            "sys.modules", {"aws_background": fake_aws_background}
+        ), patch.object(pnl_worker, "rebuild_brand_pnl", return_value=0) as rebuild:
+            pnl_worker.run_worker(brand_key="bbb")  # lower-case on purpose
+        rebuild.assert_called_once()
+        brand_index, brand_name, brand_key = rebuild.call_args[0][:3]
+        self.assertEqual((brand_index, brand_name, brand_key), (2, "Beta", "BBB"))
+
+    def test_unknown_brand_id_rebuilds_nothing(self):
+        fake_aws_background = self._fake_aws_background([1])
+        env = {"BRAND_TAG_1": "aaa", "BRAND_NAME_1": "Alpha"}
+        with patch.dict(os.environ, env, clear=False), patch.dict(
+            "sys.modules", {"aws_background": fake_aws_background}
+        ), patch.object(pnl_worker, "rebuild_brand_pnl") as rebuild:
+            pnl_worker.run_worker(brand_key="ZZZ")
+        rebuild.assert_not_called()
+
+    def test_no_brand_key_rebuilds_every_active_brand(self):
+        fake_aws_background = self._fake_aws_background([1, 2])
+        env = {
+            "BRAND_TAG_1": "aaa", "BRAND_NAME_1": "Alpha",
+            "BRAND_TAG_2": "bbb", "BRAND_NAME_2": "Beta",
+        }
+        with patch.dict(os.environ, env, clear=False), patch.dict(
+            "sys.modules", {"aws_background": fake_aws_background}
+        ), patch.object(pnl_worker, "rebuild_brand_pnl", return_value=0) as rebuild:
+            pnl_worker.run_worker()
+        self.assertEqual(rebuild.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,6 +4,7 @@ Manual trigger CLI for the standalone workers.
     python -m workers.run list
     python -m workers.run pnl
     python -m workers.run pnl --start 2026-09-01 --end 2026-09-15
+    python -m workers.run pnl --brand-id BBB --start 2026-09-01 --end 2026-09-15
     python -m workers.run checkout-login-status --as-of 2026-09-10T00:05:00+05:30
     python -m workers.run pnl --env-file env
 
@@ -46,6 +47,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start", help="YYYY-MM-DD; first date to rebuild (workers with a range)")
     parser.add_argument("--end", help="YYYY-MM-DD; last date to rebuild (workers with a range)")
     parser.add_argument("--as-of", dest="as_of", help="ISO datetime to run 'as if now' (shifts rolling windows)")
+    parser.add_argument(
+        "--brand-id",
+        dest="brand_id",
+        help="restrict the run to one brand's brand_id (workers that support it, e.g. pnl)",
+    )
     parser.add_argument(
         "--env-file",
         dest="env_file",
@@ -91,7 +97,7 @@ def main(argv=None) -> int:
 
     try:
         logger.info("▶ Running worker '%s' once (manual trigger)", args.worker)
-        run_in_process(args.worker, start=args.start, end=args.end, as_of=args.as_of)
+        run_in_process(args.worker, start=args.start, end=args.end, as_of=args.as_of, brand=args.brand_id)
     except UnknownWorkerError as exc:
         logger.error("%s", exc.args[0])
         print(list_workers(), file=sys.stderr)
