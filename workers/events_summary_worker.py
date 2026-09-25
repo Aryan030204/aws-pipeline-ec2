@@ -2,6 +2,7 @@ import base64
 import logging
 import os
 import re
+import sys
 import tempfile
 from collections import defaultdict
 from contextlib import contextmanager
@@ -24,6 +25,13 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+# Run directly (`python workers/events_summary_worker.py`), sys.path[0] is
+# workers/, not the repo root - needed so the per-brand raw-events phase can
+# import aws_background.py. Same pattern the other brand-aware workers use.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
 
 IST = ZoneInfo("Asia/Kolkata")
 MONGO_URI = os.environ.get("MONGO_URI", "").strip()
@@ -377,7 +385,72 @@ def fetch_mongo_events_for_dates(target_dates: Sequence[date]) -> List[Dict]:
             client.close()
 
 
+def run_raw_events_sync(current_dt: Optional[datetime] = None) -> None:
+    """
+    Stores the full raw alerts.sessions events (one row per event, every
+    document key a column) into each CI-events brand's own mongo_events_summary
+    table. Unlike the master-DB events_summary above, this is per brand, so it
+    reuses the main pipeline's brand infrastructure (aws_background) - imported
+    lazily so the master-summary phase above stays self-contained. The actual
+    fetch/flatten/dynamic-column/upsert logic lives in
+    pipeline/mongo_events_raw.py (sync_mongo_events_raw_for_brand).
+    """
+    import aws_background
+
+    aws_background.active_brand_indices.clear()
+    aws_background.initialize_brand_configs()
+
+    if not aws_background.active_brand_indices:
+        logger.warning("No active brands with valid database configs. Skipping raw events sync.")
+        return
+
+    for brand_index in aws_background.active_brand_indices:
+        brand_name = os.environ.get(f"BRAND_NAME_{brand_index}", f"Brand_{brand_index}")
+        brand_key = os.environ.get(f"BRAND_TAG_{brand_index}")
+
+        if not aws_background.is_ci_events_brand(brand_name, brand_key):
+            logger.info(
+                "Skipping raw events sync for %s: brand not enabled for ci_events", brand_name
+            )
+            continue
+
+        tz = aws_background.get_brand_timezone(brand_index)
+        start_date, end_date = aws_background.compute_raw_rebuild_window(tz, current_dt)
+        try:
+            aws_background.sync_mongo_events_raw_for_brand(
+                brand_index=brand_index,
+                brand_name=brand_name,
+                start_date=start_date,
+                end_date=end_date,
+                brand_key=brand_key,
+            )
+        except Exception as e:
+            logger.error("Error syncing raw events for %s: %s", brand_name, e)
+
+    logger.info("Raw events sync complete.")
+
+
 def run_worker(current_dt: Optional[datetime] = None) -> None:
+    try:
+        _run_master_events_summary(current_dt)
+    except Exception as e:
+        logger.error("Master events_summary rebuild failed: %s", e)
+        master_error = e
+    else:
+        master_error = None
+
+    # Independent of the master summary above: a failure in either must not
+    # stop the other from running.
+    try:
+        run_raw_events_sync(current_dt)
+    except Exception as e:
+        logger.error("Raw events sync failed: %s", e)
+
+    if master_error is not None:
+        raise master_error
+
+
+def _run_master_events_summary(current_dt: Optional[datetime] = None) -> None:
     target_dates = compute_rebuild_dates(current_dt=current_dt)
     target_date_set = set(target_dates)
     logger.info(

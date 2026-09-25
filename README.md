@@ -117,7 +117,7 @@ curl -X POST http://localhost:5000/trigger \
 Runs as four Docker services (see `docker-compose.yml`):
 
 - **`shopify-pipeline`** — the main pipeline described above.
-- **`events-summary-worker`** — a separate container that rolls up daily event totals across all brands into one summary table, on its own daily schedule.
+- **`events-summary-worker`** — a separate container that rolls up daily event totals across all brands into one summary table, on its own daily schedule. The same daily run also stores the full raw `alerts.sessions` events, one row per event, in each brand's own `mongo_events_summary` table (every document key becomes a column, nested `data` is flattened, new keys add columns automatically, `createdAt`/`updatedAt` kept as UTC and IST). Older history can be loaded with `backfill scripts/backfill_mongo_events_summary.py`.
 - **`variant-wise-events-worker`** — a separate container that rolls up any Mongo event type, per product variant, into each brand's own database, on its own daily schedule.
 - **`checkout-login-status-worker`** — a separate container that rolls up daily checkout counts by logged-in/non-logged-in status, per brand, on its own daily schedule (00:05 IST).
 

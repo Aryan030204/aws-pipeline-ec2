@@ -213,5 +213,81 @@ class EventsSummaryWorkerTests(unittest.TestCase):
         self.assertIn('timezone="UTC"', source)
 
 
+class RawEventsPhaseTests(unittest.TestCase):
+    """The per-brand raw-events phase added to run_worker (writes to each
+    brand's own mongo_events_summary table) and its isolation from the
+    existing master events_summary rebuild."""
+
+    def _fake_aws_background(self, brands, ci_brands=None):
+        from unittest import mock
+        from zoneinfo import ZoneInfo
+
+        fake = mock.Mock()
+        fake.active_brand_indices = []
+
+        def init():
+            fake.active_brand_indices.extend(brands)
+
+        fake.initialize_brand_configs.side_effect = init
+        fake.is_ci_events_brand.side_effect = lambda name, key: (
+            ci_brands is None or name in ci_brands
+        )
+        fake.get_brand_timezone.return_value = ZoneInfo("Asia/Kolkata")
+        fake.compute_raw_rebuild_window.return_value = (date(2026, 9, 24), date(2026, 9, 25))
+        return fake
+
+    def test_master_failure_does_not_stop_raw_sync_and_is_still_raised(self):
+        from unittest import mock
+
+        with mock.patch.object(worker, "_run_master_events_summary", side_effect=RuntimeError("master boom")), \
+             mock.patch.object(worker, "run_raw_events_sync") as raw_sync:
+            with self.assertRaises(RuntimeError):
+                worker.run_worker()
+
+        raw_sync.assert_called_once()
+
+    def test_raw_failure_does_not_fail_or_block_master_summary(self):
+        from unittest import mock
+
+        with mock.patch.object(worker, "_run_master_events_summary") as master, \
+             mock.patch.object(worker, "run_raw_events_sync", side_effect=RuntimeError("raw boom")):
+            worker.run_worker()  # must not raise
+
+        master.assert_called_once()
+
+    def test_syncs_each_ci_brand_and_skips_others(self):
+        from unittest import mock
+
+        fake = self._fake_aws_background([1, 2], ci_brands={"Brand_1"})
+        with mock.patch.dict(sys.modules, {"aws_background": fake}):
+            worker.run_raw_events_sync()
+
+        self.assertEqual(fake.sync_mongo_events_raw_for_brand.call_count, 1)
+        kwargs = fake.sync_mongo_events_raw_for_brand.call_args.kwargs
+        self.assertEqual(kwargs["brand_index"], 1)
+        self.assertEqual(kwargs["start_date"], date(2026, 9, 24))
+        self.assertEqual(kwargs["end_date"], date(2026, 9, 25))
+
+    def test_one_brand_failing_does_not_stop_the_next(self):
+        from unittest import mock
+
+        fake = self._fake_aws_background([1, 2])
+        fake.sync_mongo_events_raw_for_brand.side_effect = [RuntimeError("boom"), None]
+        with mock.patch.dict(sys.modules, {"aws_background": fake}):
+            worker.run_raw_events_sync()  # must not raise
+
+        self.assertEqual(fake.sync_mongo_events_raw_for_brand.call_count, 2)
+
+    def test_brand_list_is_cleared_before_each_init(self):
+        from unittest import mock
+
+        fake = self._fake_aws_background([1])
+        fake.active_brand_indices.extend([1, 1, 1])  # stale entries from a previous run
+        with mock.patch.dict(sys.modules, {"aws_background": fake}):
+            worker.run_raw_events_sync()
+
+        self.assertEqual(fake.active_brand_indices, [1])
+
+
 if __name__ == "__main__":
     unittest.main()

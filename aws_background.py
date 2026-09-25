@@ -355,6 +355,10 @@ from pipeline.mongo_events import (
     sync_buy_now_variant_events,
     sync_variant_wise_events_summary,
 )
+from pipeline.mongo_events_raw import (
+    compute_raw_rebuild_window,
+    sync_mongo_events_raw_for_brand,
+)
 from pipeline.checkout_login_status import (
     sync_daily_checkout_login_status,
 )
