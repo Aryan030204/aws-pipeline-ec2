@@ -44,8 +44,17 @@ when the brand has pasted its credentials on the dashboard's P&L page. Those
 land in the same arch-auth Mongo database as total_config, one document per
 brand, keyed by the same brand_id:
 
-    meta_ads_credentials   {brand_id, ad_account_id, access_token_encrypted, ...}
-    google_ads_credentials {brand_id, customer_id, login_customer_id, token_encrypted, ...}
+    meta_ads_credentials   {brand_id, ad_account_ids, access_token_encrypted, ...}
+    google_ads_credentials {brand_id, customer_ids, login_customer_id, token_encrypted, ...}
+
+ad_account_ids / customer_ids are lists - the dashboard's "Continue with
+Meta" / "Connect with Google" checkbox pickers can each authorize more than
+one ad account per brand; this worker sums that brand's spend across all of
+them into one rollup row per date (see normalize_meta_ad_account_ids /
+fetch_meta_spend_for_accounts and normalize_google_customer_ids /
+fetch_google_spend_for_accounts). A doc saved before its picker existed only
+has the single legacy ad_account_id / customer_id field, which is treated
+the same as a one-element list.
 
 Tokens are AES-256-CBC encrypted with PASSWORD_AES_KEY (same helper the
 dashboard uses). For each channel with a document the worker pulls spend
@@ -649,8 +658,47 @@ def normalize_meta_ad_account_id(raw) -> str:
     return value if value.startswith("act_") else f"act_{value}"
 
 
+def normalize_meta_ad_account_ids(doc: Dict) -> List[str]:
+    """Every Meta ad account id a brand's credential doc authorizes.
+    `ad_account_ids` is the checkbox-picker array (dashboard's "Continue with
+    Meta" / paste-a-token flow can now connect more than one) - falls back to
+    the single legacy `ad_account_id` for a doc saved before that existed.
+    Order preserved, duplicates and blanks dropped. Mirrors
+    normalize_google_customer_ids."""
+    raw_ids = doc.get("ad_account_ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raw_ids = [doc.get("ad_account_id")]
+    seen: Set[str] = set()
+    ids: List[str] = []
+    for raw in raw_ids:
+        aid = normalize_meta_ad_account_id(raw) if str(raw or "").strip() else ""
+        if aid and aid not in seen:
+            seen.add(aid)
+            ids.append(aid)
+    return ids
+
+
 def normalize_google_customer_id(raw) -> str:
     return "".join(ch for ch in str(raw or "") if ch.isdigit())
+
+
+def normalize_google_customer_ids(doc: Dict) -> List[str]:
+    """Every Google Ads customer id a brand's credential doc authorizes.
+    `customer_ids` is the checkbox-picker array (dashboard's "Connect with
+    Google" can now pick more than one account) - falls back to the single
+    legacy `customer_id` for a doc saved before that existed. Order preserved,
+    duplicates and blanks dropped."""
+    raw_ids = doc.get("customer_ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raw_ids = [doc.get("customer_id")]
+    seen: Set[str] = set()
+    ids: List[str] = []
+    for raw in raw_ids:
+        cid = normalize_google_customer_id(raw)
+        if cid and cid not in seen:
+            seen.add(cid)
+            ids.append(cid)
+    return ids
 
 
 def fetch_meta_spend_from_api(access_token: str, ad_account_id: str, start: date, end: date) -> Dict[date, Dict]:
@@ -688,6 +736,44 @@ def fetch_meta_spend_from_api(access_token: str, ad_account_id: str, start: date
             break
         url, params = next_url, None  # paging.next already carries the token + params
     return rows
+
+
+def fetch_meta_spend_for_accounts(
+    access_token: str,
+    ad_account_ids: Sequence[str],
+    start: date,
+    end: date,
+) -> Dict[date, Dict]:
+    """Sums fetch_meta_spend_from_api across every ad account a brand
+    authorized (the dashboard's checkbox picker can now connect more than
+    one). One bad account (revoked, disabled, ...) is logged and skipped
+    rather than sinking the accounts that do work - only raises if EVERY
+    account failed. currency is whichever account reports one first; mixing
+    currencies across a brand's accounts isn't handled here. Mirrors
+    fetch_google_spend_for_accounts."""
+    combined: Dict[date, Dict] = {}
+    failures: List[str] = []
+    for ad_account_id in ad_account_ids:
+        try:
+            api_rows = fetch_meta_spend_from_api(access_token, ad_account_id, start, end)
+        except Exception as e:  # noqa: BLE001 - one account's failure must not sink the others
+            failures.append(f"{ad_account_id}: {e}")
+            continue
+        for day, entry in api_rows.items():
+            bucket = combined.setdefault(day, {"spend": ZERO, "currency": None})
+            bucket["spend"] = money(bucket["spend"] + money(entry.get("spend")))
+            bucket["currency"] = bucket["currency"] or entry.get("currency")
+
+    if failures:
+        message = "; ".join(failures)
+        if not combined:
+            raise AdSpendSyncError(message)
+        logger.warning("Some Meta ad accounts failed and were skipped: %s", message)
+
+    account_label = ",".join(ad_account_ids)
+    for entry in combined.values():
+        entry["account_id"] = account_label
+    return combined
 
 
 def google_access_token(refresh_token: str) -> str:
@@ -772,19 +858,64 @@ def fetch_google_spend_from_api(
     return rows
 
 
+def fetch_google_spend_for_accounts(
+    refresh_token: str,
+    customer_ids: Sequence[str],
+    login_customer_id: Optional[str],
+    start: date,
+    end: date,
+) -> Dict[date, Dict]:
+    """Sums fetch_google_spend_from_api across every account a brand
+    authorized (the dashboard's checkbox picker can now connect more than
+    one). One bad account (revoked, a manager account with no cost data,
+    ...) is logged and skipped rather than sinking the accounts that do
+    work - only raises if EVERY account failed. currency is whichever
+    account reports one first; mixing currencies across a brand's accounts
+    isn't handled here."""
+    combined: Dict[date, Dict] = {}
+    failures: List[str] = []
+    for customer_id in customer_ids:
+        try:
+            api_rows = fetch_google_spend_from_api(refresh_token, customer_id, login_customer_id, start, end)
+        except Exception as e:  # noqa: BLE001 - one account's failure must not sink the others
+            failures.append(f"{customer_id}: {e}")
+            continue
+        for day, entry in api_rows.items():
+            bucket = combined.setdefault(day, {"spend": ZERO, "currency": None})
+            bucket["spend"] = money(bucket["spend"] + money(entry.get("spend")))
+            bucket["currency"] = bucket["currency"] or entry.get("currency")
+
+    if failures:
+        message = "; ".join(failures)
+        if not combined:
+            raise AdSpendSyncError(message)
+        logger.warning("Some Google Ads accounts failed and were skipped: %s", message)
+
+    account_label = ",".join(customer_ids)
+    for entry in combined.values():
+        entry["account_id"] = account_label
+    return combined
+
+
 def fetch_channel_spend(channel: str, doc: Dict, start: date, end: date) -> Dict[date, Dict]:
     """Decrypts the brand's token and pulls that channel's spend for the range."""
     if channel == "meta":
-        return fetch_meta_spend_from_api(
+        ad_account_ids = normalize_meta_ad_account_ids(doc)
+        if not ad_account_ids:
+            raise AdSpendSyncError("Meta credential has no ad_account_id")
+        return fetch_meta_spend_for_accounts(
             decrypt_text(doc.get("access_token_encrypted")),
-            doc.get("ad_account_id"),
+            ad_account_ids,
             start,
             end,
         )
     if channel == "google":
-        return fetch_google_spend_from_api(
+        customer_ids = normalize_google_customer_ids(doc)
+        if not customer_ids:
+            raise AdSpendSyncError("Google Ads credential has no customer_id")
+        return fetch_google_spend_for_accounts(
             decrypt_text(doc.get("token_encrypted")),
-            doc.get("customer_id"),
+            customer_ids,
             doc.get("login_customer_id"),
             start,
             end,
@@ -868,9 +999,9 @@ def sync_ad_spend(
         try:
             api_rows = fetch_channel_spend(channel, doc, start, end)
             account_id = (
-                normalize_meta_ad_account_id(doc.get("ad_account_id"))
+                ",".join(normalize_meta_ad_account_ids(doc))
                 if channel == "meta"
-                else normalize_google_customer_id(doc.get("customer_id"))
+                else ",".join(normalize_google_customer_ids(doc))
             )
             rows = build_spend_rollup_rows(api_rows, target_dates, account_id)
             written = upsert_spend_rollup_rows(cursor, connection, table, SPEND_ACCOUNT_COLUMNS[channel], rows)

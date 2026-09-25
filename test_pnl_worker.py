@@ -451,6 +451,137 @@ class GoogleSpendApiTests(unittest.TestCase):
         self.assertIn("developer token is not approved", str(ctx.exception))
 
 
+class MultiAccountGoogleSpendTests(unittest.TestCase):
+    """The dashboard's "Connect with Google" checkbox picker can authorize
+    more than one Google Ads account per brand (google_ads_credentials.
+    customer_ids); this worker sums their spend into one rollup row/date."""
+
+    DATES = [date(2026, 9, 14), date(2026, 9, 15)]
+
+    def test_normalize_prefers_customer_ids_and_dedupes(self):
+        self.assertEqual(
+            pnl_worker.normalize_google_customer_ids({"customer_ids": ["123-456-7890", "1234567890", "111-222-3333"]}),
+            ["1234567890", "1112223333"],
+        )
+
+    def test_normalize_falls_back_to_legacy_single_field(self):
+        self.assertEqual(pnl_worker.normalize_google_customer_ids({"customer_id": "123-456-7890"}), ["1234567890"])
+        self.assertEqual(pnl_worker.normalize_google_customer_ids({}), [])
+        self.assertEqual(pnl_worker.normalize_google_customer_ids({"customer_ids": []}), [])
+
+    def test_sums_spend_across_every_authorized_account(self):
+        per_account = {
+            "1111111111": {self.DATES[0]: {"spend": Decimal("10.00"), "currency": "INR"}},
+            "2222222222": {
+                self.DATES[0]: {"spend": Decimal("5.00"), "currency": "INR"},
+                self.DATES[1]: {"spend": Decimal("3.00"), "currency": "INR"},
+            },
+        }
+        with patch.object(
+            pnl_worker, "fetch_google_spend_from_api", side_effect=lambda rt, cid, *a: per_account[cid]
+        ) as fetch:
+            rows = pnl_worker.fetch_google_spend_for_accounts(
+                "rt", ["1111111111", "2222222222"], None, self.DATES[0], self.DATES[1]
+            )
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(rows[self.DATES[0]]["spend"], Decimal("15.00"))
+        self.assertEqual(rows[self.DATES[1]]["spend"], Decimal("3.00"))
+        self.assertEqual(rows[self.DATES[0]]["account_id"], "1111111111,2222222222")
+
+    def test_one_bad_account_is_skipped_not_fatal(self):
+        def side_effect(rt, cid, *a):
+            if cid == "2222222222":
+                raise pnl_worker.AdSpendSyncError("token revoked")
+            return {self.DATES[0]: {"spend": Decimal("10.00"), "currency": "INR"}}
+
+        with patch.object(pnl_worker, "fetch_google_spend_from_api", side_effect=side_effect):
+            rows = pnl_worker.fetch_google_spend_for_accounts(
+                "rt", ["1111111111", "2222222222"], None, self.DATES[0], self.DATES[1]
+            )
+        self.assertEqual(rows[self.DATES[0]]["spend"], Decimal("10.00"))
+
+    def test_every_account_failing_raises(self):
+        with patch.object(pnl_worker, "fetch_google_spend_from_api", side_effect=pnl_worker.AdSpendSyncError("boom")):
+            with self.assertRaises(pnl_worker.AdSpendSyncError):
+                pnl_worker.fetch_google_spend_for_accounts("rt", ["1111111111"], None, self.DATES[0], self.DATES[1])
+
+    def test_fetch_channel_spend_reads_customer_ids_array(self):
+        with patch.object(pnl_worker, "decrypt_text", return_value="rt"), patch.object(
+            pnl_worker, "fetch_google_spend_from_api", return_value={}
+        ) as fetch:
+            pnl_worker.fetch_channel_spend(
+                "google",
+                {"customer_ids": ["1111111111", "2222222222"], "token_encrypted": "g"},
+                self.DATES[0],
+                self.DATES[1],
+            )
+        self.assertEqual([c[0][1] for c in fetch.call_args_list], ["1111111111", "2222222222"])
+
+
+class MultiAccountMetaSpendTests(unittest.TestCase):
+    """The dashboard's "Continue with Meta" / paste-a-token checkbox picker
+    can authorize more than one Meta ad account per brand
+    (meta_ads_credentials.ad_account_ids); this worker sums their spend into
+    one rollup row/date. Mirrors MultiAccountGoogleSpendTests."""
+
+    DATES = [date(2026, 9, 14), date(2026, 9, 15)]
+
+    def test_normalize_prefers_ad_account_ids_and_dedupes(self):
+        self.assertEqual(
+            pnl_worker.normalize_meta_ad_account_ids({"ad_account_ids": ["1", "act_2", "1"]}),
+            ["act_1", "act_2"],
+        )
+
+    def test_normalize_falls_back_to_legacy_single_field(self):
+        self.assertEqual(pnl_worker.normalize_meta_ad_account_ids({"ad_account_id": "1"}), ["act_1"])
+        self.assertEqual(pnl_worker.normalize_meta_ad_account_ids({}), [])
+        self.assertEqual(pnl_worker.normalize_meta_ad_account_ids({"ad_account_ids": []}), [])
+
+    def test_sums_spend_across_every_authorized_account(self):
+        per_account = {
+            "act_1": {self.DATES[0]: {"spend": Decimal("10.00"), "currency": "INR"}},
+            "act_2": {
+                self.DATES[0]: {"spend": Decimal("5.00"), "currency": "INR"},
+                self.DATES[1]: {"spend": Decimal("3.00"), "currency": "INR"},
+            },
+        }
+        with patch.object(
+            pnl_worker, "fetch_meta_spend_from_api", side_effect=lambda token, aid, *a: per_account[aid]
+        ) as fetch:
+            rows = pnl_worker.fetch_meta_spend_for_accounts("tok", ["act_1", "act_2"], self.DATES[0], self.DATES[1])
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(rows[self.DATES[0]]["spend"], Decimal("15.00"))
+        self.assertEqual(rows[self.DATES[1]]["spend"], Decimal("3.00"))
+        self.assertEqual(rows[self.DATES[0]]["account_id"], "act_1,act_2")
+
+    def test_one_bad_account_is_skipped_not_fatal(self):
+        def side_effect(token, aid, *a):
+            if aid == "act_2":
+                raise pnl_worker.AdSpendSyncError("token revoked")
+            return {self.DATES[0]: {"spend": Decimal("10.00"), "currency": "INR"}}
+
+        with patch.object(pnl_worker, "fetch_meta_spend_from_api", side_effect=side_effect):
+            rows = pnl_worker.fetch_meta_spend_for_accounts("tok", ["act_1", "act_2"], self.DATES[0], self.DATES[1])
+        self.assertEqual(rows[self.DATES[0]]["spend"], Decimal("10.00"))
+
+    def test_every_account_failing_raises(self):
+        with patch.object(pnl_worker, "fetch_meta_spend_from_api", side_effect=pnl_worker.AdSpendSyncError("boom")):
+            with self.assertRaises(pnl_worker.AdSpendSyncError):
+                pnl_worker.fetch_meta_spend_for_accounts("tok", ["act_1"], self.DATES[0], self.DATES[1])
+
+    def test_fetch_channel_spend_reads_ad_account_ids_array(self):
+        with patch.object(pnl_worker, "decrypt_text", return_value="tok"), patch.object(
+            pnl_worker, "fetch_meta_spend_from_api", return_value={}
+        ) as fetch:
+            pnl_worker.fetch_channel_spend(
+                "meta",
+                {"ad_account_ids": ["act_1", "act_2"], "access_token_encrypted": "m"},
+                self.DATES[0],
+                self.DATES[1],
+            )
+        self.assertEqual([c[0][1] for c in fetch.call_args_list], ["act_1", "act_2"])
+
+
 class AdSpendSyncTests(unittest.TestCase):
     DATES = [date(2026, 9, 14), date(2026, 9, 15)]
 
