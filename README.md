@@ -120,6 +120,7 @@ Runs as four Docker services (see `docker-compose.yml`):
 - **`events-summary-worker`** — a separate container that rolls up daily event totals across all brands into one summary table, on its own daily schedule. The same daily run also stores the full raw `alerts.sessions` events, one row per event, in each brand's own `mongo_events_summary` table (every document key becomes a column, nested `data` is flattened, new keys add columns automatically, `createdAt`/`updatedAt` kept as UTC and IST). Older history can be loaded with `backfill scripts/backfill_mongo_events_summary.py`.
 - **`variant-wise-events-worker`** — a separate container that rolls up any Mongo event type, per product variant, into each brand's own database, on its own daily schedule.
 - **`checkout-login-status-worker`** — a separate container that rolls up daily checkout counts by logged-in/non-logged-in status, per brand, on its own daily schedule (00:05 IST).
+- **`pnl-worker`** — a separate container that builds the daily brand-level P&L (`overall_pnl`) in each brand DB at 00:10 IST, from the summary tables plus the brand's cost config in the arch-auth Mongo `total_config` collection. Right before that it syncs paid-ads spend for exactly the dates it is rebuilding: for every brand with a credential document in Mongo (`meta_ads_credentials` / `google_ads_credentials`, pasted on the dashboard's P&L page) it pulls that channel's daily spend and upserts it into `pnl_meta_ad_spend_rollup` / `pnl_google_ad_spend_rollup` (`migrations/004_pnl_ad_spend_rollups.sql`, per brand DB). Brands without a document for a channel are skipped for it. Needs `PASSWORD_AES_KEY` (same as the dashboard, to decrypt tokens) and, for Google only, `GOOGLE_ADS_CLIENT_ID`, `GOOGLE_ADS_CLIENT_SECRET` and `GOOGLE_ADS_DEVELOPER_TOKEN`; `META_API_VERSION` / `GOOGLE_ADS_API_VERSION` are optional. A failed pull is logged, written to the document's `last_error`, and that line falls back to the configured cost.
 
 To deploy an update on the server: pull the latest code on the branch that's live, rebuild, and restart:
 
@@ -142,6 +143,39 @@ docker compose exec -T checkout-login-status-worker \
 The cache pipeline runs as its own container (`cache-pipeline`) on the same EC2 host, joined to the same Docker network (`pipeline-net`) as `shopify-pipeline`. After each full run finishes, the pipeline fires a plain `GET http://cache-pipeline:8080/trigger-pipeline` — no QStash involved, just a direct container-to-container call over the shared network.
 
 This request runs in a background thread, so the pipeline doesn't wait for the cache rebuild to finish before moving on. Whenever the response does come back, only a short summary (status + brand count) is logged — not the full per-brand/per-date result body.
+
+## Triggering a worker manually
+
+Every standalone worker (`pnl`, `events-summary`, `variant-wise-events`, `checkout-login-status`, `intent-events`) can be run on demand, once, without waiting for its daily schedule. Both knobs below use the same registry in `workers/registry.py`, so adding a worker there makes it available to both.
+
+### From a shell
+
+```bash
+python -m workers.run list                                      # what's available
+python -m workers.run pnl                                       # default window
+python -m workers.run pnl --start 2026-09-01 --end 2026-09-15   # backfill a range
+python -m workers.run checkout-login-status --as-of 2026-09-10T00:05:00+05:30
+python -m workers.run pnl --env-file env                        # load a specific dotenv file
+```
+
+It loads `.env` (or a file named `env`) unless `--env-file` says otherwise, forces the worker's `*_SELF_RUN` flag off, runs it in the foreground, and exits 0/1. Inside Docker:
+
+```bash
+docker compose exec -T shopify-pipeline python -m workers.run pnl
+```
+
+### Over HTTP (main pipeline container, port 5000)
+
+```bash
+curl http://localhost:5000/workers                                       # list + last run per worker
+curl -X POST http://localhost:5000/workers/pnl/trigger \
+  -H "x-pipeline-key: $PIPELINE_AUTH_HEADER" \
+  -H "Content-Type: application/json" \
+  -d '{"start": "2026-09-01", "end": "2026-09-15"}'                      # body optional
+curl http://localhost:5000/workers/pnl/status                            # running / succeeded / failed
+```
+
+The trigger spawns `python -m workers.run <name>` as a child process of the pipeline container, so the worker's output shows up in `docker logs shopify-pipeline`. One run per worker at a time; a second trigger while one is running returns 409.
 
 ## Testing
 
