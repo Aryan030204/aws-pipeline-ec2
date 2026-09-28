@@ -1,0 +1,26 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    default-libmysqlclient-dev \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy project files
+COPY . .
+
+# Apply migrations/*.sql to every brand database, once each, then exit. Runs to
+# completion before the pipeline and worker containers start (see the
+# `depends_on: db-migrate: condition: service_completed_successfully` blocks in
+# docker-compose.yml), so no container ever reads a table a migration has not
+# created yet. Already-applied migrations are recorded per brand in that
+# brand's `schema_migrations` table, so restarts are cheap.
+CMD ["python", "-m", "pipeline.sql_migrations"]

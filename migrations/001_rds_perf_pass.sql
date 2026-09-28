@@ -1,9 +1,32 @@
+-- migrate: manual
 -- =============================================================================
 -- RDS Performance Pass #1
 -- Goal: stop EBSByteBalance% from hitting 0 on the per-brand MySQL.
 --
--- Run this PER BRAND DATABASE (each logical tenant). It is idempotent: every
--- DDL is guarded so re-running the file is safe. Run each phase in a separate
+-- ⚠️  SUPERSEDED, AND NOT SAFE TO RE-RUN. Use 002_converge_to_canonical.sql
+--     instead: it performs this same work through information_schema-guarded
+--     stored procedures, so it is genuinely idempotent and is what the
+--     automatic runner (pipeline/sql_migrations.py) applies.
+--
+--     This file is kept for provenance and is marked `-- migrate: manual`
+--     above, which makes the runner list it and skip it. Do not remove that
+--     marker. Reasons it cannot be automated:
+--
+--       * The `ADD PRIMARY KEY` statements below fail with errno 1068
+--         ("Multiple primary key defined") the second time they run - there
+--         is no IF NOT EXISTS form for a primary key.
+--       * The `DROP INDEX` statements fail with errno 1091 ("Can't DROP ...
+--         check that column/key exists") when the index is already gone, and
+--         because each ALTER drops several indexes in one statement, one
+--         already-dropped index aborts the whole batch.
+--       * The bare SELECT COUNT(*) pre-flight checks are output for a human
+--         to READ AND ACT ON before running the ALTER that follows them;
+--         nothing enforces them. A runner would happily execute the ALTER
+--         over duplicate or NULL dates and fail on a half-rebuilt table.
+--       * ALGORITHM=COPY rewrites the table, and the shopify_orders phases
+--         want a maintenance window - see the phase notes below.
+--
+-- Run this PER BRAND DATABASE (each logical tenant), one phase per
 -- maintenance window; do not run all phases at once on a hot database.
 --
 -- Phases:

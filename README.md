@@ -39,7 +39,8 @@ The pipeline used to be a single ~10,000-line file. It's now split into focused 
 | `aws_background.py` | Entrypoint, brand configuration, and the facade that re-exports everything below (so nothing else in the repo had to change) |
 | `pipeline/state.py` | Shared config and long-lived objects (logger, Flask app, scheduler, brand registries) |
 | `pipeline/db.py` | Database connections, retries, and cleanup |
-| `pipeline/schema_migrations.py` | Table creation / schema upkeep |
+| `pipeline/schema_migrations.py` | Table creation / schema upkeep run inline by the pipeline |
+| `pipeline/sql_migrations.py` | Applies `migrations/*.sql` to each brand database once, at container start |
 | `pipeline/shopify_orders.py` | Order fetching, transforming, and loading |
 | `pipeline/summary_incremental.py` | Rebuilding dashboard summary tables |
 | `pipeline/mongo_events.py` | Checkout-initiated / buy-now event sync |
@@ -114,8 +115,9 @@ curl -X POST http://localhost:5000/trigger \
 
 ## Deployment
 
-Runs as four Docker services (see `docker-compose.yml`):
+Runs as a one-shot migration task plus six long-running Docker services (see `docker-compose.yml`):
 
+- **`db-migrate`** — a one-shot container that applies `migrations/*.sql` to **every brand database**, once each, and then exits. Every other service declares `depends_on: db-migrate: condition: service_completed_successfully`, so nothing starts until migrations have finished cleanly and no worker ever reads a table a migration has not created yet. See [Database migrations](#database-migrations).
 - **`shopify-pipeline`** — the main pipeline described above.
 - **`events-summary-worker`** — a separate container that rolls up daily event totals across all brands into one summary table, on its own daily schedule.
 - **`variant-wise-events-worker`** — a separate container that rolls up any Mongo event type, per product variant, into each brand's own database, on its own daily schedule.
@@ -143,6 +145,32 @@ docker compose exec -T checkout-login-status-worker \
 The cache pipeline runs as its own container (`cache-pipeline`) on the same EC2 host, joined to the same Docker network (`pipeline-net`) as `shopify-pipeline`. After each full run finishes, the pipeline fires a plain `GET http://cache-pipeline:8080/trigger-pipeline` — no QStash involved, just a direct container-to-container call over the shared network.
 
 This request runs in a background thread, so the pipeline doesn't wait for the cache rebuild to finish before moving on. Whenever the response does come back, only a short summary (status + brand count) is logged — not the full per-brand/per-date result body.
+
+### Cache invalidation for rewritten dates
+
+The dashboard serves day-level metrics out of Redis (`metrics:<brand>:<date>`,
+`hourly_metrics:<brand>:<date>`, `date_presets:<brand>`) and only falls back to
+MySQL on a miss, so a write that lands outside the cache pipeline's rebuild
+window - a backfill, or a manual worker trigger for an older range - would leave
+the dashboard showing the pre-write numbers for those dates even though the
+tables are correct.
+
+`pipeline/cache_invalidation.py` closes that gap: whenever a run rewrites rows
+for a set of dates it deletes exactly those brand+date keys, so the next
+dashboard read misses and goes to MySQL, and the cache pipeline refills them on
+its next run. Deleting is always safe - worst case is one uncached read. It is
+wired into the two paths that write dated rows:
+
+| Caller | Dates invalidated |
+| --- | --- |
+| `pipeline/orchestration.py`, right after `execute_summary_queries_incremental` | the run's affected + RTO-affected dates |
+| `workers/pnl_worker.py`, after `overall_pnl` is upserted | that rebuild's target dates |
+
+It needs `REDIS_URL` (the same instance the dashboard's analytics service
+reads; already in `.env`) and the `redis` package. With either missing it logs
+once and turns itself off, and any Redis error is logged and swallowed - a cache
+that can't be reached never fails a run that has already written its rows.
+`TEST_MODE=true` skips it entirely.
 
 ## Triggering a worker manually
 
@@ -176,6 +204,53 @@ curl http://localhost:5000/workers/pnl/status                            # runni
 ```
 
 The trigger spawns `python -m workers.run <name>` as a child process of the pipeline container, so the worker's output shows up in `docker logs shopify-pipeline`. One run per worker at a time; a second trigger while one is running returns 409.
+
+## Database migrations
+
+`migrations/*.sql` are versioned, per-brand schema changes. The `db-migrate` container applies them
+to every brand database at startup and exits; the other containers wait for it to exit 0.
+
+Each brand database records what it has already had applied in its own `schema_migrations` table, so
+a restart with no new files just connects once per brand and exits. Concurrent starts are safe: the
+runner takes a MySQL advisory lock per brand database, so if several containers come up at once, one
+migrates and the rest wait rather than racing into duplicate-key errors.
+
+| Command | What it does |
+| --- | --- |
+| `python -m pipeline.sql_migrations` | Apply every pending migration to every active brand |
+| `python -m pipeline.sql_migrations --status` | Show, per brand, what is applied and what is pending |
+| `python -m pipeline.sql_migrations --dry-run` | List what would run, without running it |
+| `python -m pipeline.sql_migrations --brand 3` | Restrict the run to one brand index |
+
+| Env var | Effect |
+| --- | --- |
+| `MIGRATIONS_ALLOW_FAILURE` | `true` = exit 0 and let the stack boot even when a brand fails to migrate (default `false`, which blocks every dependent container) |
+| `MIGRATIONS_LOCK_TIMEOUT_S` | Seconds to wait for another container's migration lock (default 300) |
+| `MIGRATIONS_STRICT_CHECKSUMS` | `true` = fail when an already-applied file has been edited (default is to warn) |
+
+### Writing a new migration
+
+Name it `NNN_short_description.sql` with the next free number. It must be **individually
+re-runnable**, because a brand whose run dies halfway through re-applies the whole file next start:
+
+- `CREATE TABLE IF NOT EXISTS`, `DROP ... IF EXISTS`.
+- **No top-level `ALTER TABLE`.** MySQL has no `IF NOT EXISTS` for it, so it is the usual way a
+  migration stops being re-runnable — `ADD COLUMN` fails with errno 1060 the second time, `ADD
+  PRIMARY KEY` with 1068, `DROP INDEX` with 1091, and any of them with 1146 on a brand whose table
+  does not exist yet. Put the change in a stored procedure that checks `information_schema` first;
+  `003_overall_pnl.sql` is the shortest example, `002_converge_to_canonical.sql` the fullest.
+- Assume brand databases differ. They are provisioned incrementally, so guard for a missing table
+  *and* a missing column rather than assuming the schema matches your local one.
+- Never edit a migration that has already been applied — the runner records a checksum and will warn
+  that the file changed and refuse to re-run it. Add a new file instead.
+
+`test_sql_migrations.py` enforces the rules above over everything in `migrations/`, so a file that
+breaks them fails the test suite rather than a production boot.
+
+A migration that genuinely cannot be automated (needs a maintenance window, or a human reading
+pre-flight output) carries `-- migrate: manual` in its header; the runner lists it and skips it.
+`001_rds_perf_pass.sql` is the one such file — it is superseded by `002_converge_to_canonical.sql`,
+which does the same work through guarded procedures.
 
 ## Testing
 

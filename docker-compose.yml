@@ -5,9 +5,38 @@ networks:
     external: true
 
 services:
+  # Applies migrations/*.sql to every brand database, once each, then exits.
+  # Every other service waits for it to exit 0 (see their depends_on blocks),
+  # so nothing reads a table or column a migration has not created yet.
+  #
+  # restart: "no" is essential - this is a task, not a service. With the
+  # `restart: always` the other services use, a clean exit 0 would be
+  # restarted forever and the containers gated on it would never start.
+  #
+  # Re-runs are cheap: each brand database records what it has applied in its
+  # own `schema_migrations` table, so a restart with no new .sql files connects
+  # once per brand and exits. Set MIGRATIONS_ALLOW_FAILURE=true in .env to let
+  # the stack boot even when a brand fails to migrate (it exits 0 and logs the
+  # failures instead of blocking every dependent container).
+  db-migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.migrate
+    container_name: aws-pipeline-db-migrate
+    env_file:
+      - .env
+    restart: "no"
+    networks:
+      - pipeline-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
   shopify-pipeline:
     build: .
     container_name: aws-pipeline
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
     env_file:
       - .env
     restart: always
@@ -21,6 +50,9 @@ services:
       context: .
       dockerfile: Dockerfile.events-worker
     container_name: events-summary-worker
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
     env_file:
       - .env
     restart: always
@@ -34,6 +66,9 @@ services:
       context: .
       dockerfile: Dockerfile.variant-wise-events-worker
     container_name: variant-wise-events-worker
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
     env_file:
       - .env
     restart: always
@@ -47,6 +82,9 @@ services:
       context: .
       dockerfile: Dockerfile.checkout-login-status-worker
     container_name: checkout-login-status-worker
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
     env_file:
       - .env
     restart: always
@@ -60,6 +98,9 @@ services:
       context: .
       dockerfile: Dockerfile.intent-events-worker
     container_name: intent-events-worker
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
     env_file:
       - .env
     restart: always
@@ -73,6 +114,9 @@ services:
       context: .
       dockerfile: Dockerfile.pnl-worker
     container_name: pnl-worker
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
     env_file:
       - .env
     restart: always

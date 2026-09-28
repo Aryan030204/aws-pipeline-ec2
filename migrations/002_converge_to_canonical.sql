@@ -64,7 +64,38 @@ CREATE PROCEDURE _create_index_if_missing(
     IN tbl VARCHAR(64), IN idx VARCHAR(64), IN cols VARCHAR(500)
 )
 BEGIN
+    DECLARE cols_wanted INT DEFAULT 0;
+    DECLARE cols_present INT DEFAULT 0;
+
+    -- Every name in `cols` is backticked by the callers below, so counting
+    -- backtick pairs counts the columns the index wants...
+    SET cols_wanted = (CHAR_LENGTH(cols) - CHAR_LENGTH(REPLACE(cols, '`', ''))) / 2;
+
+    -- ...and matching `name` against the table's real columns counts how many
+    -- of them actually exist. The backticks on both sides keep the match
+    -- exact, so `created_dt` never matches a `created_dt_extra`.
+    SELECT COUNT(*) INTO cols_present
+    FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME   = tbl
+      AND LOCATE(CONCAT('`', COLUMN_NAME, '`'), cols) > 0;
+
+    -- Two guards, because a brand database can lag in two independent ways:
+    -- the table may not exist yet (a young brand whose pipeline has not built
+    -- it), or it may exist without a column this index needs (schema drift
+    -- between brands onboarded at different times). information_schema reports
+    -- the index as missing in both cases, so without these the ADD INDEX below
+    -- aborts the whole migration for that brand - errno 1146 for the missing
+    -- table, errno 1072 for the missing column.
     IF NOT EXISTS (
+        SELECT 1 FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = tbl
+    ) THEN
+        SELECT CONCAT('  = ', tbl, ': table absent, skipping index ', idx) AS log;
+    ELSEIF cols_present < cols_wanted THEN
+        SELECT CONCAT('  ! ', tbl, ': index ', idx, ' needs columns this table ',
+                      'does not have (', cols, ') - skipping, review schema drift') AS log;
+    ELSEIF NOT EXISTS (
         SELECT 1 FROM information_schema.STATISTICS
         WHERE TABLE_SCHEMA = DATABASE()
           AND TABLE_NAME   = tbl
@@ -82,13 +113,28 @@ END$$
 CREATE PROCEDURE _add_date_pk_if_missing(IN tbl VARCHAR(64))
 BEGIN
     DECLARE has_pk INT DEFAULT 0;
+    DECLARE has_tbl INT DEFAULT 0;
+
+    -- Table-existence guard. A missing table also reports zero PK constraints,
+    -- so without this the pre-flight COUNT(*) below would run against a table
+    -- that does not exist and abort the migration with errno 1146. Brand
+    -- databases are provisioned incrementally, so this is the normal state of
+    -- a brand whose pipeline has not built the stage tables yet.
+    -- has_tbl is 1 only when the table exists AND carries every column the
+    -- PK needs (`date`); a table missing one of them would fail the
+    -- MODIFY below with errno 1054 instead of being skipped.
+    SELECT IF(COUNT(*) > 0 AND SUM(COLUMN_NAME = 'date') > 0, 1, 0) INTO has_tbl
+    FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = tbl;
 
     SELECT COUNT(*) INTO has_pk FROM information_schema.TABLE_CONSTRAINTS
     WHERE TABLE_SCHEMA = DATABASE()
       AND TABLE_NAME   = tbl
       AND CONSTRAINT_TYPE = 'PRIMARY KEY';
 
-    IF has_pk > 0 THEN
+    IF has_tbl = 0 THEN
+        SELECT CONCAT('  = ', tbl, ': table or PK column absent, skipping') AS log;
+    ELSEIF has_pk > 0 THEN
         SELECT CONCAT('  = ', tbl, ': PK already present') AS log;
     ELSE
         -- NULL check
@@ -123,13 +169,28 @@ END$$
 CREATE PROCEDURE _add_date_hour_pk_if_missing(IN tbl VARCHAR(64))
 BEGIN
     DECLARE has_pk INT DEFAULT 0;
+    DECLARE has_tbl INT DEFAULT 0;
+
+    -- Table-existence guard. A missing table also reports zero PK constraints,
+    -- so without this the pre-flight COUNT(*) below would run against a table
+    -- that does not exist and abort the migration with errno 1146. Brand
+    -- databases are provisioned incrementally, so this is the normal state of
+    -- a brand whose pipeline has not built the stage tables yet.
+    -- has_tbl is 1 only when the table exists AND carries every column the
+    -- PK needs (`date`, `hour`); a table missing one of them would fail the
+    -- MODIFY below with errno 1054 instead of being skipped.
+    SELECT IF(COUNT(*) > 0 AND SUM(COLUMN_NAME = 'date') > 0 AND SUM(COLUMN_NAME = 'hour') > 0, 1, 0) INTO has_tbl
+    FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = tbl;
 
     SELECT COUNT(*) INTO has_pk FROM information_schema.TABLE_CONSTRAINTS
     WHERE TABLE_SCHEMA = DATABASE()
       AND TABLE_NAME   = tbl
       AND CONSTRAINT_TYPE = 'PRIMARY KEY';
 
-    IF has_pk > 0 THEN
+    IF has_tbl = 0 THEN
+        SELECT CONCAT('  = ', tbl, ': table or PK column absent, skipping') AS log;
+    ELSEIF has_pk > 0 THEN
         SELECT CONCAT('  = ', tbl, ': PK already present') AS log;
     ELSE
         SET @nq = CONCAT('SELECT COUNT(*) INTO @null_c FROM `', tbl,

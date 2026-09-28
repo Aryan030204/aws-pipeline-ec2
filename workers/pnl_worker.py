@@ -1188,6 +1188,7 @@ def run_worker(current_dt: Optional[datetime] = None, brand_key: Optional[str] =
     the rebuild to that one brand instead of every active brand - matched
     case-insensitively against resolve_brand_key() for each active brand."""
     import aws_background
+    from pipeline.cache_invalidation import invalidate_dates
 
     aws_background.initialize_brand_configs()
     if not aws_background.active_brand_indices:
@@ -1223,6 +1224,9 @@ def run_worker(current_dt: Optional[datetime] = None, brand_key: Optional[str] =
         try:
             written = rebuild_brand_pnl(brand_index, brand_name, brand_key, target_dates)
             logger.info("[%s] Upserted %s %s row(s)", brand_name, written, PNL_TABLE)
+            # Rows for these dates changed, so the dashboard's cached copies
+            # for them are stale until something refills them - drop them.
+            invalidate_dates(brand_key, target_dates, reason="p&l rebuild")
         except Exception as e:
             logger.error("Error rebuilding P&L for %s: %s", brand_name, e)
 

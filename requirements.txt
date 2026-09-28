@@ -8,6 +8,7 @@ APScheduler
 aiohttp
 gunicorn
 upstash-redis
+redis
 qstash
 pymysql
 dotenv

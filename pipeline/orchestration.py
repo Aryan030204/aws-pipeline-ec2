@@ -40,6 +40,7 @@ from pipeline.db import (
     update_last_fetch_timestamp,
 )
 from pipeline.schema_migrations import ensure_summary_tables, run_brand_preflight_schema_migrations
+from pipeline.cache_invalidation import invalidate_dates
 from pipeline.notifications import (
     _derive_error_code,
     trigger_cache_pipeline,
@@ -577,6 +578,16 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
             brand_key,
             affected_dates,
             rto_target_dates=rto_affected_dates,
+        )
+        # The summary tables the dashboard reads just changed for these
+        # dates, so drop their cached copies: the cache pipeline's rebuild
+        # at the end of the run doesn't necessarily cover a backfilled
+        # range, and until something refills them the dashboard would keep
+        # serving the pre-merge numbers.
+        invalidate_dates(
+            brand_key,
+            sorted(affected_dates | rto_affected_dates),
+            reason="summary refresh",
         )
     else:
         logger.info(
