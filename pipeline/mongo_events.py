@@ -40,7 +40,8 @@ CI_EVENTS_BRANDS = {
     "ajmalksa",
     "ajmaluk",
     "ajmalus",
-    "ajmalbh"
+    "ajmalbh",
+    "urban_hindu",
 }
 
 CI_EVENTS_MONGO_SHOP_NAME_MAP = {
@@ -55,6 +56,7 @@ CI_EVENTS_MONGO_SHOP_NAME_MAP = {
     "vama": "vama",
     "3tenx": "3tenx",
     "shylenew": "shyle",
+    "urban_hindu": "URBAN HINDU"
 }
 
 
