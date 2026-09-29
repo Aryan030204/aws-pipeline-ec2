@@ -133,6 +133,8 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
+from workers.admission import admission_controlled
+
 PNL_TABLE = "overall_pnl"  # DDL in migrations/003_overall_pnl.sql
 # Daily ad spend per channel, one row per date; DDL in migrations/004_pnl_ad_spend_rollups.sql.
 META_SPEND_TABLE = "pnl_meta_ad_spend_rollup"
@@ -1183,6 +1185,7 @@ def rebuild_brand_pnl(
     return written
 
 
+@admission_controlled("pnl")
 def run_worker(current_dt: Optional[datetime] = None, brand_key: Optional[str] = None) -> None:
     """brand_key, when given (the dashboard's brand_id, e.g. "BBB"), restricts
     the rebuild to that one brand instead of every active brand - matched

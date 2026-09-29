@@ -46,6 +46,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
 import aws_background
+from workers.admission import admission_controlled
 
 
 def compute_rebuild_dates(tz: ZoneInfo, current_dt: Optional[datetime] = None) -> List[date]:
@@ -60,6 +61,7 @@ def compute_rebuild_dates(tz: ZoneInfo, current_dt: Optional[datetime] = None) -
     return [today - timedelta(days=2), today - timedelta(days=1)]
 
 
+@admission_controlled("checkout-login-status")
 def run_worker(current_dt: Optional[datetime] = None) -> None:
     aws_background.initialize_brand_configs()
 

@@ -172,6 +172,59 @@ once and turns itself off, and any Redis error is logged and swallowed - a cache
 that can't be reached never fails a run that has already written its rows.
 `TEST_MODE=true` skips it entirely.
 
+### Worker admission control
+
+Every worker runs in its own container on one EC2 box, and several wake together
+(`events-summary` and `variant-wise-events` both at 18:30 UTC, near the main
+pipeline's `:30` slot and `intent-events`' 15-minute interval). Overlapping runs
+spike memory, the host swaps onto its EBS root volume, and the random I/O that
+follows drags the whole instance down.
+
+`workers/admission.py` caps how many worker runs may be in flight at once,
+across containers, using one Redis sorted set (`workers:running`). Each worker
+declares itself with a single decorator on `run_worker`:
+
+```python
+@admission_controlled("pnl")
+def run_worker(current_dt=None, brand_key=None):
+```
+
+`run_worker` is the one function every entry path reaches - the worker's own
+scheduler, `python -m workers.run <name>`, and `POST /workers/<name>/trigger` -
+so gating it covers all three, including the ad-hoc backfills most likely to
+collide with a scheduled job.
+
+Admission is a single Lua script, so two workers starting in the same second
+cannot both see a free slot: it evicts expired leases, counts what is left, and
+admits only if `running + 1 <= MAX_CONCURRENT_WORKERS`. Slots are **leases, not
+a counter** - the failure being guarded against is the OOM killer, and a
+decrement that never runs would leak the count upward until no worker could
+start at all. A killed container's slot frees itself once its lease expires; a
+heartbeat thread pushes the lease forward while a long run is still alive.
+
+Like `pipeline/cache_invalidation.py` it fails open: missing `REDIS_URL`, a
+missing `redis` package, or an unreachable Redis logs and lets the run proceed
+unguarded, because a gate that can't be reached must not stop work that is
+otherwise fine. `TEST_MODE=true` skips it entirely. The one case that does stop
+a run is waiting past `WORKER_ADMISSION_WAIT_S`, which means something is
+genuinely stuck - the worker raises `AdmissionTimeout` rather than piling onto a
+host that is already struggling.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MAX_CONCURRENT_WORKERS` | `2` | How many worker runs may overlap |
+| `WORKER_LEASE_TTL_S` | `300` | How long a slot is held without a heartbeat |
+| `WORKER_ADMISSION_WAIT_S` | `1800` | How long to wait for a slot before giving up |
+| `WORKER_ADMISSION_POLL_S` | `10` | How often to re-check while waiting |
+| `WORKER_ADMISSION_KEY` | `workers:running` | The sorted set the containers coordinate through |
+
+To see what is holding a slot right now:
+
+```bash
+docker compose exec -T shopify-pipeline \
+  python -c "from workers.admission import current_running; print(current_running())"
+```
+
 ## Triggering a worker manually
 
 Every standalone worker (`pnl`, `events-summary`, `variant-wise-events`, `checkout-login-status`, `intent-events`) can be run on demand, once, without waiting for its daily schedule. Both knobs below use the same registry in `workers/registry.py`, so adding a worker there makes it available to both.

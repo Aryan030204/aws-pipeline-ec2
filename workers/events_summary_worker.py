@@ -2,6 +2,7 @@ import base64
 import logging
 import os
 import re
+import sys
 import tempfile
 from collections import defaultdict
 from contextlib import contextmanager
@@ -24,6 +25,15 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+# When run directly (`python workers/events_summary_worker.py`, which is how
+# the Dockerfile/CMD invokes it), Python sets sys.path[0] to workers/, not the
+# repo root - same fix every other worker in this repo uses.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
+
+from workers.admission import admission_controlled
 
 IST = ZoneInfo("Asia/Kolkata")
 MONGO_URI = os.environ.get("MONGO_URI", "").strip()
@@ -377,6 +387,7 @@ def fetch_mongo_events_for_dates(target_dates: Sequence[date]) -> List[Dict]:
             client.close()
 
 
+@admission_controlled("events-summary")
 def run_worker(current_dt: Optional[datetime] = None) -> None:
     target_dates = compute_rebuild_dates(current_dt=current_dt)
     target_date_set = set(target_dates)

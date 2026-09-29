@@ -47,6 +47,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
 import aws_background
+from workers.admission import admission_controlled
 
 
 def _resolve_brand_index_by_db_database(db_database_value: str):
@@ -68,6 +69,7 @@ def _resolve_brand_index_by_db_database(db_database_value: str):
     return None
 
 
+@admission_controlled("intent-events")
 def run_worker() -> None:
     aws_background.initialize_brand_configs()
 
