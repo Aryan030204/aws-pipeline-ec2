@@ -74,7 +74,8 @@ Other important flags:
 
 | Variable | Purpose |
 |---|---|
-| `SELF_RUN` | `true` = auto-run every 10 minutes; `false` = manual trigger only |
+| `SELF_RUN` | `true` = auto-run on schedule (every 10 minutes, or per `BRANDS_CRON_MAP` below); `false` = manual trigger only |
+| `BRANDS_CRON_MAP` | Optional per-brand cron override, JSON `{"<brand_index>": "<minute-list>"}`, e.g. `{"3":"15,45","4":"15,45","1":"0,30","2":"0,30"}` runs brands 3/4 at :15/:45 past the hour and 1/2 at :00/:30. Any active brand **not** a key here (including every brand, if this is unset/empty) keeps running on the legacy every-10-min schedule - opt-in per brand. Read once at startup; changing it needs a restart. |
 | `BACKFILL_MODE` | `true` = process a specific historical date window instead of "since last run" |
 | `BACKFILL_BRAND_INDICES` | Restrict a backfill run to specific brands |
 | `ALERTS_WEBHOOK_URL` | Where QStash-forwarded sales/web-vitals alerts get delivered |
@@ -110,7 +111,7 @@ curl -X POST http://localhost:5000/trigger \
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/health` | GET | Basic liveness check, returns `{"status": "healthy", ...}` |
-| `/trigger` | POST | Runs the pipeline immediately. Requires an `x-pipeline-key` header and a JSON body with a `runId` |
+| `/trigger` | POST | Runs the pipeline immediately. Requires an `x-pipeline-key` header and a JSON body with a `runId`. Optional `brandIds` (a list, or a single `brandId`) restricts the run to just those brands, independent of `BRANDS_CRON_MAP` grouping - omitted, it runs every active brand as before |
 
 ## Deployment
 
@@ -143,6 +144,10 @@ docker compose exec -T checkout-login-status-worker \
 The cache pipeline runs as its own container (`cache-pipeline`) on the same EC2 host, joined to the same Docker network (`pipeline-net`) as `shopify-pipeline`. After each full run finishes, the pipeline fires a plain `GET http://cache-pipeline:8080/trigger-pipeline` — no QStash involved, just a direct container-to-container call over the shared network.
 
 This request runs in a background thread, so the pipeline doesn't wait for the cache rebuild to finish before moving on. Whenever the response does come back, only a short summary (status + brand count) is logged — not the full per-brand/per-date result body.
+
+### Per-brand cron groups
+
+With `BRANDS_CRON_MAP` set, each distinct cron value gets its own scheduler job (independent `max_instances=1`, so a slow run of one group never blocks another group's tick), plus the always-registered legacy fallback job (`pipeline_job`, every 10 minutes) for anything not in the map. A manual `/trigger` call — with or without `brandIds` — always runs as its own one-off job, so it can overlap with a brand's own cron group if the timing lines up; per-brand DB writes are upserts (`ON DUPLICATE KEY UPDATE`), so the worst case is duplicated work, not corrupted data.
 
 ## Triggering a worker manually
 

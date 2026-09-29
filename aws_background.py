@@ -383,6 +383,9 @@ from pipeline.orchestration import (
     update_sessions_summary,
     process_single_brand,
     run_data_pipeline,
+    _parse_brands_cron_map,
+    _group_brands_by_cron,
+    _run_brand_group,
     manual_trigger,
     health_check,
 )
@@ -1156,9 +1159,32 @@ def initialize_brand_configs():
 if __name__ == "__main__":
     initialize_brand_configs()
 
-    # Conditionally schedule the pipeline
+    # Conditionally schedule the pipeline. BRANDS_CRON_MAP lets some brands
+    # run on their own hourly cadence instead of the shared every-10-min job
+    # (see pipeline/orchestration.py's _parse_brands_cron_map docstring) - a
+    # brand not in the map (including every brand, when it's empty/unset)
+    # keeps running on the legacy fallback job below, unchanged.
+    brands_cron_map = _parse_brands_cron_map()
+    brand_cron_groups = _group_brands_by_cron(brands_cron_map)
+
     if SELF_RUN:
-        # Schedule at fixed 10-minute wall-clock slots (:00, :10, :20, :30, :40, :50)
+        for cron_value, group_indices in brand_cron_groups.items():
+            sanitized = "".join(ch if ch.isalnum() else "_" for ch in cron_value)
+            scheduler.add_job(
+                _run_brand_group(group_indices),
+                "cron",
+                minute=cron_value,
+                second=0,
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=120,
+                replace_existing=True,
+                id=f"pipeline_job_group_{sanitized}",
+            )
+
+        # Always registered, even when every active brand happens to be
+        # mapped today - cheap no-op otherwise, and a brand added later with
+        # no map entry still runs somewhere without a redeploy.
         scheduler.add_job(
             run_data_pipeline,
             "cron",
@@ -1170,30 +1196,19 @@ if __name__ == "__main__":
             replace_existing=True,
             id="pipeline_job",
         )
-    else:
-        # Add the job without a trigger so it ONLY runs via manual trigger
-        scheduler.add_job(
-            run_data_pipeline,
-            trigger=None,
-            next_run_time=None,
-            coalesce=True,
-            max_instances=1,
-            misfire_grace_time=120,
-            replace_existing=True,
-            id="pipeline_job",
-        )
+    # else (SELF_RUN=false): no automatic jobs at all - manual /trigger no
+    # longer reuses a pre-registered job id, it schedules its own one-off job
+    # per call (see pipeline/orchestration.py's manual_trigger), so there's
+    # nothing to pre-register here for the manual-only case.
 
     scheduler.start()
 
     logger.info("✅ Optimized Shopify ETL worker started (WITH MANUAL TRIGGER API)")
-    
+
     if SELF_RUN:
-        job = scheduler.get_job("pipeline_job")
-        next_run = job.next_run_time if job else None
-        if next_run:
-            logger.info(f"   - Schedule: Every 10 mins (Next: {next_run.strftime('%Y-%m-%d %I:%M:%S %p %Z')})")
-        else:
-            logger.info("   - Schedule: Every 10 mins")
+        for cron_value, group_indices in brand_cron_groups.items():
+            logger.info(f"   - Schedule: brands {group_indices} at minute {cron_value} every hour")
+        logger.info("   - Schedule: all other active brands every 10 mins (:00,:10,:20,:30,:40,:50)")
     else:
         logger.info("   - Schedule: MANUAL ONLY (SELF_RUN=false)")
 

@@ -8,12 +8,11 @@ and manual triggers (run_data_pipeline), and the Flask routes
 
 import json
 import os
-import queue
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set
 from zoneinfo import ZoneInfo
 
 import mysql.connector
@@ -29,7 +28,6 @@ from pipeline.state import (
     active_brand_indices,
     brand_db_configs,
     http_session,
-    MANUAL_TRIGGER_QUEUE,
     _db_context,
     _last_logs_handler,
 )
@@ -658,25 +656,73 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
 # ---------------------------
 # Job runner
 # ---------------------------
-def run_data_pipeline():
-    manual_run_id = None
+def _parse_brands_cron_map() -> Dict[int, str]:
+    """
+    BRANDS_CRON_MAP (JSON {"<brand_index>": "<minute-list>"}) lets some
+    brands run on their own hourly cadence instead of the shared every-10-min
+    job - e.g. {"3": "15,45", "1": "0,30"} runs brand 3 at :15/:45 and brand 1
+    at :00/:30. Values are minute-lists only, same shape as the legacy job's
+    own minute= kwarg (hourly, no hour/day fields). Same tolerant-JSON
+    pattern as pipeline/intent_events.py's _parse_intent_db_map: invalid
+    JSON, a non-dict, or a non-numeric key is logged and skipped rather than
+    raising - a brand not present here (including an empty/unset map) simply
+    falls through to the legacy fallback job (see run_data_pipeline below),
+    so this is opt-in per brand and fully backward compatible.
+    """
+    raw = os.environ.get("BRANDS_CRON_MAP", "{}")
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid JSON in BRANDS_CRON_MAP. Using empty mapping.")
+        return {}
+
+    if not isinstance(parsed, dict):
+        logger.warning("BRANDS_CRON_MAP must be a JSON object. Using empty mapping.")
+        return {}
+
+    result: Dict[int, str] = {}
+    for key, value in parsed.items():
+        try:
+            brand_index = int(str(key).strip())
+        except (TypeError, ValueError):
+            logger.warning(f"Ignoring non-numeric BRANDS_CRON_MAP key: {key!r}")
+            continue
+        result[brand_index] = str(value).strip()
+    return result
+
+
+def _group_brands_by_cron(cron_map: Dict[int, str]) -> Dict[str, List[int]]:
+    """cron-minute-value -> sorted brand indices sharing it, for registering
+    one scheduler job per distinct cadence."""
+    groups: Dict[str, List[int]] = {}
+    for brand_index, cron_value in cron_map.items():
+        groups.setdefault(cron_value, []).append(brand_index)
+    return {cron_value: sorted(indices) for cron_value, indices in groups.items()}
+
+
+def _execute_pipeline_run(target_indices: List[int], run_id: Optional[str] = None) -> None:
+    """
+    The actual ETL run: preflight migrations, per-brand ThreadPoolExecutor,
+    cache/UTM triggers, and (when run_id is given - only manual/dashboard
+    triggers pass one) the STARTED/COMPLETED/FAILED webhook calls. Shared by
+    every caller - the legacy fallback job (run_data_pipeline), each
+    per-cron-group job (_run_brand_group), and manual /trigger - so
+    BACKFILL_MODE/BACKFILL_BRAND_INDICES filtering lives here, once, and
+    applies uniformly regardless of who supplied target_indices.
+    """
     succeeded = False
     failure_exception: Optional[Exception] = None
-    try:
-        manual_run_id = MANUAL_TRIGGER_QUEUE.get_nowait()
-    except queue.Empty:
-        pass
 
     job_start_time = aws_background.now_ist()
     job_id = f"job-{uuid.uuid4().hex[:8]}"
     logger.info(
-        f"\n{'=' * 60}\nJOB TRIGGERED AT: {job_start_time.strftime('%Y-%m-%d %I:%M:%S %p')}\nJOB ID: {job_id}\nMANUAL TRIGGER: {bool(manual_run_id)}\n{'=' * 60}"
+        f"\n{'=' * 60}\nJOB TRIGGERED AT: {job_start_time.strftime('%Y-%m-%d %I:%M:%S %p')}\nJOB ID: {job_id}\nMANUAL TRIGGER: {bool(run_id)}\n{'=' * 60}"
     )
 
-    if manual_run_id and aws_background.MANAGER_STARTED_ENDPOINT:
+    if run_id and aws_background.MANAGER_STARTED_ENDPOINT:
         try:
             started_payload = {
-                "runId": manual_run_id,
+                "runId": run_id,
                 "pipelineId": aws_background.PIPELINE_ID,
                 "status": "running"
             }
@@ -691,15 +737,14 @@ def run_data_pipeline():
             logger.error(f"❌ Failed to send STARTED webhook: {e}")
 
     try:
-        if not active_brand_indices:
+        if not target_indices:
             logger.warning("No active brands with valid database configs. Nothing to do.")
             return
 
         # Filter indices if in backfill mode to avoid processing unrelated brands
-        target_indices = active_brand_indices
         if aws_background.BACKFILL_MODE and aws_background.BACKFILL_BRAND_INDICES:
             target_indices = [
-                i for i in active_brand_indices if i in aws_background.BACKFILL_BRAND_INDICES
+                i for i in target_indices if i in aws_background.BACKFILL_BRAND_INDICES
             ]
             logger.info(
                 f"🎯 BACKFILL_MODE is active. Filtering brands to: {target_indices}"
@@ -771,10 +816,10 @@ def run_data_pipeline():
         traceback.print_exc()
         failure_exception = e
     finally:
-        if manual_run_id and succeeded and aws_background.MANAGER_COMPLETED_ENDPOINT:
+        if run_id and succeeded and aws_background.MANAGER_COMPLETED_ENDPOINT:
             try:
                 completed_payload = {
-                    "runId": manual_run_id,
+                    "runId": run_id,
                     "pipelineId": aws_background.PIPELINE_ID,
                     "status": "completed"
                 }
@@ -788,13 +833,13 @@ def run_data_pipeline():
             except Exception as e:
                 logger.error(f"❌ Failed to send COMPLETED webhook: {e}")
 
-        if manual_run_id and (not succeeded) and aws_background.MANAGER_FAILED_ENDPOINT:
+        if run_id and (not succeeded) and aws_background.MANAGER_FAILED_ENDPOINT:
             try:
                 recent_logs = _last_logs_handler.get_recent()
                 error_body = "\n".join(recent_logs) if recent_logs else "No logs captured."
                 error_code = _derive_error_code(failure_exception)
                 failed_payload = {
-                    "runId": manual_run_id,
+                    "runId": run_id,
                     "pipelineId": aws_background.PIPELINE_ID,
                     "errorCode": error_code,
                     "errorBody": error_body,
@@ -810,6 +855,40 @@ def run_data_pipeline():
                 logger.error(f"❌ Failed to send FAILED webhook: {e}")
 
 
+def run_data_pipeline() -> None:
+    """
+    The legacy fallback cron job (still id "pipeline_job", still
+    minute="0,10,20,30,40,50" every hour - see aws_background.py's
+    scheduler registration). Runs every active brand that ISN'T a key in
+    BRANDS_CRON_MAP, so a brand with no per-brand cron entry (including
+    every brand, when the map is empty/unset) keeps running exactly as
+    before - opt-in per brand, fully backward compatible. Note the map is
+    only read once at process startup (module import time, via the
+    BRANDS_CRON_MAP env var), so changing it requires a restart to take
+    effect, same as every other env-driven config in this pipeline.
+    """
+    mapped_indices = set(_parse_brands_cron_map())
+    target_indices = [i for i in active_brand_indices if i not in mapped_indices]
+    _execute_pipeline_run(target_indices, run_id=None)
+
+
+def _run_brand_group(brand_indices: List[int]):
+    """
+    Builds one no-argument callable per distinct BRANDS_CRON_MAP cron value,
+    for scheduler.add_job - brand_indices is that group's fixed brand-index
+    list (captured at registration time); at call time it's intersected with
+    the live active_brand_indices, so a brand deactivated later is simply
+    skipped, same as the legacy job already does implicitly.
+    """
+    brand_index_set = set(brand_indices)
+
+    def _run() -> None:
+        target_indices = [i for i in active_brand_indices if i in brand_index_set]
+        _execute_pipeline_run(target_indices, run_id=None)
+
+    return _run
+
+
 # ---------------------------
 # Flask API Endpoints
 # ---------------------------
@@ -818,7 +897,10 @@ def manual_trigger():
     """
     Manual trigger endpoint to run the pipeline immediately.
     Expects 'x-pipeline-key' header for authentication and a JSON body with
-    'runId' provided by the pipeline manager.
+    'runId' provided by the pipeline manager. Optional 'brandIds' (a list,
+    or a single 'brandId') restricts the run to just those brands,
+    independent of BRANDS_CRON_MAP grouping - omitted, it runs every active
+    brand, same as before this option existed.
     """
     auth_key = request.headers.get("x-pipeline-key")
     if not auth_key or auth_key != aws_background.PIPELINE_AUTH_HEADER:
@@ -836,39 +918,53 @@ def manual_trigger():
     run_id = run_id.strip()
     logger.info(f"Manual trigger runId received: {run_id}")
 
-    # We use the scheduler to trigger the job immediately.
-    # This ensures that APScheduler's concurrency control (max_instances=1) is respected.
-    try:
-        job = scheduler.get_job("pipeline_job")
-        if not job:
-            logger.info("Pipeline job not found in scheduler (likely finished previous manual run). Re-adding job.")
-            if aws_background.SELF_RUN:
-                job = scheduler.add_job(
-                    run_data_pipeline,
-                    "cron",
-                    minute="0,10,20,30,40,50",
-                    second=0,
-                    coalesce=True,
-                    max_instances=1,
-                    misfire_grace_time=120,
-                    replace_existing=True,
-                    id="pipeline_job",
-                )
-            else:
-                job = scheduler.add_job(
-                    run_data_pipeline,
-                    trigger=None,
-                    next_run_time=None,
-                    coalesce=True,
-                    max_instances=1,
-                    misfire_grace_time=120,
-                    replace_existing=True,
-                    id="pipeline_job",
-                )
+    requested_brand_ids = request_body.get("brandIds")
+    if requested_brand_ids is None:
+        requested_brand_ids = request_body.get("brandId")
+    if requested_brand_ids is not None and not isinstance(requested_brand_ids, list):
+        requested_brand_ids = [requested_brand_ids]
 
-        MANUAL_TRIGGER_QUEUE.put(run_id)
-        # Trigger the job to run now
-        job.modify(next_run_time=datetime.now(IST))
+    if requested_brand_ids is not None:
+        try:
+            requested_indices = {int(v) for v in requested_brand_ids}
+        except (TypeError, ValueError):
+            logger.warning(f"Manual trigger rejected: invalid brandIds {requested_brand_ids!r}")
+            return jsonify({"status": "error", "message": "brandIds must be a list of brand indices"}), 400
+
+        active_set = set(active_brand_indices)
+        target_indices = sorted(requested_indices & active_set)
+        skipped = sorted(requested_indices - active_set)
+        if skipped:
+            logger.warning(f"Manual trigger: ignoring inactive/unknown brandIds {skipped}")
+        if not target_indices:
+            logger.warning("Manual trigger rejected: none of the requested brandIds are active")
+            return (
+                jsonify({"status": "error", "message": "None of the requested brandIds are active"}),
+                400,
+            )
+        logger.info(f"Manual trigger scoped to brandIds: {target_indices}")
+    else:
+        target_indices = list(active_brand_indices)
+
+    # A dedicated one-off job per manual trigger (rather than reusing the
+    # shared cron job id) so run_id/target_indices are bound directly as its
+    # arguments - unambiguous even with several per-brand-group jobs
+    # registered, unlike the previous shared-queue handoff onto a single
+    # "pipeline_job".
+    try:
+        job_id = f"manual_trigger_{uuid.uuid4().hex[:8]}"
+        scheduler.add_job(
+            _execute_pipeline_run,
+            trigger=None,
+            next_run_time=datetime.now(IST),
+            args=[target_indices],
+            kwargs={"run_id": run_id},
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=120,
+            replace_existing=True,
+            id=job_id,
+        )
         return (
             jsonify(
                 {"status": "success", "message": "Pipeline triggered immediately", "runId": run_id}
