@@ -79,8 +79,22 @@ Other important flags:
 | `BACKFILL_MODE` | `true` = process a specific historical date window instead of "since last run" |
 | `BACKFILL_BRAND_INDICES` | Restrict a backfill run to specific brands |
 | `ALERTS_WEBHOOK_URL` | Where QStash-forwarded sales/web-vitals alerts get delivered |
+| `PIPELINE_METRICS_SHEET_SWITCH` | `true` (default) = log each run's per-brand metrics to Google Sheets (see below); `false` disables it entirely |
+| `PIPELINE_METRICS_SHEET_ID` | The destination spreadsheet's ID (the long id in its URL) |
+| `GOOGLE_SHEETS_SERVICE_ACCOUNT_FILE` | Path to a service-account JSON key file, mounted into the container. Use this **or** the next var, not both |
+| `GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON_B64` | The same service-account JSON key, base64-encoded, as an env var instead of a mounted file |
 
 No secrets or real credentials are ever meant to live in source control — see `.env.local`/`.env` locally, and the deployment's own secret store in production.
+
+### Pipeline run metrics (Google Sheets)
+
+After each run, `pipeline/metrics_logging.py` appends one row per brand (new/updated order counts, affected-date count, sessions/ATC sessions synced, success/error, that brand's own duration) plus one `ALL BRANDS` summary row (aggregated counts, overall run duration), to a monthly worksheet (`Runs-2026-09`, etc., created automatically) in the spreadsheet at `PIPELINE_METRICS_SHEET_ID`. It's entirely best-effort — a Sheets outage, bad credentials, or quota error is logged and never fails or delays the pipeline run.
+
+One-time setup:
+1. In Google Cloud Console, create a service account and download its JSON key.
+2. Enable the Google Sheets API for that project.
+3. Share your destination spreadsheet with the service account's email (found in the JSON key, `client_email`) as **Editor**.
+4. Set `PIPELINE_METRICS_SHEET_ID` (from the spreadsheet's URL) and either `GOOGLE_SHEETS_SERVICE_ACCOUNT_FILE` or `GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON_B64`.
 
 ## Running it locally
 

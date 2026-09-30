@@ -8,11 +8,12 @@ and manual triggers (run_data_pipeline), and the Flask routes
 
 import json
 import os
+import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 from zoneinfo import ZoneInfo
 
 import mysql.connector
@@ -43,6 +44,7 @@ from pipeline.notifications import (
     trigger_cache_pipeline,
     trigger_utm_pipeline,
 )
+from pipeline.metrics_logging import log_pipeline_run_metrics_async
 from pipeline.shopify_orders import (
     fetch_orders,
     transform_orders_to_df_optimized,
@@ -120,6 +122,41 @@ def get_last_order(brand_index: int, table_name: str, cursor=None) -> Optional[D
 # ---------------------------
 # Sessions summary (logic preserved)
 # ---------------------------
+def ensure_session_tables(cursor, connection) -> None:
+    """
+    sessions_summary (overall daily) and hourly_sessions_summary (overall
+    hourly) aren't in schema_migrations.py's ensure_summary_tables - they're
+    created here instead. Factored out of update_sessions_summary so
+    backfill scripts/backfill_sessions_data.py, which calls the ShopifyQL
+    session syncs directly (bypassing update_sessions_summary's own
+    backfill-mode skip), can ensure the same tables exist without
+    duplicating this SQL.
+    """
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sessions_summary (
+            date DATE PRIMARY KEY,
+            number_of_sessions INT DEFAULT 0,
+            number_of_atc_sessions INT DEFAULT 0
+        );
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS hourly_sessions_summary (
+            date DATE NOT NULL,
+            hour TINYINT UNSIGNED NOT NULL,
+            number_of_sessions INT DEFAULT 0,
+            number_of_atc_sessions INT DEFAULT 0,
+            PRIMARY KEY (date, hour)
+        );
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pipeline_metadata (
+            key_name VARCHAR(50) PRIMARY KEY,
+            key_value DATETIME
+        );
+    """)
+    connection.commit()
+
+
 def update_sessions_summary(
     brand_index: int,
     brand_name: str,
@@ -135,78 +172,83 @@ def update_sessions_summary(
     Mixed mode:
       - NO LONGER calls in-house sessions API.
       - Uses ShopifyQL for both daily and hourly sessions truth.
+
+    Returns {"sessions_synced": int, "atc_sessions_synced": int} - the overall
+    (daily) session/ATC-session totals ShopifyQL returned this call, for
+    pipeline run-metrics logging (see process_single_brand). 0/0 whenever
+    backfill mode skips this brand's sync, or on any error below.
     """
+    sessions_synced = 0
+    atc_sessions_synced = 0
     try:
         with get_db_cursor(brand_index) as (cursor, connection):
             with timed("Ensure session tables"):
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS sessions_summary (
-                        date DATE PRIMARY KEY,
-                        number_of_sessions INT DEFAULT 0,
-                        number_of_atc_sessions INT DEFAULT 0
-                    );
-                """)
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS hourly_sessions_summary (
-                        date DATE NOT NULL,
-                        hour TINYINT UNSIGNED NOT NULL,
-                        number_of_sessions INT DEFAULT 0,
-                        number_of_atc_sessions INT DEFAULT 0,
-                        PRIMARY KEY (date, hour)
-                    );
-                """)
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS pipeline_metadata (
-                        key_name VARCHAR(50) PRIMARY KEY,
-                        key_value DATETIME
-                    );
-                """)
-                connection.commit()
+                ensure_session_tables(cursor, connection)
 
             # --- DAILY & HOURLY: Use ShopifyQL as source of truth ---
-            update_sessions_summary_from_shopifyql(
-                brand_index=brand_index,
-                brand_name=brand_name,
-                shop_name=shop_name,
-                api_version=api_version,
-                access_token=access_token,
-                tz=tz,
-                cursor=cursor,
-                connection=connection,
-            )
+            # Skipped during backfill: the overall (not city-wise) sessions/ATC
+            # sessions numbers must not be backfilled - only "since last run"
+            # incremental updates for these two. City-wise, web vitals,
+            # checkout-initiated/buy-now events etc. below are unaffected.
+            if aws_background.is_backfill_active_for(brand_index):
+                logger.info(
+                    f"⏭️ Skipping overall sessions/ATC sessions sync for {brand_name}: "
+                    "backfill mode is active"
+                )
+            else:
+                sessions_synced, atc_sessions_synced = update_sessions_summary_from_shopifyql(
+                    brand_index=brand_index,
+                    brand_name=brand_name,
+                    shop_name=shop_name,
+                    api_version=api_version,
+                    access_token=access_token,
+                    tz=tz,
+                    cursor=cursor,
+                    connection=connection,
+                ) or (0, 0)
 
-            update_hourly_sessions_summary_from_shopifyql(
-                brand_index=brand_index,
-                brand_name=brand_name,
-                shop_name=shop_name,
-                api_version=api_version,
-                access_token=access_token,
-                tz=tz,
-                cursor=cursor,
-                connection=connection,
-            )
+                update_hourly_sessions_summary_from_shopifyql(
+                    brand_index=brand_index,
+                    brand_name=brand_name,
+                    shop_name=shop_name,
+                    api_version=api_version,
+                    access_token=access_token,
+                    tz=tz,
+                    cursor=cursor,
+                    connection=connection,
+                )
 
-            city_daily_dates = update_daily_city_sessions_summary_from_shopifyql(
-                brand_index=brand_index,
-                brand_name=brand_name,
-                shop_name=shop_name,
-                api_version=api_version,
-                access_token=access_token,
-                tz=tz,
-                cursor=cursor,
-                connection=connection,
-            )
+            # Skipped during backfill too - "no sessions/ATC sessions
+            # backfill at all" covers city-wise as well as overall.
+            if aws_background.is_backfill_active_for(brand_index):
+                logger.info(
+                    f"⏭️ Skipping city-wise sessions/ATC sessions sync for {brand_name}: "
+                    "backfill mode is active"
+                )
+                city_daily_dates = set()
+                city_hourly_dates = set()
+            else:
+                city_daily_dates = update_daily_city_sessions_summary_from_shopifyql(
+                    brand_index=brand_index,
+                    brand_name=brand_name,
+                    shop_name=shop_name,
+                    api_version=api_version,
+                    access_token=access_token,
+                    tz=tz,
+                    cursor=cursor,
+                    connection=connection,
+                )
 
-            city_hourly_dates = update_hourly_city_sessions_summary_from_shopifyql(
-                brand_index=brand_index,
-                brand_name=brand_name,
-                shop_name=shop_name,
-                api_version=api_version,
-                access_token=access_token,
-                tz=tz,
-                cursor=cursor,
-                connection=connection,
-            )
+                city_hourly_dates = update_hourly_city_sessions_summary_from_shopifyql(
+                    brand_index=brand_index,
+                    brand_name=brand_name,
+                    shop_name=shop_name,
+                    api_version=api_version,
+                    access_token=access_token,
+                    tz=tz,
+                    cursor=cursor,
+                    connection=connection,
+                )
 
             ci_start_dt = datetime.now(tz).date() - timedelta(days=1)
             ci_end_dt = datetime.now(tz).date()
@@ -312,20 +354,50 @@ def update_sessions_summary(
     except Exception as e:
         logger.error(f"❌ Error updating sessions for {brand_name}: {e}")
         traceback.print_exc()
+        return {"sessions_synced": 0, "atc_sessions_synced": 0}
+
+    return {"sessions_synced": sessions_synced, "atc_sessions_synced": atc_sessions_synced}
 
 
 # ---------------------------
 # Per-brand processing
 # ---------------------------
-def process_single_brand(brand_index: int, job_id: Optional[str] = None):
+def _empty_brand_metrics(brand_index: int, brand_name: str, success: bool = True, error_message: str = "") -> Dict[str, Any]:
+    """Baseline shape for process_single_brand's return value - every exit
+    path (including the early-return ones below) returns this shape, not
+    None, so the run-metrics logging in _execute_pipeline_run always has a
+    row to log per brand instead of silently skipping one."""
+    return {
+        "brand_name": brand_name,
+        "brand_index": brand_index,
+        "new_orders_count": 0,
+        "updated_orders_count": 0,
+        "affected_dates_count": 0,
+        "sessions_synced": 0,
+        "atc_sessions_synced": 0,
+        "success": success,
+        "error_message": error_message,
+        "duration_seconds": 0.0,
+    }
+
+
+def process_single_brand(brand_index: int, job_id: Optional[str] = None) -> Dict[str, Any]:
+    brand_started_at = time.monotonic()
     if brand_index not in brand_db_configs:
         logger.error(f"❌ Skipping brand {brand_index}: no database config")
-        return
+        return _empty_brand_metrics(
+            brand_index, f"Brand_{brand_index}", success=False, error_message="no database config"
+        )
     _db_context.job_id = job_id
     brand_name = os.environ.get(f"BRAND_NAME_{brand_index}", f"Brand_{brand_index}")
     brand_key = os.environ.get(
         f"BRAND_TAG_{brand_index}"
     )  # used for session_adjustment_buckets & alerts
+    # Sub-phase failures below are individually caught and logged (a bundle-
+    # rollup or UTM hiccup shouldn't abort the rest of the brand's run) but
+    # are collected here so they still show up in this brand's run-metrics
+    # row instead of being invisible outside the container logs.
+    errors: List[str] = []
 
     logger.info(f"\n{'=' * 50}\nSTARTING PROCESS FOR SHOP: {brand_name}\n{'=' * 50}")
     log_db_connection_metrics(f"DB_CONNECTION_METRICS_BRAND_START brand={brand_name}")
@@ -334,7 +406,9 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
         execute_discount_dashboard_backfill_only(brand_index, brand_name)
         log_db_connection_metrics(f"DB_CONNECTION_METRICS_BRAND_COMPLETE brand={brand_name}")
         _db_context.job_id = None
-        return
+        metrics = _empty_brand_metrics(brand_index, brand_name)
+        metrics["duration_seconds"] = round(time.monotonic() - brand_started_at, 2)
+        return metrics
 
     tz = aws_background.get_brand_timezone(brand_index)
     shop_name = os.environ.get(f"SHOP_NAME_{brand_index}")
@@ -363,7 +437,7 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
     logger.info(f"APP_ID_MAPPING_{brand_index} length={len(app_id_mapping_str)}")
 
     # Sessions
-    update_sessions_summary(
+    session_metrics = update_sessions_summary(
         brand_index,
         brand_name,
         session_url,
@@ -373,11 +447,15 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
         api_version,
         access_token,
         tz,
-    )
+    ) or {}
+    sessions_synced = session_metrics.get("sessions_synced", 0)
+    atc_sessions_synced = session_metrics.get("atc_sessions_synced", 0)
 
     # Track affected dates across all order processing (sparse set, not a range)
     affected_dates: Set[str] = set()
     rto_affected_dates: Set[str] = set()
+    new_orders_count = 0
+    updated_orders_count = 0
 
     # Orders (NEW + UPDATED) with single connection/cursor reused
     process_types = [
@@ -457,6 +535,10 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
             logger.info(
                 f"Fetched {original_count}, removed {original_count - len(filtered)} duplicates. Processing {len(filtered)} orders."
             )
+            if process["type"] == "NEW":
+                new_orders_count = len(filtered)
+            else:
+                updated_orders_count = len(filtered)
 
             # Track affected dates for NEW orders before load
             if process["type"] == "NEW":
@@ -596,6 +678,7 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
         except Exception as e:
             logger.error(f"Bundle rollup refresh failed for {brand_name}: {e}")
             traceback.print_exc()
+            errors.append(f"bundle rollups: {e}")
 
     # --- ShopifyQL Summaries (Always updated for 'today' or affected range) ---
     try:
@@ -620,6 +703,7 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
             )
         except Exception as e:
             logger.error(f"❌ Error updating UTM summary for {brand_name}: {e}")
+            errors.append(f"UTM summary: {e}")
 
         # 2. Product traffic split
         try:
@@ -633,6 +717,7 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
             logger.error(
                 f"Error updating product traffic split for {brand_name}: {e}"
             )
+            errors.append(f"product traffic split: {e}")
 
         # 3. Referrer
         try:
@@ -641,16 +726,33 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None):
             )
         except Exception as e:
             logger.error(f"❌ Error updating Referrer summary for {brand_name}: {e}")
+            errors.append(f"referrer summary: {e}")
 
     except Exception as e:
         logger.error(
             f"❌ Critical error in ShopifyQL summary block for {brand_name}: {e}"
         )
         traceback.print_exc()
+        errors.append(f"ShopifyQL summary block: {e}")
 
     logger.info(f"✅ COMPLETED PROCESSING FOR {brand_name}")
     log_db_connection_metrics(f"DB_CONNECTION_METRICS_BRAND_COMPLETE brand={brand_name}")
     _db_context.job_id = None
+
+    metrics = _empty_brand_metrics(brand_index, brand_name)
+    metrics.update(
+        {
+            "new_orders_count": new_orders_count,
+            "updated_orders_count": updated_orders_count,
+            "affected_dates_count": len(affected_dates),
+            "sessions_synced": sessions_synced,
+            "atc_sessions_synced": atc_sessions_synced,
+            "success": len(errors) == 0,
+            "error_message": "; ".join(errors),
+            "duration_seconds": round(time.monotonic() - brand_started_at, 2),
+        }
+    )
+    return metrics
 
 
 # ---------------------------
@@ -754,15 +856,18 @@ def _execute_pipeline_run(target_indices: List[int], run_id: Optional[str] = Non
             logger.warning("No active brands match the current filters. Nothing to do.")
             return
 
-        logger.info("🧱 Running serial preflight schema migrations before brand workers...")
-        for idx in target_indices:
-            try:
-                run_brand_preflight_schema_migrations(idx)
-            except Exception as e:
-                brand_name = os.environ.get(f"BRAND_NAME_{idx}", f"Brand_{idx}")
-                logger.error(f"❌ Preflight schema migration failed for {brand_name}: {e}")
-                traceback.print_exc()
-                raise
+        if aws_background.BACKFILL_MODE:
+            logger.info("⏭️ Skipping preflight schema migrations: backfill mode is active.")
+        else:
+            logger.info("🧱 Running serial preflight schema migrations before brand workers...")
+            for idx in target_indices:
+                try:
+                    run_brand_preflight_schema_migrations(idx)
+                except Exception as e:
+                    brand_name = os.environ.get(f"BRAND_NAME_{idx}", f"Brand_{idx}")
+                    logger.error(f"❌ Preflight schema migration failed for {brand_name}: {e}")
+                    traceback.print_exc()
+                    raise
 
         # Cap per-run concurrency to protect RDS I/O. The per-brand pipeline is
         # heavy (multi-table JOINs, summary rebuilds, session upserts); running
@@ -775,6 +880,7 @@ def _execute_pipeline_run(target_indices: List[int], run_id: Optional[str] = Non
             f" (MAX_CONCURRENT_BRANDS={max_concurrent_brands})"
         )
 
+        brand_run_metrics: List[Dict[str, Any]] = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             logger.info(f"🚀 Starting {len(target_indices)} brand worker threads...")
             futures = {
@@ -784,11 +890,16 @@ def _execute_pipeline_run(target_indices: List[int], run_id: Optional[str] = Non
                 idx = futures[fut]
                 name = os.environ.get(f"BRAND_NAME_{idx}", f"Brand_{idx}")
                 try:
-                    fut.result()
+                    result = fut.result()
+                    if isinstance(result, dict):
+                        brand_run_metrics.append(result)
                     logger.info(f"✅ Successfully completed brand: {name}")
                 except Exception as e:
                     logger.error(f"❌ Failed processing brand {name}: {e}")
                     traceback.print_exc()
+                    brand_run_metrics.append(
+                        _empty_brand_metrics(idx, name, success=False, error_message=str(e))
+                    )
                 finally:
                     log_db_connection_metrics(
                         f"DB_CONNECTION_METRICS_BRAND_FUTURE_DONE brand={name}"
@@ -802,6 +913,12 @@ def _execute_pipeline_run(target_indices: List[int], run_id: Optional[str] = Non
             f"\n{'=' * 60}\nJOB COMPLETED AT: {end.strftime('%Y-%m-%d %I:%M:%S %p')}"
         )
         logger.info(f"Total Duration: {dur:.2f}s ({dur / 60:.2f} minutes)\n{'=' * 60}")
+
+        # Best-effort, never blocks/fails the run - see pipeline/metrics_logging.py.
+        try:
+            log_pipeline_run_metrics_async(job_id, brand_run_metrics, dur)
+        except Exception as e:
+            logger.error(f"❌ Failed to schedule run-metrics logging: {e}")
 
         # Trigger cache pipeline rebuild
         trigger_cache_pipeline()

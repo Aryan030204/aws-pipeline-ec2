@@ -794,7 +794,22 @@ def update_hourly_sessions_summary_from_shopifyql(
     )
 
     if not results:
-        return
+        return 0, 0
+
+    total_sessions = sum(
+        int(r.get("mobile_sessions") or 0)
+        + int(r.get("desktop_sessions") or 0)
+        + int(r.get("tablet_sessions") or 0)
+        + int(r.get("other_sessions") or 0)
+        for r in results
+    )
+    total_atc_sessions = sum(
+        int(r.get("mobile_atc_sessions") or 0)
+        + int(r.get("desktop_atc_sessions") or 0)
+        + int(r.get("tablet_atc_sessions") or 0)
+        + int(r.get("other_atc_sessions") or 0)
+        for r in results
+    )
 
     if cursor is not None:
         _do_upsert_hourly_sessions_shopify(results, cursor, connection, brand_name)
@@ -806,6 +821,8 @@ def update_hourly_sessions_summary_from_shopifyql(
             logger.error(
                 f"❌ Error updating hourly Shopify sessions for {brand_name}: {e}"
             )
+
+    return total_sessions, total_atc_sessions
 
 
 def _do_upsert_hourly_sessions_shopify(results, cursor, connection, brand_name):
@@ -1130,7 +1147,10 @@ def update_sessions_summary_from_shopifyql(
 
     if not results:
         logger.info("No session data returned from ShopifyQL.")
-        return
+        return 0, 0
+
+    total_sessions = sum(int(r.get("sessions") or 0) for r in results if isinstance(r, dict))
+    total_atc_sessions = sum(int(r.get("atc_sessions") or 0) for r in results if isinstance(r, dict))
 
     if cursor is not None:
         # Reusing existing connection
@@ -1142,6 +1162,8 @@ def update_sessions_summary_from_shopifyql(
                 _do_upsert_sessions_from_shopifyql(results, c, conn, brand_name)
         except Exception as e:
             logger.error(f"❌ Error updating sessions summary for {brand_name}: {e}")
+
+    return total_sessions, total_atc_sessions
 
 
 def _do_upsert_sessions_from_shopifyql(results, cursor, connection, brand_name):

@@ -105,7 +105,6 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.pool import NullPool
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request, jsonify
@@ -126,6 +125,7 @@ from pipeline.state import (
     brand_id_from_config,
     brand_db_configs,
     sqlalchemy_engines,
+    mysql_connector_pools,
     active_brand_indices,
     brand_rto_tags_by_index,
     scheduler,
@@ -204,6 +204,16 @@ class RDSProxyValidationError(RuntimeError):
 
 DB_TEST_ON_STARTUP = os.environ.get("DB_TEST_ON_STARTUP", "false").strip().lower() == "true"
 REQUIRE_RDS_PROXY = os.environ.get("REQUIRE_RDS_PROXY", "true").strip().lower() == "true"
+
+# Per-brand connection pool sizing (one SQLAlchemy pool + one mysql.connector
+# pool per active brand - see pipeline/db.py and _create_sqlalchemy_engine_for_brand
+# below). Total concurrent connections across all brands is roughly
+# active_brands * (SQLALCHEMY_POOL_SIZE + MYSQL_CONNECTOR_POOL_SIZE); check
+# the RDS instance's max_connections before raising these on a large fleet.
+SQLALCHEMY_POOL_SIZE = int(os.environ.get("SQLALCHEMY_POOL_SIZE", "5"))
+SQLALCHEMY_POOL_MAX_OVERFLOW = int(os.environ.get("SQLALCHEMY_POOL_MAX_OVERFLOW", "2"))
+SQLALCHEMY_POOL_RECYCLE_S = int(os.environ.get("SQLALCHEMY_POOL_RECYCLE_S", "1800"))
+MYSQL_CONNECTOR_POOL_SIZE = int(os.environ.get("MYSQL_CONNECTOR_POOL_SIZE", "5"))
 EXPECTED_RDS_PROXY_HOST = os.environ.get("EXPECTED_RDS_PROXY_HOST", "").strip()
 try:
     RTO_ASSUMPTION_PERIOD = int(os.environ.get("RTO_ASSUMPTION_PERIOD", "7").strip())
@@ -217,6 +227,7 @@ except ValueError:
 from pipeline.db import (
     DB_RETRY_ATTEMPTS,
     DB_RETRY_BASE_DELAY_S,
+    BrandConnectionPool,
     _metric_inc,
     _metric_dec,
     get_db_connection_metrics_snapshot,
@@ -380,6 +391,7 @@ from pipeline.utm_traffic import (
 from pipeline.orchestration import (
     _get_last_order_with_cursor,
     get_last_order,
+    ensure_session_tables,
     update_sessions_summary,
     process_single_brand,
     run_data_pipeline,
@@ -824,7 +836,19 @@ def _create_sqlalchemy_engine_for_brand(
             query={"charset": "utf8mb4"},
         ),
         connect_args=connect_args,
-        poolclass=NullPool,
+        # NullPool used to mean every engine.connect()/engine.begin() (schema
+        # migration column checks, load_data_to_sql_optimized's bulk insert)
+        # opened a brand-new physical connection - full TCP+TLS+auth handshake
+        # every time, ~13 of these per brand per preflight pass alone. A real
+        # pool lets those calls reuse warm connections instead; call sites
+        # don't change at all, SQLAlchemy hands out pooled connections
+        # transparently under the same engine.connect()/engine.begin() API.
+        # pool_pre_ping=True (kept) already validates a pooled connection
+        # before handing it out and transparently reconnects if it went
+        # stale, so this also covers the new pooled case for free.
+        pool_size=SQLALCHEMY_POOL_SIZE,
+        max_overflow=SQLALCHEMY_POOL_MAX_OVERFLOW,
+        pool_recycle=SQLALCHEMY_POOL_RECYCLE_S,
         pool_pre_ping=True,
         echo=False,
         future=True,
@@ -861,6 +885,44 @@ def _replace_sqlalchemy_engine_for_brand(
         except Exception:
             pass
     sqlalchemy_engines[brand_idx] = _create_sqlalchemy_engine_for_brand(
+        brand_idx, brand_name, db_config
+    )
+
+
+def _create_mysql_connector_pool_for_brand(
+    brand_idx: int, brand_name: str, db_config: Dict[str, Any]
+):
+    """
+    One pooled mysql.connector connection pool per brand, used by
+    pipeline/db.py's get_db_connection/get_db_cursor - the raw-connector
+    equivalent of _create_sqlalchemy_engine_for_brand above. db_config here
+    is the exact same dict already passed to mysql.connector.connect()
+    directly (see pipeline/db.py's _open_mysql_connection_once before this
+    change), so every key in it is already a valid connector kwarg.
+
+    Uses pipeline.db.BrandConnectionPool, not
+    mysql.connector.pooling.MySQLConnectionPool - see that class's docstring
+    for why (the built-in eagerly opens every pool connection at construction
+    time, which would block this function - called on every
+    initialize_brand_configs(), not just once at startup - on DB
+    reachability, and leak connections on repeat calls).
+    """
+    return BrandConnectionPool(db_config, max_size=MYSQL_CONNECTOR_POOL_SIZE)
+
+
+def _replace_mysql_connector_pool_for_brand(
+    brand_idx: int, brand_name: str, db_config: Dict[str, Any]
+) -> None:
+    """
+    Mirrors _replace_sqlalchemy_engine_for_brand: called from the SSL-fallback
+    path in pipeline/db.py's get_db_connection once a brand's config has been
+    permanently switched to the no-SSL fallback, so the pool stops handing
+    out connections built with the old (failing) SSL config.
+    MySQLConnectionPool has no dispose()/close-all - dropping the old pool
+    reference here is enough; its individual connections are cleaned up as
+    each is closed/returned or garbage collected.
+    """
+    mysql_connector_pools[brand_idx] = _create_mysql_connector_pool_for_brand(
         brand_idx, brand_name, db_config
     )
 
@@ -947,10 +1009,21 @@ def initialize_brand_configs():
             logger.error(f"❌ Engine setup error for {brand_name}: {e}")
             return
 
+        try:
+            mysql_connector_pools[brand_idx] = _create_mysql_connector_pool_for_brand(
+                brand_idx, brand_name, db_config
+            )
+        except Exception as e:
+            sqlalchemy_engines.pop(brand_idx, None)
+            brand_db_configs.pop(brand_idx, None)
+            logger.error(f"❌ Connection pool setup error for {brand_name}: {e}")
+            return
+
         if DB_TEST_ON_STARTUP:
             try:
                 _test_brand_database_connection(brand_idx, brand_name)
             except Exception as e:
+                mysql_connector_pools.pop(brand_idx, None)
                 sqlalchemy_engines.pop(brand_idx, None)
                 brand_db_configs.pop(brand_idx, None)
                 logger.error(f"❌ Startup DB test failed for {brand_name}: {e}")
@@ -1144,8 +1217,11 @@ def initialize_brand_configs():
                 continue
 
     logger.info(f"✅ Active brands initialized: {active_brand_indices}")
-    logger.info("Database connection mode: lazy")
-    logger.info("SQLAlchemy pool mode: NullPool")
+    logger.info(
+        f"SQLAlchemy pool mode: pool_size={SQLALCHEMY_POOL_SIZE} "
+        f"max_overflow={SQLALCHEMY_POOL_MAX_OVERFLOW} pool_recycle={SQLALCHEMY_POOL_RECYCLE_S}s"
+    )
+    logger.info(f"mysql.connector pool mode: pool_size={MYSQL_CONNECTOR_POOL_SIZE} per brand")
     logger.info(f"Configured brands: {len(active_brand_indices)}")
     logger.info(f"Active brand concurrency: {os.environ.get('MAX_CONCURRENT_BRANDS', '3')}")
     logger.info(f"RDS Proxy enforcement: {'enabled' if REQUIRE_RDS_PROXY and not TEST_MODE else 'disabled'}")
@@ -1234,7 +1310,11 @@ if __name__ == "__main__":
     logger.info(
         f"   - Parallel workers: {min(len(active_brand_indices), int(os.environ.get('MAX_CONCURRENT_BRANDS', '3')))}"
     )
-    logger.info("   - Database connections: Lazy short-lived mysql.connector + SQLAlchemy NullPool")
+    logger.info(
+        f"   - Database connections: pooled (mysql.connector pool_size="
+        f"{MYSQL_CONNECTOR_POOL_SIZE}, SQLAlchemy pool_size={SQLALCHEMY_POOL_SIZE}, "
+        f"per brand)"
+    )
     logger.info("   - Async API fetching: Enabled")
     logger.info("   - Summary updates: INCREMENTAL (only affected dates) 🚀")
     logger.info("   - Manual Trigger API: POST /trigger (port 5000)")

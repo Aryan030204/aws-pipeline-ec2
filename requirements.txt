@@ -14,3 +14,5 @@ dotenv
 cryptography
 python-dotenv
 pymongo
+gspread
+google-auth

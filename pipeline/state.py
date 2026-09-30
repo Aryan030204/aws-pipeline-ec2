@@ -72,6 +72,11 @@ brand_tag_to_index_map: Dict[str, int] = {}
 brand_id_from_config: Dict[int, int] = {}  # brand_index -> brand_id from pipelinecreds MongoDB
 brand_db_configs: Dict[int, Dict[str, Any]] = {}
 sqlalchemy_engines: Dict[int, Any] = {}
+# One mysql.connector.pooling.MySQLConnectionPool per brand - see
+# aws_background.py's _setup_brand_infra (creation) and
+# _replace_mysql_connector_pool_for_brand (SSL-fallback rebuild), and
+# pipeline/db.py's _open_mysql_connection_once (acquisition).
+mysql_connector_pools: Dict[int, Any] = {}
 active_brand_indices: List[int] = []  # only brands with valid configs/engines
 brand_rto_tags_by_index: Dict[int, str] = {}
 

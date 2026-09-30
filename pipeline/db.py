@@ -8,6 +8,7 @@ reused by several summary/watermark features.
 
 import atexit
 import os
+import queue
 import random
 import signal
 import threading
@@ -25,6 +26,7 @@ from pipeline.state import (
     logger,
     brand_db_configs,
     sqlalchemy_engines,
+    mysql_connector_pools,
     http_session,
     _db_metrics_lock,
     _db_shutdown_lock,
@@ -100,6 +102,27 @@ def close_all_database_resources() -> None:
             )
 
     sqlalchemy_engines.clear()
+
+    drained = 0
+    for brand_idx, pool in list(mysql_connector_pools.items()):
+        try:
+            while True:
+                cnx = pool._free.get_nowait()
+                try:
+                    cnx.close()
+                except Exception:
+                    pass
+                drained += 1
+        except queue.Empty:
+            pass
+        except Exception as e:
+            logger.warning(
+                "Error draining connection pool for brand_index=%s: %s",
+                brand_idx,
+                e,
+            )
+    mysql_connector_pools.clear()
+
     brand_db_configs.clear()
     try:
         http_session.close()
@@ -107,8 +130,10 @@ def close_all_database_resources() -> None:
         pass
 
     logger.info(
-        "Database resource shutdown complete: disposed_sqlalchemy_engines=%s",
+        "Database resource shutdown complete: disposed_sqlalchemy_engines=%s "
+        "drained_pooled_connections=%s",
         disposed,
+        drained,
     )
     log_db_connection_metrics("DB_CONNECTION_METRICS_SHUTDOWN_COMPLETE")
 
@@ -255,14 +280,131 @@ def _connector_config_without_ssl(config: Dict[str, Any]) -> Dict[str, Any]:
     return clean
 
 
+class BrandConnectionPool:
+    """
+    A small, lazy per-brand connection pool - deliberately NOT
+    mysql.connector.pooling.MySQLConnectionPool. That built-in eagerly opens
+    every one of its pool_size connections inside __init__ (confirmed by
+    reading its source - `while cnt < self._pool_size: self.add_connection()`
+    runs unconditionally whenever kwargs are given), which would make brand
+    config setup block on DB reachability - a real regression, since several
+    standalone workers (e.g. workers/intent_events_worker.py) call
+    initialize_brand_configs() on every scheduled run, not just once at
+    startup, and each call would re-open pool_size fresh connections while
+    leaking whatever the previous pool had already opened (mysql-connector's
+    pool has no dispose()/close-all to tear the old one down with first).
+
+    This pool instead opens a connection lazily, on first real demand,
+    exactly like the pre-pooling code already did - a brand's pool object is
+    cheap to create (and safe to recreate on every initialize_brand_configs()
+    call) since it holds no connections until something actually asks for
+    one. Once a connection exists, get_connection()/release() reuse it.
+    """
+
+    def __init__(self, config: Dict[str, Any], max_size: int):
+        self._config = dict(config)
+        self._max_size = max(1, max_size)
+        self._free: "queue.LifoQueue" = queue.LifoQueue(maxsize=self._max_size)
+
+    def get_connection(self) -> Tuple[Any, bool]:
+        """Returns (raw_mysql_connector_connection, was_reused)."""
+        while True:
+            try:
+                cnx = self._free.get_nowait()
+            except queue.Empty:
+                return mysql.connector.connect(**self._config), False
+            if cnx.is_connected():
+                return cnx, True
+            try:
+                cnx.close()
+            except Exception:
+                pass
+            # Stale connection discarded - loop to try the next free one, or
+            # fall through to opening a fresh connection.
+
+    def release(self, cnx) -> None:
+        try:
+            if cnx.in_transaction:
+                cnx.rollback()
+        except Exception:
+            pass
+        try:
+            self._free.put_nowait(cnx)
+        except queue.Full:
+            try:
+                cnx.close()
+            except Exception:
+                pass
+
+
+class _PooledConnectionHandle:
+    """
+    Thin proxy around a raw mysql.connector connection so existing code's
+    `cnx.close()` (get_db_connection's finally block, unchanged) returns the
+    connection to its BrandConnectionPool instead of truly closing the
+    socket - every other attribute/method (cursor(), commit(), rollback(),
+    in_transaction, ping(), ...) passes straight through to the real
+    connection via __getattr__, so no other call site needs to know this
+    proxy exists.
+    """
+
+    def __init__(self, cnx, pool: BrandConnectionPool):
+        object.__setattr__(self, "_cnx", cnx)
+        object.__setattr__(self, "_pool", pool)
+        object.__setattr__(self, "_released", False)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_cnx"), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, "_cnx"), name, value)
+
+    def close(self) -> None:
+        if not object.__getattribute__(self, "_released"):
+            object.__setattr__(self, "_released", True)
+            object.__getattribute__(self, "_pool").release(
+                object.__getattribute__(self, "_cnx")
+            )
+
+
 def _open_mysql_connection_once(
     brand_index: int,
     brand_name: str,
     config: Dict[str, Any],
+    use_pool: bool = True,
 ):
+    """
+    use_pool=True (the normal path): acquires from the brand's
+    BrandConnectionPool (see aws_background.py's
+    _create_mysql_connector_pool_for_brand) instead of always opening a
+    brand-new physical connection. The pool hands back either a reused,
+    already-open connection or (on a cold pool / all connections busy) opens
+    one fresh - either way it's wrapped in _PooledConnectionHandle so the
+    existing `finally: cnx.close()` in get_db_connection already does the
+    right thing with no changes there. `config` is unused in this path (the
+    pool already encapsulates it) but kept as a parameter for the
+    use_pool=False path below.
+
+    use_pool=False: used only by get_db_connection's SSL-fallback probe,
+    which must try a *different* config (without ssl_ca) than whatever the
+    brand's current pool was built with, before that pool gets rebuilt to
+    match (aws_background._replace_mysql_connector_pool_for_brand) - so this
+    one connection is opened directly, bypassing the pool.
+    """
     cnx = None
+    reused = False
+    pool = None
     try:
-        cnx = mysql.connector.connect(**config)
+        if use_pool:
+            pool = mysql_connector_pools.get(brand_index)
+            if pool is None:
+                raise mysql.connector.Error(
+                    f"No connection pool configured for brand {brand_index}"
+                )
+            raw_cnx, reused = pool.get_connection()
+            cnx = _PooledConnectionHandle(raw_cnx, pool)
+        else:
+            cnx = mysql.connector.connect(**config)
         cnx.ping(reconnect=False, attempts=1, delay=0)
     except Exception:
         if cnx is not None:
@@ -273,6 +415,24 @@ def _open_mysql_connection_once(
         raise
 
     _metric_inc("active_connector_connections")
+
+    if reused:
+        # Reused pooled connection: skip the "new connection" bookkeeping
+        # below (connections_opened_total, the extra SELECT CONNECTION_ID()
+        # round trip, and the OPENED log line) entirely - nothing new was
+        # actually opened, so counting/logging it as such would be
+        # misleading, and the round trip is pure overhead for a connection
+        # that's about to be used for real work anyway.
+        logger.debug(
+            "DB_CONNECTION_REUSED brand=%s brand_index=%s pipeline=orders_etl "
+            "job_id=%s thread=%s",
+            brand_name,
+            brand_index,
+            getattr(_db_context, "job_id", None),
+            threading.current_thread().name,
+        )
+        return cnx
+
     _metric_inc("connections_opened_total")
 
     connection_id = None
@@ -335,8 +495,14 @@ def get_db_connection(
                 )
                 fallback_config = _connector_config_without_ssl(config)
                 try:
+                    # use_pool=False: this probe connection must use the
+                    # fallback (no-SSL) config, which differs from whatever
+                    # the brand's pool was built with - opened directly,
+                    # bypassing the pool. The pool itself gets rebuilt to
+                    # match just below, so every connection after this one
+                    # goes through the (now-matching) pool again.
                     cnx = _open_mysql_connection_once(
-                        brand_index, brand_name, fallback_config
+                        brand_index, brand_name, fallback_config, use_pool=False
                     )
                     brand_db_configs[brand_index] = fallback_config
                     # Lazy import: _replace_sqlalchemy_engine_for_brand stays in
@@ -347,6 +513,9 @@ def get_db_connection(
                     import aws_background
 
                     aws_background._replace_sqlalchemy_engine_for_brand(
+                        brand_index, brand_name, fallback_config
+                    )
+                    aws_background._replace_mysql_connector_pool_for_brand(
                         brand_index, brand_name, fallback_config
                     )
                     break
