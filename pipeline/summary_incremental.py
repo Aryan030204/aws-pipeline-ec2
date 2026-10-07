@@ -22,8 +22,7 @@ from pipeline.shopify_orders import (
     backfill_dashboard_order_discount_fact_from_shopify_orders,
 )
 
-# aws_background still owns update_overall_summary_event_columns (mongo_events
-# category, not yet extracted), now_ist (misc_utils), and the
+# aws_background still owns now_ist (misc_utils) and the
 # DISCOUNT_DASHBOARD_BACKFILL constant. Imported at module level here is safe:
 # attribute access only happens when these functions are actually CALLED,
 # during real pipeline execution, long after aws_background.py has fully
@@ -1283,12 +1282,21 @@ def update_overall_summary_incremental(
         cursor.execute("CREATE TABLE overall_summary_stage LIKE overall_summary")
 
         # STEP 3: Populate staging table
+        # ci_events/buy_now_events are carried forward from the LIVE
+        # overall_summary row (LEFT JOIN overall_summary cur), not recomputed
+        # here - those two columns are now owned entirely by
+        # events-summary-worker (pipeline/mongo_events_sql.py's
+        # update_overall_summary_event_columns_sql, a targeted UPDATE on its
+        # own schedule). Without this carry-forward, this order-driven
+        # DELETE+INSERT would silently reset them to 0 on every run that
+        # touches a date events-summary-worker already populated.
         sql = f"""
         INSERT INTO overall_summary_stage (
             date, gross_sales, total_discount_amount, total_sales, net_sales,
             total_orders, cod_orders, prepaid_orders, partially_paid_orders,
             cod_sales, prepaid_sales, partially_prepaid_sales,
-            total_sessions, total_atc_sessions, adjusted_total_sessions
+            total_sessions, total_atc_sessions, adjusted_total_sessions,
+            ci_events, buy_now_events
         )
         SELECT
             s.date,
@@ -1322,12 +1330,15 @@ def update_overall_summary_incremental(
                         0
                     )
                 )
-            ) AS adjusted_total_sessions
+            ) AS adjusted_total_sessions,
+            COALESCE(cur.ci_events, 0)       AS ci_events,
+            COALESCE(cur.buy_now_events, 0)  AS buy_now_events
         FROM sales_summary s
         LEFT JOIN order_summary      o    ON s.date = o.date
         LEFT JOIN sessions_summary   sess ON s.date = sess.date
         LEFT JOIN gross_summary      gs   ON s.date = gs.date
         LEFT JOIN discount_summary   ds   ON s.date = ds.date
+        LEFT JOIN overall_summary    cur  ON s.date = cur.date
         WHERE s.date IN ({placeholders})
         """
         cursor.execute(sql, (brand_key,) + params)
@@ -1336,17 +1347,6 @@ def update_overall_summary_incremental(
         # STEP 4 & 5: Fetch affected dates and merge
         merge_staging_to_main_by_date(
             cursor, connection, "overall_summary", "overall_summary_stage", brand_name
-        )
-
-        parsed_dates = sorted(date.fromisoformat(str(d)) for d in params)
-        aws_background.update_overall_summary_event_columns(
-            brand_index=brand_index,
-            brand_name=brand_name,
-            brand_key=brand_key,
-            start_date=parsed_dates[0],
-            end_date=parsed_dates[-1],
-            cursor=cursor,
-            connection=connection,
         )
 
 

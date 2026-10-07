@@ -53,7 +53,7 @@ def backfill_brand(brand_index: int, start_dt: datetime, end_dt: datetime):
         )
         return
 
-    aws_background.sync_variant_wise_events_summary(
+    aws_background.sync_variant_wise_events_summary_sql(
         brand_index=brand_index,
         brand_name=brand_name,
         brand_key=brand_key,

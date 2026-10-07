@@ -56,7 +56,7 @@ def backfill_brand(brand_index: int, start_dt: datetime, end_dt: datetime):
         aws_background.ensure_summary_tables(cursor, connection)
 
     aws_background.ensure_overall_summary_event_columns(brand_index)
-    aws_background.update_overall_summary_event_columns(
+    aws_background.update_overall_summary_event_columns_sql(
         brand_index=brand_index,
         brand_name=brand_name,
         brand_key=brand_key,

@@ -41,12 +41,12 @@ class CheckoutLoginStatusWorkerTests(unittest.TestCase):
         self.assertIn("checkout-login-status-worker:", content)
         self.assertIn("Dockerfile.checkout-login-status-worker", content)
 
-    def test_scheduled_mode_uses_0005_ist_cron(self):
-        # Default cron must be 00:05 IST = 18:35 UTC.
+    def test_scheduled_mode_uses_every_6_hours_ist_cron(self):
+        # Runs 4x/day at 00:00, 06:00, 12:00, 18:00 IST.
         source = inspect.getsource(worker._run_scheduled)
-        self.assertIn("hour=18", source)
-        self.assertIn("minute=35", source)
-        self.assertIn('timezone="UTC"', source)
+        self.assertIn('hour="0,6,12,18"', source)
+        self.assertIn("minute=0", source)
+        self.assertIn('timezone="Asia/Kolkata"', source)
 
     def test_scheduled_mode_prevents_overlapping_runs(self):
         source = inspect.getsource(worker._run_scheduled)

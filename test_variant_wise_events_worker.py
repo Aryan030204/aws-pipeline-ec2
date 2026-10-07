@@ -42,11 +42,31 @@ class VariantWiseEventsWorkerTests(unittest.TestCase):
         self.assertIn("variant-wise-events-worker:", content)
         self.assertIn("Dockerfile.variant-wise-events-worker", content)
 
-    def test_scheduled_mode_uses_same_cron_as_events_summary_worker(self):
+    def test_scheduled_mode_uses_a_30_minute_interval(self):
         source = inspect.getsource(worker._run_scheduled)
-        self.assertIn("hour=18", source)
-        self.assertIn("minute=30", source)
-        self.assertIn('timezone="UTC"', source)
+        self.assertIn('trigger="interval"', source)
+        self.assertIn("minutes=30", source)
+        self.assertNotIn('trigger="cron"', source)
+
+    def test_scheduled_mode_runs_once_immediately_before_starting_scheduler(self):
+        from unittest import mock
+
+        call_order = []
+
+        def fake_run_worker():
+            call_order.append("run_worker")
+
+        fake_scheduler = mock.Mock()
+        fake_scheduler.start.side_effect = lambda: call_order.append("scheduler.start")
+
+        with mock.patch.object(worker, "run_worker", side_effect=fake_run_worker), \
+             mock.patch(
+                 "apscheduler.schedulers.blocking.BlockingScheduler",
+                 return_value=fake_scheduler,
+             ):
+            worker._run_scheduled()
+
+        self.assertEqual(call_order, ["run_worker", "scheduler.start"])
 
     def test_self_run_env_var_toggle_is_present(self):
         source = inspect.getsource(worker)

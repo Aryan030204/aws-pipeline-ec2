@@ -132,10 +132,12 @@ curl -X POST http://localhost:5000/trigger \
 Runs as four Docker services (see `docker-compose.yml`):
 
 - **`shopify-pipeline`** — the main pipeline described above.
-- **`events-summary-worker`** — a separate container that rolls up daily event totals across all brands into one summary table, on its own daily schedule. The same daily run also stores the full raw `alerts.sessions` events, one row per event, in each brand's own `mongo_events_summary` table (every document key becomes a column, nested `data` is flattened, new keys add columns automatically, `createdAt`/`updatedAt` kept as UTC and IST). Older history can be loaded with `backfill scripts/backfill_mongo_events_summary.py`.
-- **`variant-wise-events-worker`** — a separate container that rolls up any Mongo event type, per product variant, into each brand's own database, on its own daily schedule.
-- **`checkout-login-status-worker`** — a separate container that rolls up daily checkout counts by logged-in/non-logged-in status, per brand, on its own daily schedule (00:05 IST).
+- **`events-summary-worker`** — a separate container running two independent schedules. The master `events_summary` table (daily event totals across all brands) keeps its original once-daily schedule. On top of that, every 15 minutes it incrementally ingests raw `alerts.sessions` events (watermark-based, per brand) into each CI-events-enabled brand's own `mongo_events_summary` table (every document key becomes a column, nested `data` is flattened, new keys add columns automatically, `createdAt`/`updatedAt` kept as UTC and IST), deletes the now-ingested documents from Mongo so the cluster doesn't fill up on storage, and rolls the newly-ingested dates up into `hourly_sessions_summary_shopify`/`daily_ci_events_summary`/`daily_buy_now_events_summary`/`overall_summary`. Older history can be loaded with `backfill scripts/backfill_mongo_events_summary.py`.
+- **`variant-wise-events-worker`** — a separate container that rolls up any event type (read from `mongo_events_summary`, not Mongo directly), per product variant, into each brand's own database, every 30 minutes.
+- **`checkout-login-status-worker`** — a separate container that rolls up daily checkout counts by logged-in/non-logged-in status, per brand, every 6 hours (00:00/06:00/12:00/18:00 IST).
 - **`pnl-worker`** — a separate container that builds the daily brand-level P&L (`overall_pnl`) in each brand DB at 00:10 IST, from the summary tables plus the brand's cost config in the arch-auth Mongo `total_config` collection. Right before that it syncs paid-ads spend for exactly the dates it is rebuilding: for every brand with a credential document in Mongo (`meta_ads_credentials` / `google_ads_credentials`, pasted on the dashboard's P&L page) it pulls that channel's daily spend and upserts it into `pnl_meta_ad_spend_rollup` / `pnl_google_ad_spend_rollup` (`migrations/004_pnl_ad_spend_rollups.sql`, per brand DB). Brands without a document for a channel are skipped for it. Needs `PASSWORD_AES_KEY` (same as the dashboard, to decrypt tokens) and, for Google only, `GOOGLE_ADS_CLIENT_ID`, `GOOGLE_ADS_CLIENT_SECRET` and `GOOGLE_ADS_DEVELOPER_TOKEN`; `META_API_VERSION` / `GOOGLE_ADS_API_VERSION` are optional. A failed pull is logged, written to the document's `last_error`, and that line falls back to the configured cost.
+
+The behavioral/click/session intent-events worker that used to run here now runs as its own service outside this repo; its retired code is kept under [`dead_code/`](dead_code/README.md).
 
 To deploy an update on the server: pull the latest code on the branch that's live, rebuild, and restart:
 
@@ -146,7 +148,7 @@ docker compose build shopify-pipeline events-summary-worker variant-wise-events-
 docker compose up -d shopify-pipeline events-summary-worker variant-wise-events-worker checkout-login-status-worker
 ```
 
-`checkout-login-status-worker`'s own schedule is once a day (00:05 IST), so after deploying a change to it, optionally trigger one immediate run instead of waiting for the next scheduled tick:
+`checkout-login-status-worker`'s own schedule is every 6 hours, so after deploying a change to it, optionally trigger one immediate run instead of waiting for the next scheduled tick:
 
 ```bash
 docker compose exec -T checkout-login-status-worker \
@@ -165,7 +167,7 @@ With `BRANDS_CRON_MAP` set, each distinct cron value gets its own scheduler job 
 
 ## Triggering a worker manually
 
-Every standalone worker (`pnl`, `events-summary`, `variant-wise-events`, `checkout-login-status`, `intent-events`) can be run on demand, once, without waiting for its daily schedule. Both knobs below use the same registry in `workers/registry.py`, so adding a worker there makes it available to both.
+Every standalone worker (`pnl`, `events-summary`, `variant-wise-events`, `checkout-login-status`) can be run on demand, once, without waiting for its own schedule. Both knobs below use the same registry in `workers/registry.py`, so adding a worker there makes it available to both.
 
 ### From a shell
 

@@ -1,8 +1,13 @@
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+# Safe import order (see test_mongo_events.py's comment): aws_background
+# first, then the pipeline module - otherwise, run in isolation, this starts
+# a circular partial-init (aws_background.py re-exports from
+# pipeline.mongo_events, which itself does `import aws_background`).
+import aws_background  # noqa: F401
 from pipeline import mongo_events_raw as raw
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -284,6 +289,7 @@ class SyncForBrandTests(unittest.TestCase):
     def _run(self, docs, brand_name="SHYLENEW", brand_key="SHYLENEW", cursor=None, find_side_effect=None):
         cursor = cursor or FakeCursor()
         collection = mock.Mock()
+        collection.delete_many.return_value = mock.Mock(deleted_count=len(docs) if docs else 0)
         if find_side_effect:
             collection.find.side_effect = find_side_effect
         else:
@@ -346,12 +352,129 @@ class SyncForBrandTests(unittest.TestCase):
         self.assertEqual([len(rows) for _, rows in cursor.executemany_calls], [2, 2, 1])
 
 
-class RebuildWindowTests(unittest.TestCase):
-    def test_window_is_day_before_yesterday_to_yesterday_in_brand_tz(self):
-        now = datetime(2026, 9, 25, 20, 0, tzinfo=timezone.utc)  # already 26th 01:30 IST
-        self.assertEqual(
-            raw.compute_raw_rebuild_window(IST, now), (date(2026, 9, 24), date(2026, 9, 25))
+class DeleteAfterIngestTests(unittest.TestCase):
+    def _run(self, docs, delete_enabled=True):
+        cursor = FakeCursor()
+        collection = mock.Mock()
+        collection.find.return_value = list(docs)
+        collection.delete_many.return_value = mock.Mock(deleted_count=len(docs))
+        client = mock.Mock()
+        with mock.patch.object(raw.aws_background, "get_brand_timezone", return_value=IST), \
+             mock.patch.object(raw, "_resolve_mongo_sessions_collection", return_value=(client, collection)), \
+             mock.patch.object(raw, "MONGO_EVENTS_DELETE_INGESTED_DOCS", delete_enabled):
+            raw.sync_mongo_events_raw_for_brand(
+                brand_index=8,
+                brand_name="SHYLENEW",
+                brand_key="SHYLENEW",
+                start_date=date(2026, 9, 24),
+                end_date=date(2026, 9, 25),
+                cursor=cursor,
+                connection=FakeConnection(),
+            )
+        return collection
+
+    def test_ingested_documents_are_deleted_by_event_id(self):
+        collection = self._run([dict(SAMPLE_DOC)])
+        collection.delete_many.assert_called_once_with(
+            {"event_id": {"$in": [SAMPLE_DOC["event_id"]]}}
         )
+
+    def test_kill_switch_disables_deletion(self):
+        collection = self._run([dict(SAMPLE_DOC)], delete_enabled=False)
+        collection.delete_many.assert_not_called()
+
+    def test_delete_failure_is_caught_and_does_not_raise(self):
+        cursor = FakeCursor()
+        collection = mock.Mock()
+        collection.find.return_value = [dict(SAMPLE_DOC)]
+        collection.delete_many.side_effect = RuntimeError("mongo boom")
+        client = mock.Mock()
+        with mock.patch.object(raw.aws_background, "get_brand_timezone", return_value=IST), \
+             mock.patch.object(raw, "_resolve_mongo_sessions_collection", return_value=(client, collection)):
+            raw.sync_mongo_events_raw_for_brand(
+                brand_index=8, brand_name="SHYLENEW", brand_key="SHYLENEW",
+                start_date=date(2026, 9, 24), end_date=date(2026, 9, 25),
+                cursor=cursor, connection=FakeConnection(),
+            )  # must not raise
+        # the upsert itself must still have gone through despite the delete failure
+        self.assertEqual(len(cursor.executemany_calls), 1)
+
+
+class WatermarkIncrementalTests(unittest.TestCase):
+    def _run_incremental(self, docs, stored_watermark=None):
+        cursor = FakeCursor()
+        collection = mock.Mock()
+        collection.find.return_value = list(docs)
+        collection.delete_many.return_value = mock.Mock(deleted_count=len(docs))
+        client = mock.Mock()
+        with mock.patch.object(raw.aws_background, "get_brand_timezone", return_value=IST), \
+             mock.patch.object(raw, "_resolve_mongo_sessions_collection", return_value=(client, collection)), \
+             mock.patch.object(raw, "get_pipeline_metadata_timestamp", return_value=stored_watermark) as get_wm, \
+             mock.patch.object(raw, "update_pipeline_metadata_timestamp") as update_wm:
+            raw.sync_mongo_events_raw_for_brand(
+                brand_index=8,
+                brand_name="SHYLENEW",
+                brand_key="SHYLENEW",
+                cursor=cursor,
+                connection=FakeConnection(),
+            )
+        return collection, get_wm, update_wm
+
+    def test_no_window_given_queries_by_watermark_only(self):
+        watermark = datetime(2026, 9, 24, 12, 0, tzinfo=IST)
+        collection, get_wm, update_wm = self._run_incremental([], stored_watermark=watermark)
+
+        get_wm.assert_called_once()
+        self.assertEqual(get_wm.call_args.args[1], raw.RAW_EVENTS_METADATA_KEY)
+        query = collection.find.call_args.args[0]
+        self.assertEqual(set(query["createdAt"].keys()), {"$gt"})
+        # lower bound is watermark minus the overlap, not the raw watermark
+        expected_lower = (watermark - raw.RAW_EVENTS_OVERLAP).astimezone(timezone.utc)
+        self.assertEqual(query["createdAt"]["$gt"], expected_lower)
+
+    def test_first_run_with_no_stored_watermark_looks_back_further(self):
+        collection, get_wm, update_wm = self._run_incremental([], stored_watermark=None)
+        query = collection.find.call_args.args[0]
+        # No stored watermark -> falls back to "now - RAW_EVENTS_DEFAULT_LOOKBACK",
+        # a much wider window than a 5-minute overlap off "now" would give.
+        barely_before_now = datetime.now(timezone.utc) - timedelta(minutes=10)
+        self.assertLess(query["createdAt"]["$gt"], barely_before_now)
+
+    def test_watermark_advances_to_max_created_at_ingested(self):
+        doc1 = dict(SAMPLE_DOC, event_id="e1", createdAt=datetime(2026, 9, 24, 10, 0, tzinfo=timezone.utc))
+        doc2 = dict(SAMPLE_DOC, event_id="e2", createdAt=datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc))
+        collection, get_wm, update_wm = self._run_incremental(
+            [doc1, doc2], stored_watermark=datetime(2026, 9, 24, 9, 0, tzinfo=IST)
+        )
+
+        update_wm.assert_called()
+        new_watermark = update_wm.call_args.args[3]
+        self.assertEqual(new_watermark.astimezone(timezone.utc), datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc))
+
+    def test_no_new_documents_does_not_advance_watermark(self):
+        _, _, update_wm = self._run_incremental([], stored_watermark=datetime(2026, 9, 24, 9, 0, tzinfo=IST))
+        update_wm.assert_not_called()
+
+    def test_returns_affected_ist_dates(self):
+        doc = dict(
+            SAMPLE_DOC,
+            event_id="e1",
+            createdAt=datetime(2026, 9, 24, 20, 0, tzinfo=timezone.utc),  # 2026-09-25 01:30 IST
+        )
+        cursor = FakeCursor()
+        collection = mock.Mock()
+        collection.find.return_value = [doc]
+        collection.delete_many.return_value = mock.Mock(deleted_count=1)
+        client = mock.Mock()
+        with mock.patch.object(raw.aws_background, "get_brand_timezone", return_value=IST), \
+             mock.patch.object(raw, "_resolve_mongo_sessions_collection", return_value=(client, collection)), \
+             mock.patch.object(raw, "get_pipeline_metadata_timestamp", return_value=None), \
+             mock.patch.object(raw, "update_pipeline_metadata_timestamp"):
+            affected = raw.sync_mongo_events_raw_for_brand(
+                brand_index=8, brand_name="SHYLENEW", brand_key="SHYLENEW",
+                cursor=cursor, connection=FakeConnection(),
+            )
+        self.assertEqual(affected, {"2026-09-25"})
 
 
 if __name__ == "__main__":

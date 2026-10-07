@@ -49,8 +49,6 @@ class RegistryTests(unittest.TestCase):
             registry.build_cli_command("pnl", start="2026-09-05", end="2026-09-01")
         with self.assertRaises(ValueError):
             registry.build_cli_command("checkout-login-status", start="2026-09-01", end="2026-09-02")
-        with self.assertRaises(ValueError):
-            registry.build_cli_command("intent-events", as_of="2026-09-01T00:00:00")
 
     def test_run_in_process_sets_env_then_calls_run_worker(self):
         fake_module = MagicMock()

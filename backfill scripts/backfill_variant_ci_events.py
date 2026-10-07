@@ -54,7 +54,7 @@ def backfill_brand(brand_index: int, start_dt: datetime, end_dt: datetime):
     with aws_background.get_db_cursor(brand_index) as (cursor, connection):
         aws_background.ensure_summary_tables(cursor, connection)
 
-    aws_background.sync_checkout_initiated_variant_events(
+    aws_background.sync_checkout_initiated_variant_events_sql(
         brand_index=brand_index,
         brand_name=brand_name,
         brand_key=brand_key,

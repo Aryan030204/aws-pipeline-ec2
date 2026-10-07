@@ -67,13 +67,6 @@ WORKERS: Dict[str, WorkerSpec] = {
             description="Daily checkout counts by login status -> each brand DB",
             self_run_env="CHECKOUT_LOGIN_STATUS_WORKER_SELF_RUN",
         ),
-        WorkerSpec(
-            name="intent-events",
-            module="workers.intent_events_worker",
-            description="Behavioural intent / click events -> each brand DB",
-            self_run_env="INTENT_EVENTS_WORKER_SELF_RUN",
-            accepts_as_of=False,
-        ),
     )
 }
 

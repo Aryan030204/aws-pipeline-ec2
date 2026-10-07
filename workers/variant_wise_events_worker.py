@@ -8,11 +8,14 @@ Unlike workers/events_summary_worker.py (a single master-DB table keyed by
 worker writes into each brand's own database - the same place
 daily_ci_events_summary/daily_buy_now_events_summary already live - so it
 reuses the main pipeline's existing brand infrastructure (aws_background)
-rather than reimplementing per-brand DB config loading. The actual Mongo
-fetch/dedup/aggregate/upsert logic lives in pipeline/mongo_events.py
-(sync_variant_wise_events_summary) and is shared with the rest of the
-pipeline; this file is just the scheduling/orchestration wrapper that runs
-it, per brand, on its own schedule.
+rather than reimplementing per-brand DB config loading. Reads from that
+brand's own mongo_events_summary table (MySQL), not Mongo directly -
+pipeline/mongo_events_raw.py is the only thing that still queries
+alerts.sessions. The fetch/dedup/aggregate/upsert logic lives in
+pipeline/mongo_events_sql.py (sync_variant_wise_events_summary_sql) and is
+shared with the rest of the pipeline; this file is just the
+scheduling/orchestration wrapper that runs it, per brand, on its own
+schedule.
 
 Business logic (dedup rule, dynamic column discovery) is not duplicated here.
 """
@@ -88,7 +91,7 @@ def run_worker(current_dt: Optional[datetime] = None) -> None:
             tz,
         )
         try:
-            aws_background.sync_variant_wise_events_summary(
+            aws_background.sync_variant_wise_events_summary_sql(
                 brand_index=brand_index,
                 brand_name=brand_name,
                 start_date=start_date,
@@ -104,27 +107,31 @@ def run_worker(current_dt: Optional[datetime] = None) -> None:
 def _run_scheduled() -> None:
     """
     Long-running mode for the standalone container: schedules run_worker
-    daily, same cadence as events_summary_worker (30 18 * * * UTC, i.e.
-    00:00 IST), then blocks. Set VARIANT_WISE_EVENTS_WORKER_SELF_RUN=false
-    to instead run once and exit (e.g. for a one-off/manual invocation).
+    every 30 minutes, plus one immediate run at startup (same pattern
+    workers/intent_events_worker.py uses) so a container restart doesn't
+    wait up to 30 minutes for fresh data. Set
+    VARIANT_WISE_EVENTS_WORKER_SELF_RUN=false to instead run once and exit
+    (e.g. for a one-off/manual invocation).
     """
     from apscheduler.schedulers.blocking import BlockingScheduler
+
+    logger.info("Running variant-wise events worker once immediately on startup")
+    try:
+        run_worker()
+    except Exception as e:
+        logger.error("Error in immediate startup run of variant-wise events worker: %s", e)
 
     scheduler = BlockingScheduler(timezone="UTC")
     scheduler.add_job(
         run_worker,
-        trigger="cron",
-        hour=18,
-        minute=30,
-        timezone="UTC",
+        trigger="interval",
+        minutes=30,
         id="variant_wise_events_worker_job",
         coalesce=True,
         max_instances=1,
-        misfire_grace_time=3600,
+        misfire_grace_time=1800,
     )
-    logger.info(
-        "Variant-wise events worker scheduler started (cron 30 18 * * * UTC / 00:00 IST)"
-    )
+    logger.info("Variant-wise events worker scheduler started (every 30 minutes)")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):

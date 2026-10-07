@@ -66,12 +66,6 @@ from pipeline.summary_incremental import (
     update_hourly_citywise_summary_incremental,
     push_web_vitals_metrics_to_qstash,
 )
-from pipeline.mongo_events import (
-    sync_buy_now_events,
-    sync_buy_now_variant_events,
-    sync_checkout_initiated_ci_events,
-    sync_checkout_initiated_variant_events,
-)
 from pipeline.web_vitals import sync_web_vitals_summary
 from pipeline.shopifyql_sessions import (
     update_daily_city_sessions_summary_from_shopifyql,
@@ -250,53 +244,11 @@ def update_sessions_summary(
                     connection=connection,
                 )
 
-            ci_start_dt = datetime.now(tz).date() - timedelta(days=1)
-            ci_end_dt = datetime.now(tz).date()
-            if aws_background.is_backfill_active_for(brand_index):
-                backfill_start_dt, backfill_end_dt = aws_background.get_backfill_window_for_brand(brand_index)
-                if backfill_start_dt and backfill_end_dt:
-                    ci_start_dt = backfill_start_dt.date()
-                    ci_end_dt = backfill_end_dt.date()
-
-            sync_checkout_initiated_ci_events(
-                brand_index=brand_index,
-                brand_name=brand_name,
-                brand_key=os.environ.get(f"BRAND_TAG_{brand_index}"),
-                start_date=ci_start_dt,
-                end_date=ci_end_dt,
-                cursor=cursor,
-                connection=connection,
-            )
-
-            sync_checkout_initiated_variant_events(
-                brand_index=brand_index,
-                brand_name=brand_name,
-                brand_key=os.environ.get(f"BRAND_TAG_{brand_index}"),
-                start_date=ci_start_dt,
-                end_date=ci_end_dt,
-                cursor=cursor,
-                connection=connection,
-            )
-
-            sync_buy_now_events(
-                brand_index=brand_index,
-                brand_name=brand_name,
-                brand_key=os.environ.get(f"BRAND_TAG_{brand_index}"),
-                start_date=ci_start_dt,
-                end_date=ci_end_dt,
-                cursor=cursor,
-                connection=connection,
-            )
-
-            sync_buy_now_variant_events(
-                brand_index=brand_index,
-                brand_name=brand_name,
-                brand_key=os.environ.get(f"BRAND_TAG_{brand_index}"),
-                start_date=ci_start_dt,
-                end_date=ci_end_dt,
-                cursor=cursor,
-                connection=connection,
-            )
+            # Checkout-initiated/buy-now event sync (ci_events, buy_now_events,
+            # their variant tables) used to run here, querying alerts.sessions
+            # directly every 10 minutes. That's now owned entirely by
+            # events-summary-worker (every 15 minutes, reading mongo_events_summary
+            # instead) - see pipeline/mongo_events_sql.py.
 
             web_vitals_start_dt = None
             web_vitals_end_dt = None

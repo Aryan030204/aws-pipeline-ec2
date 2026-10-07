@@ -1,7 +1,7 @@
 import sys
 import types
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -50,14 +50,6 @@ class _DummyCursor:
         return list(self.fetch_rows)
 
 
-class _FakeMongoClient:
-    def __init__(self):
-        self.closed = False
-
-    def close(self):
-        self.closed = True
-
-
 class SanitizeEventTypeColumnTests(unittest.TestCase):
     def test_normalizes_common_cases(self):
         self.assertEqual(
@@ -77,124 +69,6 @@ class QuoteIdentifierTests(unittest.TestCase):
     def test_rejects_unsafe_identifier(self):
         with self.assertRaises(ValueError):
             mongo_events._quote_identifier("bad; DROP TABLE x --")
-
-
-class IterUniqueDailyPairEventsAllTypesTests(unittest.TestCase):
-    def _mock_collection(self, docs):
-        fake_client = _FakeMongoClient()
-        fake_collection = mock.Mock()
-        fake_collection.find.return_value = list(docs)
-        return mock.patch.object(
-            mongo_events,
-            "_resolve_mongo_sessions_collection",
-            return_value=(fake_client, fake_collection),
-        ), fake_client
-
-    def test_same_pair_different_event_types_both_count_independently(self):
-        docs = [
-            {
-                "session_id": "s1",
-                "cart_token": "c1",
-                "event_type": "checkout_initiated",
-                "createdAt": datetime(2026, 8, 17, 10, 0, tzinfo=timezone.utc),
-                "variantId": "v1",
-            },
-            {
-                "session_id": "s1",
-                "cart_token": "c1",
-                "event_type": "buy_now",
-                "createdAt": datetime(2026, 8, 17, 10, 5, tzinfo=timezone.utc),
-                "variantId": "v1",
-            },
-        ]
-        patcher, fake_client = self._mock_collection(docs)
-        with patcher:
-            events = mongo_events._iter_unique_daily_pair_events_all_types_from_mongo(
-                start_date=date(2026, 8, 17),
-                end_date=date(2026, 8, 17),
-                mongo_shop_name="tmc",
-                tz=IST,
-            )
-
-        self.assertTrue(fake_client.closed)
-        columns = sorted(e["event_column"] for e in events)
-        self.assertEqual(columns, ["buy_now_count", "checkout_initiated_count"])
-
-    def test_same_pair_same_event_type_twice_is_dropped(self):
-        docs = [
-            {
-                "session_id": "s1",
-                "cart_token": "c1",
-                "event_type": "checkout_initiated",
-                "createdAt": datetime(2026, 8, 17, 10, 0, tzinfo=timezone.utc),
-                "variantId": "v1",
-            },
-            {
-                "session_id": "s1",
-                "cart_token": "c1",
-                "event_type": "checkout_initiated",
-                "createdAt": datetime(2026, 8, 17, 11, 0, tzinfo=timezone.utc),
-                "variantId": "v1",
-            },
-        ]
-        patcher, _ = self._mock_collection(docs)
-        with patcher:
-            events = mongo_events._iter_unique_daily_pair_events_all_types_from_mongo(
-                start_date=date(2026, 8, 17),
-                end_date=date(2026, 8, 17),
-                mongo_shop_name="tmc",
-                tz=IST,
-            )
-
-        self.assertEqual(events, [])
-
-    def test_missing_session_id_or_cart_token_is_skipped(self):
-        docs = [
-            {
-                "session_id": "",
-                "cart_token": "c1",
-                "event_type": "checkout_initiated",
-                "createdAt": datetime(2026, 8, 17, 10, 0, tzinfo=timezone.utc),
-                "variantId": "v1",
-            },
-        ]
-        patcher, _ = self._mock_collection(docs)
-        with patcher:
-            events = mongo_events._iter_unique_daily_pair_events_all_types_from_mongo(
-                start_date=date(2026, 8, 17),
-                end_date=date(2026, 8, 17),
-                mongo_shop_name="tmc",
-                tz=IST,
-            )
-
-        self.assertEqual(events, [])
-
-
-class AggregateVariantWiseEventCountsTests(unittest.TestCase):
-    def test_aggregates_by_date_variant_and_event_column(self):
-        fake_events = [
-            {"date": date(2026, 8, 17), "event_column": "checkout_initiated_count", "variant_ids": ["v1", "v2"]},
-            {"date": date(2026, 8, 17), "event_column": "buy_now_count", "variant_ids": ["v1"]},
-        ]
-        with mock.patch.object(
-            mongo_events, "_iter_unique_daily_pair_events_all_types_from_mongo", return_value=fake_events
-        ):
-            aggregated, event_columns = mongo_events._aggregate_variant_wise_event_counts(
-                start_date=date(2026, 8, 17),
-                end_date=date(2026, 8, 17),
-                mongo_shop_name="tmc",
-                tz=IST,
-            )
-
-        self.assertEqual(event_columns, {"checkout_initiated_count", "buy_now_count"})
-        self.assertEqual(
-            aggregated[(date(2026, 8, 17), "v1")],
-            {"checkout_initiated_count": 1, "buy_now_count": 1},
-        )
-        self.assertEqual(
-            aggregated[(date(2026, 8, 17), "v2")],
-            {"checkout_initiated_count": 1},
-        )
 
 
 class UpsertVariantWiseEventsSummaryTests(unittest.TestCase):

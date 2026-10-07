@@ -47,14 +47,6 @@ class _DummyCursor:
         return list(self.fetch_rows)
 
 
-class _FakeMongoClient:
-    def __init__(self):
-        self.closed = False
-
-    def close(self):
-        self.closed = True
-
-
 def _checkout_doc(session_id, cart_token, created_at, variant_id="v1"):
     return {
         "session_id": session_id,
@@ -65,80 +57,55 @@ def _checkout_doc(session_id, cart_token, created_at, variant_id="v1"):
     }
 
 
-class _MockCollectionMixin:
-    def _mock_collection(self, find_docs=None, distinct_values=None):
-        fake_client = _FakeMongoClient()
-        fake_collection = mock.Mock()
-        fake_collection.find.return_value = list(find_docs or [])
-        fake_collection.distinct.return_value = list(distinct_values or [])
-        return (
-            mock.patch.object(
-                cls,
-                "_resolve_mongo_sessions_collection",
-                return_value=(fake_client, fake_collection),
-            ),
-            fake_client,
-        )
-
-
-class FetchLoginCartTokensTests(_MockCollectionMixin, unittest.TestCase):
+class FetchLoginCartTokensTests(unittest.TestCase):
     def test_returns_distinct_cart_tokens(self):
-        patcher, fake_client = self._mock_collection(distinct_values=["c1", "c2", "c1", ""])
-        with patcher:
-            tokens = cls._fetch_login_cart_tokens(
-                start_date=date(2026, 8, 17),
-                end_date=date(2026, 8, 17),
-                mongo_shop_name="tmc",
-                tz=IST,
-            )
+        rows = [
+            _checkout_doc("s1", "c1", datetime(2026, 8, 17, 10, 0)),
+            _checkout_doc("s2", "c2", datetime(2026, 8, 17, 10, 0)),
+            _checkout_doc("s3", "c1", datetime(2026, 8, 17, 11, 0)),
+            _checkout_doc("s4", "", datetime(2026, 8, 17, 11, 0)),
+        ]
+        cursor = _DummyCursor()
+        with mock.patch.object(cls, "_fetch_candidate_rows", return_value=rows) as fetch:
+            tokens = cls._fetch_login_cart_tokens(cursor, date(2026, 8, 17), date(2026, 8, 17), IST)
         self.assertEqual(tokens, {"c1", "c2"})
-        self.assertTrue(fake_client.closed)
+        fetch.assert_called_once_with(cursor, date(2026, 8, 17), date(2026, 8, 17), IST, event_type="login")
 
 
-class IterUniqueDailyCheckoutPairsTests(_MockCollectionMixin, unittest.TestCase):
+class IterUniqueDailyCheckoutPairsTests(unittest.TestCase):
+    def _run(self, docs):
+        cursor = _DummyCursor()
+        with mock.patch.object(cls, "_fetch_candidate_rows", return_value=docs):
+            return cls._iter_unique_daily_checkout_pairs(cursor, date(2026, 8, 17), date(2026, 8, 17), IST)
+
     def test_duplicate_checkout_docs_same_pair_counts_once(self):
         # CASE 3: duplicate (cart_token, session_id) documents.
-        created = datetime(2026, 8, 17, 10, 0, tzinfo=timezone.utc)
+        created = datetime(2026, 8, 17, 10, 0)
         docs = [
             _checkout_doc("s1", "c1", created),
             _checkout_doc("s1", "c1", created.replace(hour=11)),
         ]
-        patcher, _ = self._mock_collection(find_docs=docs)
-        with patcher:
-            pairs = cls._iter_unique_daily_checkout_pairs(
-                start_date=date(2026, 8, 17), end_date=date(2026, 8, 17),
-                mongo_shop_name="tmc", tz=IST,
-            )
-        # Same semantics as pipeline.mongo_events' dedup: >1 doc for the same
-        # pair on the same day means it's dropped by the "exactly once"
+        pairs = self._run(docs)
+        # Same semantics as pipeline.mongo_events_sql' dedup: >1 doc for the
+        # same pair on the same day means it's dropped by the "exactly once"
         # rule, not double-counted.
         self.assertEqual(pairs, [])
 
     def test_distinct_pairs_each_counted_once(self):
         # CASE 5: multiple distinct checkout pairs.
-        created = datetime(2026, 8, 17, 10, 0, tzinfo=timezone.utc)
+        created = datetime(2026, 8, 17, 10, 0)
         docs = [
             _checkout_doc("s1", "c1", created, variant_id="v1"),
             _checkout_doc("s2", "c2", created, variant_id="v2"),
         ]
-        patcher, _ = self._mock_collection(find_docs=docs)
-        with patcher:
-            pairs = cls._iter_unique_daily_checkout_pairs(
-                start_date=date(2026, 8, 17), end_date=date(2026, 8, 17),
-                mongo_shop_name="tmc", tz=IST,
-            )
+        pairs = self._run(docs)
         self.assertEqual(len(pairs), 2)
         self.assertEqual({p["cart_token"] for p in pairs}, {"c1", "c2"})
 
     def test_missing_session_id_or_cart_token_is_skipped(self):
-        created = datetime(2026, 8, 17, 10, 0, tzinfo=timezone.utc)
+        created = datetime(2026, 8, 17, 10, 0)
         docs = [_checkout_doc("", "c1", created)]
-        patcher, _ = self._mock_collection(find_docs=docs)
-        with patcher:
-            pairs = cls._iter_unique_daily_checkout_pairs(
-                start_date=date(2026, 8, 17), end_date=date(2026, 8, 17),
-                mongo_shop_name="tmc", tz=IST,
-            )
+        pairs = self._run(docs)
         self.assertEqual(pairs, [])
 
 
@@ -148,10 +115,9 @@ class ClassifyAndAggregateTests(unittest.TestCase):
         pairs = [{"date": date(2026, 8, 17), "cart_token": "c1", "variant_ids": ["v1"]}]
         with mock.patch.object(cls, "_fetch_login_cart_tokens", return_value={"c1"}), \
              mock.patch.object(cls, "_iter_unique_daily_checkout_pairs", return_value=pairs), \
-             mock.patch.object(cls, "_fetch_daily_unique_pair_event_counts_from_mongo", return_value={date(2026, 8, 17): 1}):
+             mock.patch.object(cls, "_fetch_daily_unique_pair_event_counts_from_sql", return_value={date(2026, 8, 17): 1}):
             daily, variant = cls._classify_and_aggregate(
-                start_date=date(2026, 8, 17), end_date=date(2026, 8, 17),
-                mongo_shop_name="tmc", tz=IST,
+                _DummyCursor(), date(2026, 8, 17), date(2026, 8, 17), IST,
             )
         d = daily[date(2026, 8, 17)]
         self.assertEqual(d["total_checkout_events"], 1)
@@ -164,10 +130,9 @@ class ClassifyAndAggregateTests(unittest.TestCase):
         pairs = [{"date": date(2026, 8, 17), "cart_token": "c1", "variant_ids": ["v1"]}]
         with mock.patch.object(cls, "_fetch_login_cart_tokens", return_value=set()), \
              mock.patch.object(cls, "_iter_unique_daily_checkout_pairs", return_value=pairs), \
-             mock.patch.object(cls, "_fetch_daily_unique_pair_event_counts_from_mongo", return_value={}):
+             mock.patch.object(cls, "_fetch_daily_unique_pair_event_counts_from_sql", return_value={}):
             daily, variant = cls._classify_and_aggregate(
-                start_date=date(2026, 8, 17), end_date=date(2026, 8, 17),
-                mongo_shop_name="tmc", tz=IST,
+                _DummyCursor(), date(2026, 8, 17), date(2026, 8, 17), IST,
             )
         d = daily[date(2026, 8, 17)]
         self.assertEqual(d["total_checkout_events"], 1)
@@ -183,10 +148,9 @@ class ClassifyAndAggregateTests(unittest.TestCase):
         pairs = [{"date": date(2026, 8, 17), "cart_token": "c1", "variant_ids": ["v1"]}]
         with mock.patch.object(cls, "_fetch_login_cart_tokens", return_value={"c1"}), \
              mock.patch.object(cls, "_iter_unique_daily_checkout_pairs", return_value=pairs), \
-             mock.patch.object(cls, "_fetch_daily_unique_pair_event_counts_from_mongo", return_value={date(2026, 8, 17): 3}):
+             mock.patch.object(cls, "_fetch_daily_unique_pair_event_counts_from_sql", return_value={date(2026, 8, 17): 3}):
             daily, variant = cls._classify_and_aggregate(
-                start_date=date(2026, 8, 17), end_date=date(2026, 8, 17),
-                mongo_shop_name="tmc", tz=IST,
+                _DummyCursor(), date(2026, 8, 17), date(2026, 8, 17), IST,
             )
         d = daily[date(2026, 8, 17)]
         self.assertEqual(d["logged_in_users"], 1)
@@ -201,10 +165,9 @@ class ClassifyAndAggregateTests(unittest.TestCase):
         ]
         with mock.patch.object(cls, "_fetch_login_cart_tokens", return_value={"c1"}), \
              mock.patch.object(cls, "_iter_unique_daily_checkout_pairs", return_value=pairs), \
-             mock.patch.object(cls, "_fetch_daily_unique_pair_event_counts_from_mongo", return_value={}):
+             mock.patch.object(cls, "_fetch_daily_unique_pair_event_counts_from_sql", return_value={}):
             daily, variant = cls._classify_and_aggregate(
-                start_date=date(2026, 8, 17), end_date=date(2026, 8, 17),
-                mongo_shop_name="tmc", tz=IST,
+                _DummyCursor(), date(2026, 8, 17), date(2026, 8, 17), IST,
             )
         vA = variant[(date(2026, 8, 17), "vA")]
         vB = variant[(date(2026, 8, 17), "vB")]
@@ -220,10 +183,9 @@ class ClassifyAndAggregateTests(unittest.TestCase):
         # for dates with no activity.
         with mock.patch.object(cls, "_fetch_login_cart_tokens", return_value=set()), \
              mock.patch.object(cls, "_iter_unique_daily_checkout_pairs", return_value=[]), \
-             mock.patch.object(cls, "_fetch_daily_unique_pair_event_counts_from_mongo", return_value={}):
+             mock.patch.object(cls, "_fetch_daily_unique_pair_event_counts_from_sql", return_value={}):
             daily, variant = cls._classify_and_aggregate(
-                start_date=date(2026, 8, 17), end_date=date(2026, 8, 17),
-                mongo_shop_name="tmc", tz=IST,
+                _DummyCursor(), date(2026, 8, 17), date(2026, 8, 17), IST,
             )
         self.assertEqual(
             daily[date(2026, 8, 17)],

@@ -24,10 +24,15 @@ import os
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo
 
 from pipeline.state import IST, logger
-from pipeline.db import get_db_cursor, executemany_chunked
+from pipeline.db import (
+    get_db_cursor,
+    executemany_chunked,
+    get_pipeline_metadata_timestamp,
+    update_pipeline_metadata_timestamp,
+    EXECUTEMANY_CHUNK_SIZE,
+)
 from pipeline.mongo_events import (
     _ist_date_range_to_utc_bounds,
     _resolve_mongo_sessions_collection,
@@ -46,6 +51,30 @@ RAW_EVENTS_TABLE = "mongo_events_summary"
 # are skipped with an error log instead.
 MAX_COLUMNS = int(os.environ.get("MONGO_EVENTS_MAX_COLUMNS", "400"))
 BATCH_SIZE = int(os.environ.get("MONGO_EVENTS_RAW_BATCH_SIZE", "2000"))
+
+# Incremental ingest (live worker path, no explicit start/end given): watermark
+# on createdAt (server-set, not user/tracker-written - see pipeline/intent_events.py's
+# identical reasoning for why createdAt, not a client timestamp). 5-minute
+# overlap re-checks the boundary in case of any in-flight writes at query time;
+# the upsert is idempotent so re-matching a handful of already-ingested docs is
+# harmless (and if delete-after-ingest already removed them, they just won't
+# match the query at all).
+RAW_EVENTS_METADATA_KEY = "mongo_events_raw_last_created_at"
+RAW_EVENTS_OVERLAP = timedelta(minutes=5)
+# First run under this watermark key: look back further than one 15-minute
+# cycle to recover anything the old daily-window job's last run missed. Safe -
+# idempotent upsert, and ingested docs get deleted, so what's left to re-scan
+# next run is small.
+RAW_EVENTS_DEFAULT_LOOKBACK = timedelta(hours=24)
+
+# Deletes each batch's documents from Mongo once it's durably upserted into
+# mongo_events_summary, so the alerts.sessions collection doesn't grow
+# unbounded. Every document here is a one-shot event (no mutable-rollup
+# analog like the Intent cluster's session_history), so there's no excluded
+# sub-stream - everything successfully ingested is eligible for deletion.
+MONGO_EVENTS_DELETE_INGESTED_DOCS = (
+    os.environ.get("MONGO_EVENTS_DELETE_INGESTED_DOCS", "true").strip().lower() == "true"
+)
 
 MAX_FLATTEN_DEPTH = 5
 MYSQL_MAX_IDENTIFIER_LENGTH = 64
@@ -391,80 +420,172 @@ def _flush_batch(
     return executemany_chunked(cursor, connection, sql, rows)
 
 
-def compute_raw_rebuild_window(tz: ZoneInfo, current_dt: Optional[datetime] = None) -> Tuple[date, date]:
-    """Same rolling "day-before-yesterday .. yesterday" window the other
-    daily Mongo workers use, in the brand's own timezone."""
-    local_now = current_dt.astimezone(tz) if current_dt else datetime.now(tz)
-    today = local_now.date()
-    return today - timedelta(days=2), today - timedelta(days=1)
+def _delete_ingested_documents(collection, event_ids: List[str]) -> int:
+    """
+    Deletes documents by event_id, chunked at EXECUTEMANY_CHUNK_SIZE (same
+    constant the MySQL side chunks on). Only ever called after a batch's
+    upsert has already returned successfully - see the per-batch
+    delete-after-ingest call in sync_mongo_events_raw_for_brand below.
+    """
+    deleted = 0
+    for i in range(0, len(event_ids), EXECUTEMANY_CHUNK_SIZE):
+        chunk = event_ids[i : i + EXECUTEMANY_CHUNK_SIZE]
+        result = collection.delete_many({"event_id": {"$in": chunk}})
+        deleted += result.deleted_count
+    return deleted
 
 
 def sync_mongo_events_raw_for_brand(
     brand_index: int,
     brand_name: str,
-    start_date: date,
-    end_date: date,
     brand_key: Optional[str] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
     cursor=None,
     connection=None,
-) -> None:
+) -> "set":
+    """
+    Returns the set of IST date strings (YYYY-MM-DD) touched by whatever was
+    upserted this call - callers (events-summary-worker) use this to know
+    which dates' CI/buy-now rollups need recomputing from mongo_events_summary,
+    without rescanning dates nothing changed for. Empty set on a brand-skip
+    or an error (logged, not raised - matches every other per-brand sync in
+    this pipeline).
+
+    Default path (start_date/end_date both omitted - the live worker, every
+    15 minutes): incremental, watermarked on createdAt, stored per brand in
+    pipeline_metadata. Explicit start_date/end_date (the backfill script):
+    a fixed date window instead, same as before - the watermark is left
+    untouched in that path, so a backfill never rewinds or fast-forwards the
+    live worker's incremental position.
+
+    Either way, once a batch is durably upserted, its source documents are
+    deleted from Mongo (MONGO_EVENTS_DELETE_INGESTED_DOCS) so alerts.sessions
+    doesn't grow unbounded.
+    """
     if not is_ci_events_brand(brand_name, brand_key):
         logger.info(
             f"Skipping raw Mongo events sync for {brand_name}: brand not enabled for ci_events"
         )
-        return
+        return set()
 
     mongo_shop_name = get_ci_events_mongo_shop_name(brand_name, brand_key)
     if not mongo_shop_name:
         logger.info(
             f"Skipping raw Mongo events sync for {brand_name}: no Mongo shop_name mapping"
         )
-        return
+        return set()
 
     tz = aws_background.get_brand_timezone(brand_index)
-    start_utc, end_utc = _ist_date_range_to_utc_bounds(start_date, end_date, tz)
+    explicit_window = start_date is not None and end_date is not None
+    if explicit_window:
+        query_lower_bound, query_upper_bound = _ist_date_range_to_utc_bounds(start_date, end_date, tz)
+    else:
+        query_upper_bound = None  # no upper bound - incremental, open-ended
     log_prefix = f"[raw events] brand={brand_name} (shop_name={mongo_shop_name})"
+
+    affected_dates: set = set()
 
     def _do_sync(c, conn, collection) -> None:
         started_at = time.monotonic()
-        logger.info(
-            f"{log_prefix}: starting ingestion for {start_date}..{end_date} ({tz}); "
-            f"createdAt in [{start_utc:%Y-%m-%d %H:%M:%S}, {end_utc:%Y-%m-%d %H:%M:%S}) UTC"
-        )
-
         _ensure_raw_events_table(c, conn)
         catalog = _ColumnCatalog(c, conn)
         # Belt and braces for a table created by an older version of this code.
         catalog.add([(n, t.replace(" NOT NULL", "").replace(" NULL", ""))
                      for n, t in _FIXED_COLUMNS.items() if catalog.get(n) is None])
 
+        if explicit_window:
+            lower_bound = query_lower_bound
+            logger.info(
+                f"{log_prefix}: starting ingestion for {start_date}..{end_date} ({tz}); "
+                f"createdAt in [{lower_bound:%Y-%m-%d %H:%M:%S}, {query_upper_bound:%Y-%m-%d %H:%M:%S}) UTC"
+            )
+        else:
+            stored_watermark = get_pipeline_metadata_timestamp(c, RAW_EVENTS_METADATA_KEY)
+            watermark = stored_watermark or (datetime.now(IST) - RAW_EVENTS_DEFAULT_LOOKBACK)
+            lower_bound = (watermark - RAW_EVENTS_OVERLAP).astimezone(timezone.utc)
+            if stored_watermark is None:
+                logger.info(
+                    f"{log_prefix}: no stored watermark (first run) - looking back "
+                    f"{RAW_EVENTS_DEFAULT_LOOKBACK}"
+                )
+            logger.info(
+                f"{log_prefix}: starting ingestion; createdAt > "
+                f"{lower_bound:%Y-%m-%d %H:%M:%S} UTC (stored watermark "
+                f"{watermark.strftime('%Y-%m-%d %H:%M:%S')} IST minus "
+                f"{int(RAW_EVENTS_OVERLAP.total_seconds() // 60)}m overlap)"
+            )
+
+        created_at_filter: Dict[str, Any] = {"$gt": lower_bound} if not explicit_window else {
+            "$gte": lower_bound,
+            "$lt": query_upper_bound,
+        }
+        query = {"shop_name": mongo_shop_name, "createdAt": created_at_filter}
+
         # No .sort(): order is irrelevant for an idempotent upsert, and an
         # unindexed sort fails past Mongo's 32MB in-memory limit. Streamed in
         # batches (not list(cursor)) - raw payloads are large.
-        docs = collection.find(
-            {"shop_name": mongo_shop_name, "createdAt": {"$gte": start_utc, "$lt": end_utc}},
-            {"_id": 0},
-            batch_size=BATCH_SIZE,
-        )
+        docs = collection.find(query, {"_id": 0}, batch_size=BATCH_SIZE)
 
         warned: set = set()
         batch: List[Dict[str, Any]] = []
-        seen = skipped = upserted = 0
+        batch_created_ats: List[datetime] = []
+        seen = skipped = upserted = deleted = 0
+        max_created_at: Optional[datetime] = None
+
+        def _flush(current_batch: List[Dict[str, Any]], current_created_ats: List[datetime]) -> None:
+            nonlocal upserted, deleted
+            if not current_batch:
+                return
+            flushed = _flush_batch(c, conn, catalog, current_batch, warned, log_prefix)
+            upserted += flushed
+            for r in current_batch:
+                ist_dt = r.get("created_at_ist")
+                if ist_dt is not None:
+                    affected_dates.add(ist_dt.date().isoformat())
+            if MONGO_EVENTS_DELETE_INGESTED_DOCS:
+                try:
+                    event_ids = [r["event_id"] for r in current_batch]
+                    deleted += _delete_ingested_documents(collection, event_ids)
+                except Exception as e:
+                    logger.error(
+                        f"{log_prefix}: error deleting {len(current_batch)} ingested "
+                        f"document(s) from Mongo: {e}"
+                    )
+            if not explicit_window and current_created_ats:
+                # Watermark advance happens here, per batch, right after that
+                # batch's upsert (and delete attempt) - so a mid-run failure
+                # on a later batch still leaves the watermark correctly past
+                # every batch that *did* complete, instead of all-or-nothing.
+                batch_max = max(current_created_ats)
+                nonlocal max_created_at
+                if max_created_at is None or batch_max > max_created_at:
+                    max_created_at = batch_max
+                update_pipeline_metadata_timestamp(
+                    c, conn, RAW_EVENTS_METADATA_KEY, max_created_at.astimezone(IST)
+                )
+            logger.info(
+                f"{log_prefix}: read {seen} document(s), upserted {upserted} so far, "
+                f"deleted {deleted} ingested doc(s) ({time.monotonic() - started_at:.1f}s elapsed)"
+            )
+
         for doc in docs:
             seen += 1
+            created_at = doc.get("createdAt")
             record = _build_record(doc)
             if record is None:
                 skipped += 1
                 continue
             batch.append(record)
-            if len(batch) >= BATCH_SIZE:
-                upserted += _flush_batch(c, conn, catalog, batch, warned, log_prefix)
-                batch = []
-                logger.info(
-                    f"{log_prefix}: read {seen} document(s), upserted {upserted} so far "
-                    f"({time.monotonic() - started_at:.1f}s elapsed)"
+            if isinstance(created_at, datetime):
+                batch_created_ats.append(
+                    created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
                 )
-        upserted += _flush_batch(c, conn, catalog, batch, warned, log_prefix)
+            if len(batch) >= BATCH_SIZE:
+                _flush(batch, batch_created_ats)
+                batch = []
+                batch_created_ats = []
+        _flush(batch, batch_created_ats)
 
         if skipped:
             logger.warning(
@@ -472,7 +593,8 @@ def sync_mongo_events_raw_for_brand(
             )
         logger.info(
             f"{log_prefix}: finished - read {seen} document(s), upserted {upserted} row(s) "
-            f"into {RAW_EVENTS_TABLE} in {time.monotonic() - started_at:.1f}s"
+            f"into {RAW_EVENTS_TABLE}, deleted {deleted} ingested document(s) from Mongo, "
+            f"in {time.monotonic() - started_at:.1f}s"
         )
 
     client = None
@@ -488,3 +610,5 @@ def sync_mongo_events_raw_for_brand(
     finally:
         if client is not None:
             client.close()
+
+    return affected_dates

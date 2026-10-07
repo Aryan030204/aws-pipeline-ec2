@@ -54,7 +54,7 @@ def backfill_brand(brand_index: int, start_dt: datetime, end_dt: datetime):
     aws_background.ensure_buy_now_events_column(
         brand_index, "hourly_sessions_summary_shopify"
     )
-    aws_background.sync_buy_now_events(
+    aws_background.sync_buy_now_events_sql(
         brand_index=brand_index,
         brand_name=brand_name,
         brand_key=brand_key,

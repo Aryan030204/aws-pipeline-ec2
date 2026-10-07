@@ -212,18 +212,60 @@ class EventsSummaryWorkerTests(unittest.TestCase):
         self.assertIn('minute=30', source)
         self.assertIn('timezone="UTC"', source)
 
+    def test_scheduled_mode_runs_master_summary_once_immediately_before_starting_scheduler(self):
+        from unittest import mock
+
+        fake_scheduler = mock.Mock()
+        with mock.patch(
+            "apscheduler.schedulers.blocking.BlockingScheduler", return_value=fake_scheduler
+        ), mock.patch.object(worker, "_run_master_events_summary") as master, \
+             mock.patch.object(worker, "run_incremental_events_job") as incremental:
+            worker._run_scheduled()
+
+        master.assert_called_once_with()
+        incremental.assert_called_once_with()
+        fake_scheduler.start.assert_called_once()
+
+
+class _FakeDbCursorCtx:
+    """Fakes aws_background.get_db_cursor(brand_index) as a context manager
+    yielding (cursor, connection) sentinels - good enough since every call
+    in run_incremental_events_job just threads them through unchanged."""
+
+    def __init__(self, cursor="cursor", connection="connection"):
+        self.cursor = cursor
+        self.connection = connection
+
+    def __call__(self, brand_index):
+        return self
+
+    def __enter__(self):
+        return self.cursor, self.connection
+
+    def __exit__(self, *exc):
+        return False
+
 
 class RawEventsPhaseTests(unittest.TestCase):
-    """The per-brand raw-events phase added to run_worker (writes to each
-    brand's own mongo_events_summary table) and its isolation from the
-    existing master events_summary rebuild."""
+    """The per-brand incremental events job added to run_worker (raw ingest
+    into each brand's own mongo_events_summary table, then the CI/buy-now
+    rollups for whatever dates that ingest touched) and its isolation from
+    the existing master events_summary rebuild."""
 
-    def _fake_aws_background(self, brands, ci_brands=None):
+    _SQL_FN_NAMES = (
+        "sync_checkout_initiated_ci_events_sql",
+        "sync_checkout_initiated_variant_events_sql",
+        "sync_buy_now_events_sql",
+        "sync_buy_now_variant_events_sql",
+        "update_overall_summary_event_columns_sql",
+    )
+
+    def _fake_aws_background(self, brands, ci_brands=None, affected_dates=None):
         from unittest import mock
-        from zoneinfo import ZoneInfo
 
         fake = mock.Mock()
         fake.active_brand_indices = []
+        fake.get_db_cursor = _FakeDbCursorCtx()
 
         def init():
             fake.active_brand_indices.extend(brands)
@@ -232,25 +274,28 @@ class RawEventsPhaseTests(unittest.TestCase):
         fake.is_ci_events_brand.side_effect = lambda name, key: (
             ci_brands is None or name in ci_brands
         )
-        fake.get_brand_timezone.return_value = ZoneInfo("Asia/Kolkata")
-        fake.compute_raw_rebuild_window.return_value = (date(2026, 9, 24), date(2026, 9, 25))
+        fake.sync_mongo_events_raw_for_brand.return_value = (
+            affected_dates if affected_dates is not None else {"2026-09-24", "2026-09-25"}
+        )
+        for fn_name in self._SQL_FN_NAMES:
+            setattr(fake, fn_name, mock.Mock())
         return fake
 
-    def test_master_failure_does_not_stop_raw_sync_and_is_still_raised(self):
+    def test_master_failure_does_not_stop_incremental_job_and_is_still_raised(self):
         from unittest import mock
 
         with mock.patch.object(worker, "_run_master_events_summary", side_effect=RuntimeError("master boom")), \
-             mock.patch.object(worker, "run_raw_events_sync") as raw_sync:
+             mock.patch.object(worker, "run_incremental_events_job") as incremental:
             with self.assertRaises(RuntimeError):
                 worker.run_worker()
 
-        raw_sync.assert_called_once()
+        incremental.assert_called_once()
 
-    def test_raw_failure_does_not_fail_or_block_master_summary(self):
+    def test_incremental_failure_does_not_fail_or_block_master_summary(self):
         from unittest import mock
 
         with mock.patch.object(worker, "_run_master_events_summary") as master, \
-             mock.patch.object(worker, "run_raw_events_sync", side_effect=RuntimeError("raw boom")):
+             mock.patch.object(worker, "run_incremental_events_job", side_effect=RuntimeError("boom")):
             worker.run_worker()  # must not raise
 
         master.assert_called_once()
@@ -260,21 +305,57 @@ class RawEventsPhaseTests(unittest.TestCase):
 
         fake = self._fake_aws_background([1, 2], ci_brands={"Brand_1"})
         with mock.patch.dict(sys.modules, {"aws_background": fake}):
-            worker.run_raw_events_sync()
+            worker.run_incremental_events_job()
 
         self.assertEqual(fake.sync_mongo_events_raw_for_brand.call_count, 1)
         kwargs = fake.sync_mongo_events_raw_for_brand.call_args.kwargs
         self.assertEqual(kwargs["brand_index"], 1)
-        self.assertEqual(kwargs["start_date"], date(2026, 9, 24))
-        self.assertEqual(kwargs["end_date"], date(2026, 9, 25))
+        self.assertEqual(kwargs["cursor"], "cursor")
+        self.assertEqual(kwargs["connection"], "connection")
+
+    def test_affected_dates_drive_the_sql_rollup_window(self):
+        from unittest import mock
+
+        fake = self._fake_aws_background([1], affected_dates={"2026-09-24", "2026-09-26", "2026-09-25"})
+        with mock.patch.dict(sys.modules, {"aws_background": fake}):
+            worker.run_incremental_events_job()
+
+        for fn_name in self._SQL_FN_NAMES:
+            fn = getattr(fake, fn_name)
+            fn.assert_called_once()
+            kwargs = fn.call_args.kwargs
+            self.assertEqual(kwargs["start_date"], date(2026, 9, 24))
+            self.assertEqual(kwargs["end_date"], date(2026, 9, 26))
+            self.assertEqual(kwargs["brand_index"], 1)
+
+    def test_no_affected_dates_skips_the_sql_rollups_entirely(self):
+        from unittest import mock
+
+        fake = self._fake_aws_background([1], affected_dates=set())
+        with mock.patch.dict(sys.modules, {"aws_background": fake}):
+            worker.run_incremental_events_job()
+
+        for fn_name in self._SQL_FN_NAMES:
+            getattr(fake, fn_name).assert_not_called()
+
+    def test_one_sql_rollup_function_failing_does_not_stop_the_others(self):
+        from unittest import mock
+
+        fake = self._fake_aws_background([1])
+        fake.sync_checkout_initiated_ci_events_sql.side_effect = RuntimeError("boom")
+        with mock.patch.dict(sys.modules, {"aws_background": fake}):
+            worker.run_incremental_events_job()  # must not raise
+
+        for fn_name in self._SQL_FN_NAMES:
+            getattr(fake, fn_name).assert_called_once()
 
     def test_one_brand_failing_does_not_stop_the_next(self):
         from unittest import mock
 
         fake = self._fake_aws_background([1, 2])
-        fake.sync_mongo_events_raw_for_brand.side_effect = [RuntimeError("boom"), None]
+        fake.sync_mongo_events_raw_for_brand.side_effect = [RuntimeError("boom"), {"2026-09-24"}]
         with mock.patch.dict(sys.modules, {"aws_background": fake}):
-            worker.run_raw_events_sync()  # must not raise
+            worker.run_incremental_events_job()  # must not raise
 
         self.assertEqual(fake.sync_mongo_events_raw_for_brand.call_count, 2)
 
@@ -284,7 +365,7 @@ class RawEventsPhaseTests(unittest.TestCase):
         fake = self._fake_aws_background([1])
         fake.active_brand_indices.extend([1, 1, 1])  # stale entries from a previous run
         with mock.patch.dict(sys.modules, {"aws_background": fake}):
-            worker.run_raw_events_sync()
+            worker.run_incremental_events_job()
 
         self.assertEqual(fake.active_brand_indices, [1])
 

@@ -385,15 +385,37 @@ def fetch_mongo_events_for_dates(target_dates: Sequence[date]) -> List[Dict]:
             client.close()
 
 
-def run_raw_events_sync(current_dt: Optional[datetime] = None) -> None:
+# Sync functions run against each brand's freshly-ingested mongo_events_summary
+# rows, per affected-date window, after the raw ingest below - these used to
+# run inside the main pipeline every 10 minutes, querying alerts.sessions
+# (Mongo) directly; see pipeline/mongo_events_sql.py and
+# pipeline/orchestration.py's update_sessions_summary for where they moved
+# from.
+_CI_BUY_NOW_SYNC_FN_NAMES = (
+    "sync_checkout_initiated_ci_events_sql",
+    "sync_checkout_initiated_variant_events_sql",
+    "sync_buy_now_events_sql",
+    "sync_buy_now_variant_events_sql",
+    "update_overall_summary_event_columns_sql",
+)
+
+
+def run_incremental_events_job() -> None:
     """
-    Stores the full raw alerts.sessions events (one row per event, every
-    document key a column) into each CI-events brand's own mongo_events_summary
-    table. Unlike the master-DB events_summary above, this is per brand, so it
-    reuses the main pipeline's brand infrastructure (aws_background) - imported
-    lazily so the master-summary phase above stays self-contained. The actual
-    fetch/flatten/dynamic-column/upsert logic lives in
-    pipeline/mongo_events_raw.py (sync_mongo_events_raw_for_brand).
+    Every 15 minutes: incremental raw ingest (pipeline/mongo_events_raw.py -
+    watermarked, deletes each document from Mongo once it's durably
+    upserted) into each CI-events brand's own mongo_events_summary table,
+    then recomputes that brand's CI/buy-now rollups
+    (hourly_sessions_summary_shopify's ci_events/buy_now_events,
+    daily_ci_events_summary, daily_buy_now_events_summary, their variant
+    tables, and overall_summary's event-total columns) for whatever dates
+    this run's ingest actually touched - nothing to do if a brand had no new
+    events this run.
+
+    aws_background is imported lazily so the master-summary phase (daily,
+    unrelated cadence) stays self-contained. Each brand uses one shared DB
+    connection for both the ingest and the rollup recompute; a brand's
+    failure doesn't stop the next brand.
     """
     import aws_background
 
@@ -401,7 +423,7 @@ def run_raw_events_sync(current_dt: Optional[datetime] = None) -> None:
     aws_background.initialize_brand_configs()
 
     if not aws_background.active_brand_indices:
-        logger.warning("No active brands with valid database configs. Skipping raw events sync.")
+        logger.warning("No active brands with valid database configs. Skipping incremental events job.")
         return
 
     for brand_index in aws_background.active_brand_indices:
@@ -410,27 +432,55 @@ def run_raw_events_sync(current_dt: Optional[datetime] = None) -> None:
 
         if not aws_background.is_ci_events_brand(brand_name, brand_key):
             logger.info(
-                "Skipping raw events sync for %s: brand not enabled for ci_events", brand_name
+                "Skipping incremental events job for %s: brand not enabled for ci_events", brand_name
             )
             continue
 
-        tz = aws_background.get_brand_timezone(brand_index)
-        start_date, end_date = aws_background.compute_raw_rebuild_window(tz, current_dt)
         try:
-            aws_background.sync_mongo_events_raw_for_brand(
-                brand_index=brand_index,
-                brand_name=brand_name,
-                start_date=start_date,
-                end_date=end_date,
-                brand_key=brand_key,
-            )
-        except Exception as e:
-            logger.error("Error syncing raw events for %s: %s", brand_name, e)
+            with aws_background.get_db_cursor(brand_index) as (cursor, connection):
+                affected_dates = aws_background.sync_mongo_events_raw_for_brand(
+                    brand_index=brand_index,
+                    brand_name=brand_name,
+                    brand_key=brand_key,
+                    cursor=cursor,
+                    connection=connection,
+                )
 
-    logger.info("Raw events sync complete.")
+                if not affected_dates:
+                    continue
+
+                start_date = min(date.fromisoformat(d) for d in affected_dates)
+                end_date = max(date.fromisoformat(d) for d in affected_dates)
+                logger.info(
+                    "Recomputing CI/buy-now rollups for %s: %s..%s (%s affected date(s))",
+                    brand_name, start_date, end_date, len(affected_dates),
+                )
+
+                for fn_name in _CI_BUY_NOW_SYNC_FN_NAMES:
+                    try:
+                        getattr(aws_background, fn_name)(
+                            brand_index=brand_index,
+                            brand_name=brand_name,
+                            start_date=start_date,
+                            end_date=end_date,
+                            brand_key=brand_key,
+                            cursor=cursor,
+                            connection=connection,
+                        )
+                    except Exception as e:
+                        logger.error("Error running %s for %s: %s", fn_name, brand_name, e)
+        except Exception as e:
+            logger.error("Error in incremental events job for %s: %s", brand_name, e)
+
+    logger.info("Incremental events job complete.")
 
 
 def run_worker(current_dt: Optional[datetime] = None) -> None:
+    """
+    Manual/one-off entry point (EVENTS_WORKER_SELF_RUN=false): runs both
+    independently-scheduled phases once. The live scheduled container runs
+    them on their own separate cadences instead - see _run_scheduled.
+    """
     try:
         _run_master_events_summary(current_dt)
     except Exception as e:
@@ -442,9 +492,9 @@ def run_worker(current_dt: Optional[datetime] = None) -> None:
     # Independent of the master summary above: a failure in either must not
     # stop the other from running.
     try:
-        run_raw_events_sync(current_dt)
+        run_incremental_events_job()
     except Exception as e:
-        logger.error("Raw events sync failed: %s", e)
+        logger.error("Incremental events job failed: %s", e)
 
     if master_error is not None:
         raise master_error
@@ -511,16 +561,24 @@ def _run_master_events_summary(current_dt: Optional[datetime] = None) -> None:
 
 def _run_scheduled() -> None:
     """
-    Long-running mode for the standalone container: schedules run_worker on
-    the same cadence the GitHub Actions cron used to (30 18 * * * UTC, i.e.
-    00:00 IST), then blocks. Set EVENTS_WORKER_SELF_RUN=false to instead run
-    once and exit (e.g. for a one-off/manual invocation).
+    Long-running mode for the standalone container: two independent
+    cadences on one scheduler.
+      - The master events_summary table: same daily cadence as before
+        (30 18 * * * UTC, i.e. 00:00 IST), plus one immediate run at
+        startup so a container restart doesn't wait up to a day for
+        fresh data.
+      - The incremental raw-ingest + CI/buy-now rollup job: every 15
+        minutes, plus one immediate run at startup (same pattern
+        workers/intent_events_worker.py uses) so a container restart
+        doesn't wait up to 15 minutes for fresh data.
+    Set EVENTS_WORKER_SELF_RUN=false to instead run both once and exit
+    (e.g. for a one-off/manual invocation) - see run_worker.
     """
     from apscheduler.schedulers.blocking import BlockingScheduler
 
     scheduler = BlockingScheduler(timezone="UTC")
     scheduler.add_job(
-        run_worker,
+        _run_master_events_summary,
         trigger="cron",
         hour=18,
         minute=30,
@@ -530,8 +588,31 @@ def _run_scheduled() -> None:
         max_instances=1,
         misfire_grace_time=3600,
     )
+
+    logger.info("Running master events summary job once immediately on startup")
+    try:
+        _run_master_events_summary()
+    except Exception as e:
+        logger.error("Error in immediate startup run of master events summary job: %s", e)
+
+    logger.info("Running incremental events job once immediately on startup")
+    try:
+        run_incremental_events_job()
+    except Exception as e:
+        logger.error("Error in immediate startup run of incremental events job: %s", e)
+
+    scheduler.add_job(
+        run_incremental_events_job,
+        trigger="interval",
+        minutes=15,
+        id="incremental_events_job",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=600,
+    )
     logger.info(
-        "Events summary worker scheduler started (cron 30 18 * * * UTC / 00:00 IST)"
+        "Events summary worker scheduler started (master table: cron 30 18 * * * UTC / "
+        "00:00 IST; incremental events job: every 15 minutes)"
     )
     try:
         scheduler.start()
