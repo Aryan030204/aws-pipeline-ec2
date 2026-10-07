@@ -325,6 +325,46 @@ class _ColumnCatalog:
                 added.append(name)
         return added
 
+    def widen(self, definitions: List[Tuple[str, str]]) -> List[str]:
+        """ALTER TABLE ... MODIFY COLUMN for each (name, sql_type), widening
+        an existing column whose type (inferred from its first-seen value)
+        turns out too narrow for a later value - e.g. a price column created
+        as BIGINT from an early whole-number value, widened to DOUBLE once a
+        decimal value arrives, instead of silently storing NULL for it. Same
+        combined-then-one-at-a-time fallback as add()."""
+        widened: List[str] = []
+        if not definitions:
+            return widened
+
+        def _alter(defs: List[Tuple[str, str]]) -> None:
+            clauses = ", ".join(f"MODIFY COLUMN {_quote(n)} {t} NULL" for n, t in defs)
+            self._cursor.execute(f"ALTER TABLE {_quote(RAW_EVENTS_TABLE)} {clauses}")
+            self._connection.commit()
+
+        try:
+            _alter(definitions)
+            groups = [definitions]
+        except Exception as e:
+            logger.warning(
+                f"[raw events] combined MODIFY for {len(definitions)} widened column(s) failed "
+                f"({e}); retrying one at a time"
+            )
+            groups = []
+            for definition in definitions:
+                try:
+                    _alter([definition])
+                    groups.append([definition])
+                except Exception as single_error:
+                    logger.error(
+                        f"[raw events] could not widen column {definition[0]!r} "
+                        f"to {definition[1]}: {single_error}"
+                    )
+        for group in groups:
+            for name, sql_type in group:
+                self._columns[name.lower()] = (name, _category_from_sql_type(sql_type))
+                widened.append(name)
+        return widened
+
 
 def _ensure_raw_events_table(cursor, connection) -> None:
     fixed = ",\n            ".join(f"{_quote(n)} {t}" for n, t in _FIXED_COLUMNS.items())
@@ -358,11 +398,22 @@ def _flush_batch(
 
     # 1. Discover new keys. A key that is null in every record so far creates
     #    no column yet (its type is unknowable); it will once a value appears.
+    #    Also detect existing int columns that need widening to DOUBLE - a
+    #    column whose first-seen value was a whole number (e.g. 300) gets
+    #    BIGINT, but a later decimal value (299.5) for the same key can't fit
+    #    it; widen instead of letting that value fall back to NULL.
     new_definitions: Dict[str, Tuple[str, str]] = {}
+    widen_definitions: Dict[str, Tuple[str, str]] = {}
     for record in records:
         for name, value in record.items():
             lower = name.lower()
-            if value is None or catalog.get(name) or lower in new_definitions:
+            entry = catalog.get(name)
+            if entry is not None:
+                actual, category = entry
+                if category == "int" and isinstance(value, float) and not value.is_integer():
+                    widen_definitions.setdefault(lower, (actual, "DOUBLE"))
+                continue
+            if value is None or lower in new_definitions:
                 continue
             if len(catalog) + len(new_definitions) >= MAX_COLUMNS:
                 if "__cap__" not in warned:
@@ -378,6 +429,14 @@ def _flush_batch(
         added = catalog.add(list(new_definitions.values()))
         if added:
             logger.info(f"{log_prefix}: discovered and added {len(added)} new column(s): {added}")
+
+    if widen_definitions:
+        widened = catalog.widen(list(widen_definitions.values()))
+        if widened:
+            logger.info(
+                f"{log_prefix}: widened {len(widened)} column(s) from int to double "
+                f"(non-integer value seen): {widened}"
+            )
 
     # 2. Map/coerce each record onto real column names.
     mapped_records: List[Dict[str, Any]] = []

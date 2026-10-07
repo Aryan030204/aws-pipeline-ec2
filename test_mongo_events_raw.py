@@ -53,6 +53,11 @@ class FakeCursor:
 
             for name, sql_type in re.findall(r"ADD COLUMN `([^`]+)` (\w+(?:\(\d+\))?)", sql):
                 self.columns.append((name, sql_type.lower()))
+            for name, sql_type in re.findall(r"MODIFY COLUMN `([^`]+)` (\w+(?:\(\d+\))?)", sql):
+                self.columns = [
+                    (existing_name, sql_type.lower()) if existing_name == name else (existing_name, existing_type)
+                    for existing_name, existing_type in self.columns
+                ]
 
     def executemany(self, sql, rows):
         self.executemany_calls.append((sql, list(rows)))
@@ -208,6 +213,27 @@ class ColumnCatalogTests(unittest.TestCase):
         self.assertIsNotNone(catalog.get("good_col"))
         self.assertIsNone(catalog.get("bad_col"))
 
+    def test_widen_changes_column_category_and_records_the_alter(self):
+        cursor = FakeCursor(_fixed_show_columns_rows() + [("price", "bigint")])
+        catalog = raw._ColumnCatalog(cursor, FakeConnection())
+        widened = catalog.widen([("price", "DOUBLE")])
+
+        self.assertEqual(widened, ["price"])
+        self.assertEqual(catalog.get("price"), ("price", "float"))
+        self.assertIn("MODIFY COLUMN `price` DOUBLE", " ".join(cursor.alters))
+
+    def test_widen_falls_back_to_one_at_a_time_when_combined_alter_fails(self):
+        cursor = FakeCursor(
+            _fixed_show_columns_rows() + [("good_col", "bigint"), ("bad_col", "bigint")],
+            fail_alter_containing="bad_col",
+        )
+        catalog = raw._ColumnCatalog(cursor, FakeConnection())
+        widened = catalog.widen([("good_col", "DOUBLE"), ("bad_col", "DOUBLE")])
+
+        self.assertEqual(widened, ["good_col"])
+        self.assertEqual(catalog.get("good_col"), ("good_col", "float"))
+        self.assertEqual(catalog.get("bad_col"), ("bad_col", "int"))
+
 
 class FlushBatchTests(unittest.TestCase):
     def _flush(self, records, cursor=None, catalog=None):
@@ -283,6 +309,26 @@ class FlushBatchTests(unittest.TestCase):
     def test_empty_batch_writes_nothing(self):
         cursor = self._flush([])
         self.assertEqual(cursor.executemany_calls, [])
+
+    def test_non_integer_value_widens_an_existing_int_column_instead_of_nulling_it(self):
+        cursor = FakeCursor(_fixed_show_columns_rows() + [("price", "bigint")])
+        catalog = raw._ColumnCatalog(cursor, FakeConnection())
+        record = raw._build_record(dict(SAMPLE_DOC, price=299.5))
+        self._flush([record], cursor, catalog)
+
+        self.assertIn("MODIFY COLUMN `price` DOUBLE", " ".join(cursor.alters))
+        sql, rows = cursor.executemany_calls[0]
+        columns = [c.strip(" `") for c in sql.split("(", 1)[1].split(") VALUES")[0].split(",")]
+        self.assertEqual(dict(zip(columns, rows[0]))["price"], 299.5)
+
+    def test_whole_number_float_into_int_column_does_not_widen(self):
+        cursor = FakeCursor(_fixed_show_columns_rows() + [("price", "bigint")])
+        catalog = raw._ColumnCatalog(cursor, FakeConnection())
+        record = raw._build_record(dict(SAMPLE_DOC, price=300.0))
+        self._flush([record], cursor, catalog)
+
+        self.assertNotIn("MODIFY COLUMN", " ".join(cursor.alters))
+        self.assertEqual(catalog.get("price"), ("price", "int"))
 
 
 class SyncForBrandTests(unittest.TestCase):
