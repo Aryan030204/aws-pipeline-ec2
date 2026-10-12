@@ -17,7 +17,9 @@ def get_category(src):
     return category
 
 
-test_cases = [
+import unittest
+
+CASES = [
     ("fb", "Meta"),
     ("ig", "Meta"),
     ("facebook_ads", "Meta"),
@@ -35,7 +37,13 @@ test_cases = [
     ("tik_tok", "others"),
 ]
 
-for src, expected in test_cases:
-    actual = get_category(src)
-    status = "PASS" if actual == expected else "FAIL"
-    print(f"{status} Source: '{src}' -> Expected: {expected}, Actual: {actual}")
+
+class UtmMappingTests(unittest.TestCase):
+    def test_categories(self):
+        for src, expected in CASES:
+            with self.subTest(src=src):
+                self.assertEqual(get_category(src), expected)
+
+
+if __name__ == "__main__":
+    unittest.main()
