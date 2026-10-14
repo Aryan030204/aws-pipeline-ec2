@@ -95,6 +95,75 @@ class FetchCandidateRowsTests(unittest.TestCase):
         self.assertEqual(rows, [])
 
 
+class CandidateRowsCacheTests(unittest.TestCase):
+    D = date(2026, 8, 17)
+
+    def _cursor(self):
+        return _FakeCursor([
+            _row("buy_now", "s2", "c2", datetime(2026, 8, 17, 11, 0)),
+            _row("buy_now", "s1", "c1", datetime(2026, 8, 17, 10, 0)),
+        ])
+
+    def test_without_cache_every_call_queries(self):
+        cursor = self._cursor()
+        mes._fetch_candidate_rows(cursor, self.D, self.D, IST, event_type="buy_now")
+        mes._fetch_candidate_rows(cursor, self.D, self.D, IST, event_type="buy_now")
+        self.assertEqual(len(cursor.executed), 2)
+
+    def test_identical_calls_inside_cache_query_once(self):
+        cursor = self._cursor()
+        with mes.candidate_rows_cache():
+            first = mes._fetch_candidate_rows(cursor, self.D, self.D, IST, event_type="buy_now")
+            second = mes._fetch_candidate_rows(cursor, self.D, self.D, IST, event_type="buy_now")
+        self.assertEqual(len(cursor.executed), 1)
+        self.assertEqual(first, second)
+
+    def test_different_event_type_or_window_still_queries(self):
+        cursor = self._cursor()
+        with mes.candidate_rows_cache():
+            mes._fetch_candidate_rows(cursor, self.D, self.D, IST, event_type="buy_now")
+            mes._fetch_candidate_rows(cursor, self.D, self.D, IST, event_type="checkout_initiated")
+            mes._fetch_candidate_rows(cursor, self.D, self.D, IST, event_type=None)
+            mes._fetch_candidate_rows(cursor, self.D, date(2026, 8, 18), IST, event_type="buy_now")
+        self.assertEqual(len(cursor.executed), 4)
+
+    def test_in_place_sort_by_one_caller_does_not_leak_to_the_next(self):
+        cursor = self._cursor()
+        with mes.candidate_rows_cache():
+            first = mes._fetch_candidate_rows(cursor, self.D, self.D, IST, event_type="buy_now")
+            first.sort(key=lambda r: r["createdAt"])
+            second = mes._fetch_candidate_rows(cursor, self.D, self.D, IST, event_type="buy_now")
+        self.assertEqual([r["session_id"] for r in second], ["s2", "s1"])
+
+    def test_cache_is_dropped_when_scope_exits(self):
+        cursor = self._cursor()
+        with mes.candidate_rows_cache():
+            mes._fetch_candidate_rows(cursor, self.D, self.D, IST, event_type="buy_now")
+        mes._fetch_candidate_rows(cursor, self.D, self.D, IST, event_type="buy_now")
+        self.assertEqual(len(cursor.executed), 2)
+
+    def test_incremental_job_sync_functions_fetch_each_event_type_once(self):
+        cursor = self._cursor()
+        conn = _DummyConnection()
+        common = dict(
+            brand_index=0, brand_name="TEST", start_date=self.D, end_date=self.D,
+            cursor=cursor, connection=conn,
+        )
+        with mock.patch.object(mes, "_brand_gate", return_value="shop"), \
+             mock.patch.object(mes.aws_background, "get_brand_timezone", return_value=IST), \
+             mock.patch.object(mes, "_do_upsert_hourly_event_counts"), \
+             mock.patch.object(mes, "_do_upsert_variant_event_counts"), \
+             mock.patch.object(mes, "_upsert_overall_summary_event_totals"), \
+             mes.candidate_rows_cache():
+            mes.sync_checkout_initiated_ci_events_sql(**common)
+            mes.sync_checkout_initiated_variant_events_sql(**common)
+            mes.sync_buy_now_events_sql(**common)
+            mes.sync_buy_now_variant_events_sql(**common)
+            mes.update_overall_summary_event_columns_sql(**common)
+        # Previously 6 queries (checkout_initiated x3, buy_now x3).
+        self.assertEqual(sorted(p[-1] for _, p in cursor.executed), ["buy_now", "checkout_initiated"])
+
+
 class IterCountedPairEventsFromSqlTests(unittest.TestCase):
     """The trickiest logic in this module: a greedy sequential scan, not a
     simple consecutive-row gap check - see the module/plan docstring."""

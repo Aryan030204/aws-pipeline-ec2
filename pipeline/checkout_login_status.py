@@ -25,6 +25,7 @@ from pipeline.mongo_events import (
     _normalize_variant_ids,
 )
 from pipeline.mongo_events_sql import (
+    candidate_rows_cache,
     _fetch_candidate_rows,
     _extract_session_id,
     _extract_cart_token,
@@ -331,7 +332,10 @@ def sync_daily_checkout_login_status(
 
     def _do(c, conn) -> None:
         try:
-            daily_totals, variant_totals = _classify_and_aggregate(c, start_date, end_date, tz)
+            # login rows are requested twice (cart-token set + daily
+            # counts); fetch them from mongo_events_summary once.
+            with candidate_rows_cache():
+                daily_totals, variant_totals = _classify_and_aggregate(c, start_date, end_date, tz)
         except Exception as e:
             logger.error(f"Error fetching checkout login-status data for {brand_name}: {e}")
             return

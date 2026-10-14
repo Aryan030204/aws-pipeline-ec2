@@ -21,8 +21,10 @@ variant-wise-events-summary table helpers) are imported unchanged from
 pipeline.mongo_events, not duplicated.
 """
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
 from pipeline.state import IST, logger
@@ -43,6 +45,30 @@ import aws_background
 
 MONGO_EVENTS_SUMMARY_TABLE = "mongo_events_summary"
 
+# Per-run memo for _fetch_candidate_rows. The sync_* functions below each
+# fetch their own rows (a holdover from the per-metric Mongo queries they
+# replaced), so one brand's rollup run used to re-read the same window of
+# this wide table several times - e.g. checkout_initiated three times in the
+# incremental events job. Inside candidate_rows_cache(), a repeat call with
+# identical arguments reuses the first result instead of hitting MySQL again.
+# The key is the exact query arguments, so results are identical to the
+# uncached path; outside the context manager nothing is cached.
+_candidate_rows_cache: ContextVar[Optional[Dict[Tuple[Any, ...], List[Dict[str, Any]]]]] = ContextVar(
+    "_candidate_rows_cache", default=None
+)
+
+
+@contextmanager
+def candidate_rows_cache() -> Iterator[None]:
+    """Scope one brand's rollup run so repeated identical candidate-row
+    fetches hit MySQL once. Keep the scope to a single run - the cache never
+    sees rows ingested after the first fetch."""
+    token = _candidate_rows_cache.set({})
+    try:
+        yield
+    finally:
+        _candidate_rows_cache.reset(token)
+
 
 def _fetch_candidate_rows(
     cursor,
@@ -60,6 +86,12 @@ def _fetch_candidate_rows(
     "event_type". event_type=None fetches every event type in the window
     (used by the variant-wise-events path, which dedupes per type itself).
     """
+    cache = _candidate_rows_cache.get()
+    cache_key = (id(cursor), start_date, end_date, tz, event_type)
+    if cache is not None and cache_key in cache:
+        # Fresh list each time: callers sort it in place.
+        return list(cache[cache_key])
+
     start_utc, end_utc = _ist_date_range_to_utc_bounds(start_date, end_date, tz)
     where = ["created_at_utc >= %s", "created_at_utc < %s"]
     params: List[Any] = [start_utc.replace(tzinfo=None), end_utc.replace(tzinfo=None)]
@@ -98,6 +130,9 @@ def _fetch_candidate_rows(
                 "createdAt": created_at.replace(tzinfo=None),  # naive UTC, matches Mongo's tz_aware=True->UTC
             }
         )
+    if cache is not None:
+        cache[cache_key] = mapped
+        return list(mapped)
     return mapped
 
 
