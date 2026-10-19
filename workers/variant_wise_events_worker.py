@@ -23,6 +23,8 @@ Business logic (dedup rule, dynamic column discovery) is not duplicated here.
 import logging
 import os
 import sys
+import tempfile
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from typing import List, Optional
 from zoneinfo import ZoneInfo
@@ -49,6 +51,43 @@ if PROJECT_ROOT not in sys.path:
 
 import aws_background
 
+LOCK_PATH = os.environ.get(
+    "VARIANT_WISE_LOCK_PATH",
+    os.path.join(tempfile.gettempdir(), "variant_wise_events_worker.lock"),
+)
+
+
+@contextmanager
+def _single_instance_lock(path: Optional[str] = None):
+    """Non-blocking exclusive OS file lock; yields True if acquired, False if
+    another process already holds it. The kernel drops the lock if the process
+    dies, so a crash can't leave it stuck."""
+    handle = open(path or LOCK_PATH, "a+")
+    try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    finally:
+        handle.close()
+
 
 def compute_rebuild_dates(tz: ZoneInfo, current_dt: Optional[datetime] = None) -> List[date]:
     """
@@ -62,6 +101,17 @@ def compute_rebuild_dates(tz: ZoneInfo, current_dt: Optional[datetime] = None) -
 
 
 def run_worker(current_dt: Optional[datetime] = None) -> None:
+    with _single_instance_lock() as acquired:
+        if not acquired:
+            logger.warning(
+                "Variant-wise events worker already running (lock %s held); exiting without scanning.",
+                LOCK_PATH,
+            )
+            return
+        _run_rebuild(current_dt)
+
+
+def _run_rebuild(current_dt: Optional[datetime] = None) -> None:
     aws_background.initialize_brand_configs()
 
     if not aws_background.active_brand_indices:
@@ -106,32 +156,28 @@ def run_worker(current_dt: Optional[datetime] = None) -> None:
 
 def _run_scheduled() -> None:
     """
-    Long-running mode for the standalone container: schedules run_worker
-    every 30 minutes, plus one immediate run at startup (same pattern
-    workers/intent_events_worker.py uses) so a container restart doesn't
-    wait up to 30 minutes for fresh data. Set
+    Long-running mode for the standalone container: runs run_worker once a
+    day at 00:15 IST (the window it rebuilds is the two closed days D-2..D-1,
+    so more frequent runs only re-scan identical data). No run at startup, so
+    a container restart can't trigger the full-table scan. Set
     VARIANT_WISE_EVENTS_WORKER_SELF_RUN=false to instead run once and exit
     (e.g. for a one-off/manual invocation).
     """
     from apscheduler.schedulers.blocking import BlockingScheduler
 
-    logger.info("Running variant-wise events worker once immediately on startup")
-    try:
-        run_worker()
-    except Exception as e:
-        logger.error("Error in immediate startup run of variant-wise events worker: %s", e)
-
-    scheduler = BlockingScheduler(timezone="UTC")
+    scheduler = BlockingScheduler(timezone="Asia/Kolkata")
     scheduler.add_job(
         run_worker,
-        trigger="interval",
-        minutes=30,
+        trigger="cron",
+        hour=0,
+        minute=15,
+        timezone="Asia/Kolkata",
         id="variant_wise_events_worker_job",
         coalesce=True,
         max_instances=1,
-        misfire_grace_time=1800,
+        misfire_grace_time=6 * 3600,
     )
-    logger.info("Variant-wise events worker scheduler started (every 30 minutes)")
+    logger.info("Variant-wise events worker scheduler started (daily at 00:15 IST)")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):

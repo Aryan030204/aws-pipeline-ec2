@@ -760,6 +760,15 @@ def _build_db_config(
         "connection_timeout": int(os.environ.get("DB_CONNECT_TIMEOUT_S", "10")),
         "read_timeout": int(os.environ.get("DB_READ_TIMEOUT_S", "120")),
         "write_timeout": int(os.environ.get("DB_WRITE_TIMEOUT_S", "120")),
+        # mysql-connector's default C extension (_mysql_connector) has a known
+        # thread-safety bug opening concurrent SSL connections: it can crash
+        # the whole process natively (no Python traceback, no exception to
+        # catch - the process just exits) when multiple brand worker threads
+        # each open a fresh SSL connection at nearly the same time. The pure-
+        # Python implementation doesn't share that bug; it's slightly slower
+        # per-connection but connections are pooled/reused, so this only costs
+        # a bit on first connect per brand.
+        "use_pure": True,
     }
 
     effective_ca_path = ca_path
@@ -808,6 +817,10 @@ def _create_sqlalchemy_engine_for_brand(
         "connection_timeout": db_config.get("connection_timeout", 10),
         "read_timeout": db_config.get("read_timeout", 120),
         "write_timeout": db_config.get("write_timeout", 120),
+        # Same C-extension thread-safety issue as BrandConnectionPool's raw
+        # mysql.connector connections (see _build_db_config) - this engine is
+        # also the mysqlconnector dialect, so it needs the same fix.
+        "use_pure": True,
     }
     for key in ("ssl_ca", "ssl_verify_cert", "ssl_verify_identity"):
         if key in db_config:

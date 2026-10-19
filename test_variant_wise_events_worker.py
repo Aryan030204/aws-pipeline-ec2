@@ -42,35 +42,77 @@ class VariantWiseEventsWorkerTests(unittest.TestCase):
         self.assertIn("variant-wise-events-worker:", content)
         self.assertIn("Dockerfile.variant-wise-events-worker", content)
 
-    def test_scheduled_mode_uses_a_30_minute_interval(self):
-        source = inspect.getsource(worker._run_scheduled)
-        self.assertIn('trigger="interval"', source)
-        self.assertIn("minutes=30", source)
-        self.assertNotIn('trigger="cron"', source)
-
-    def test_scheduled_mode_runs_once_immediately_before_starting_scheduler(self):
+    def test_scheduled_mode_is_one_daily_cron_run_in_ist_with_no_startup_run(self):
         from unittest import mock
 
-        call_order = []
-
-        def fake_run_worker():
-            call_order.append("run_worker")
-
         fake_scheduler = mock.Mock()
-        fake_scheduler.start.side_effect = lambda: call_order.append("scheduler.start")
-
-        with mock.patch.object(worker, "run_worker", side_effect=fake_run_worker), \
+        with mock.patch.object(worker, "run_worker") as run_worker, \
              mock.patch(
                  "apscheduler.schedulers.blocking.BlockingScheduler",
                  return_value=fake_scheduler,
              ):
             worker._run_scheduled()
 
-        self.assertEqual(call_order, ["run_worker", "scheduler.start"])
+        run_worker.assert_not_called()
+        fake_scheduler.add_job.assert_called_once()
+        kwargs = fake_scheduler.add_job.call_args.kwargs
+        self.assertEqual(kwargs["trigger"], "cron")
+        self.assertEqual((kwargs["hour"], kwargs["minute"]), (0, 15))
+        self.assertEqual(kwargs["timezone"], "Asia/Kolkata")
+        self.assertEqual(kwargs["max_instances"], 1)
+        self.assertNotIn("minutes", kwargs)
+        fake_scheduler.start.assert_called_once()
 
     def test_self_run_env_var_toggle_is_present(self):
         source = inspect.getsource(worker)
         self.assertIn("VARIANT_WISE_EVENTS_WORKER_SELF_RUN", source)
+
+
+class SingleInstanceLockTests(unittest.TestCase):
+    def setUp(self):
+        import os
+        import tempfile
+
+        fd, self.lock_path = tempfile.mkstemp(suffix=".lock")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(self.lock_path) and os.remove(self.lock_path))
+
+    def test_lock_held_means_rebuild_is_skipped(self):
+        from unittest import mock
+
+        with mock.patch.object(worker, "LOCK_PATH", self.lock_path), \
+             mock.patch.object(worker, "_run_rebuild") as rebuild:
+            with worker._single_instance_lock(self.lock_path) as holder:
+                self.assertTrue(holder)
+                worker.run_worker()  # second acquirer: must return without scanning
+
+        rebuild.assert_not_called()
+
+    def test_lock_is_released_after_normal_completion(self):
+        from unittest import mock
+
+        with mock.patch.object(worker, "LOCK_PATH", self.lock_path), \
+             mock.patch.object(worker, "_run_rebuild") as rebuild:
+            worker.run_worker()
+            rebuild.assert_called_once()
+            with worker._single_instance_lock(self.lock_path) as reacquired:
+                self.assertTrue(reacquired)
+
+    def test_lock_is_released_after_exception(self):
+        from unittest import mock
+
+        with mock.patch.object(worker, "LOCK_PATH", self.lock_path), \
+             mock.patch.object(worker, "_run_rebuild", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                worker.run_worker()
+            with worker._single_instance_lock(self.lock_path) as reacquired:
+                self.assertTrue(reacquired)
+
+    def test_second_acquirer_does_not_wait(self):
+        with worker._single_instance_lock(self.lock_path) as first:
+            self.assertTrue(first)
+            with worker._single_instance_lock(self.lock_path) as second:
+                self.assertFalse(second)
 
 
 if __name__ == "__main__":
