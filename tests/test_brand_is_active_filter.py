@@ -17,7 +17,7 @@ import aws_background
 import sqlalchemy
 
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parent.parent
 AWS_DATA_UPDATE_PATH = REPO_ROOT / "backfill scripts" / "aws_data_update.py"
 
 

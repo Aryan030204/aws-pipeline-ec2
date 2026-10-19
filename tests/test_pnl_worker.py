@@ -233,7 +233,7 @@ class TableOwnershipTests(unittest.TestCase):
             self.assertIsNone(re.search(rf"\b{verb}\b", src, re.IGNORECASE), f"worker contains {verb}")
 
     def test_migration_creates_overall_pnl_if_not_exists(self):
-        migration_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migrations", "003_overall_pnl.sql")
+        migration_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "migrations", "003_overall_pnl.sql")
         with open(migration_path) as fh:
             sql = fh.read()
         self.assertIn("CREATE TABLE IF NOT EXISTS `overall_pnl`", sql)
@@ -243,7 +243,7 @@ class TableOwnershipTests(unittest.TestCase):
 
     def test_rollup_migration_creates_both_spend_tables(self):
         migration_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "migrations", "004_pnl_ad_spend_rollups.sql"
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "migrations", "004_pnl_ad_spend_rollups.sql"
         )
         with open(migration_path) as fh:
             sql = fh.read()
