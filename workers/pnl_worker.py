@@ -1140,6 +1140,14 @@ def rebuild_brand_pnl(
         # when the P&L rows below read them. Only runs for channels the
         # brand has credentials for; failures are logged and skipped.
         outcomes = sync_ad_spend(cursor, connection, brand_key, brand_name, credentials, target_dates)
+        # Campaign / ad / product breakdown for the dashboard's Ads page,
+        # same credentials and dates (workers/ads_performance.py). Never
+        # raises; doesn't feed overall_pnl.
+        from workers import ads_performance
+
+        ads_outcomes = ads_performance.sync_ads_performance(
+            cursor, connection, brand_key, brand_name, credentials, target_dates
+        )
 
         # Reads: the source tables are only ever SELECTed here.
         sales_rows = fetch_sales_rows(cursor, start, end)
@@ -1164,6 +1172,7 @@ def rebuild_brand_pnl(
         written = upsert_pnl_rows(cursor, connection, rows)
 
     logger.info("[%s] ad spend sync: %s", brand_name, ", ".join(f"{k}={v}" for k, v in outcomes.items()))
+    logger.info("[%s] ads performance sync: %s", brand_name, ", ".join(f"{k}={v}" for k, v in ads_outcomes.items()))
     for row in rows:
         logger.info(
             "[%s] %s gross=%s cancel=%s net=%s cogs=%s meta=%s%s google=%s%s ebitda=%s costs=%s",
