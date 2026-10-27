@@ -121,6 +121,42 @@ class ExecutePipelineRunBackfillFilterTests(unittest.TestCase):
         submitted_indices = [call.args[1] for call in fake_executor.submit.call_args_list]
         self.assertEqual(submitted_indices, [2])
 
+    def test_backfill_mode_runs_preflight_migrations_only_for_backfill_brands_before_workers(self):
+        order = []
+        with mock.patch.object(aws_background, "BACKFILL_MODE", True), \
+             mock.patch.object(aws_background, "BACKFILL_BRAND_INDICES", {2}), \
+             mock.patch.object(
+                 orchestration,
+                 "run_brand_preflight_schema_migrations",
+                 side_effect=lambda idx: order.append(("preflight", idx)),
+             ) as preflight, \
+             mock.patch.object(orchestration, "ThreadPoolExecutor") as executor_cls, \
+             mock.patch.object(orchestration, "trigger_cache_pipeline"), \
+             mock.patch.object(orchestration, "trigger_utm_pipeline"):
+            fake_executor = mock.MagicMock()
+            fake_executor.__enter__.return_value = fake_executor
+            fake_executor.submit.side_effect = lambda fn, idx, *a, **k: order.append(("worker", idx)) or mock.Mock()
+            executor_cls.return_value = fake_executor
+
+            with mock.patch.object(orchestration, "as_completed", return_value=[]):
+                orchestration._execute_pipeline_run([1, 2, 3], run_id=None)
+
+        preflight.assert_called_once_with(2)
+        self.assertEqual(order, [("preflight", 2), ("worker", 2)])
+
+    def test_backfill_preflight_failure_stops_the_backfill(self):
+        with mock.patch.object(aws_background, "BACKFILL_MODE", True), \
+             mock.patch.object(aws_background, "BACKFILL_BRAND_INDICES", {2}), \
+             mock.patch.object(
+                 orchestration, "run_brand_preflight_schema_migrations", side_effect=RuntimeError("ddl failed")
+             ), \
+             mock.patch.object(orchestration, "ThreadPoolExecutor") as executor_cls, \
+             mock.patch.object(orchestration, "trigger_cache_pipeline"), \
+             mock.patch.object(orchestration, "trigger_utm_pipeline"):
+            orchestration._execute_pipeline_run([1, 2], run_id=None)  # failure is logged, not raised
+
+        executor_cls.assert_not_called()  # no brand worker started
+
     def test_no_backfill_mode_runs_every_target_index(self):
         with mock.patch.object(aws_background, "BACKFILL_MODE", False), \
              mock.patch.object(orchestration, "run_brand_preflight_schema_migrations"), \

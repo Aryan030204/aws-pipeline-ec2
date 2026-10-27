@@ -655,12 +655,12 @@ def update_hour_wise_sales_incremental(
     with timed(
         f"[{brand_name}] hour_wise_sales incremental ({len(params)} date(s))"
     ):
-        # STEP 1: Create staging table
-        cursor.execute(
-            "CREATE TABLE IF NOT EXISTS hour_wise_sales_stage LIKE hour_wise_sales"
-        )
-        # STEP 2: Clear staging table
-        cursor.execute("TRUNCATE TABLE hour_wise_sales_stage")
+        # STEP 1-2: Recreate the staging table from the current hour_wise_sales
+        # layout every run (same pattern as sales_summary/order_summary).
+        # CREATE IF NOT EXISTS + TRUNCATE kept a stale layout forever once the
+        # real table gained columns, failing with "Unknown column".
+        cursor.execute("DROP TABLE IF EXISTS hour_wise_sales_stage")
+        cursor.execute("CREATE TABLE hour_wise_sales_stage LIKE hour_wise_sales")
 
         # STEP 3: Populate staging table
         sql = f"""

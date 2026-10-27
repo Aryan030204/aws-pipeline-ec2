@@ -808,18 +808,21 @@ def _execute_pipeline_run(target_indices: List[int], run_id: Optional[str] = Non
             logger.warning("No active brands match the current filters. Nothing to do.")
             return
 
-        if aws_background.BACKFILL_MODE:
-            logger.info("⏭️ Skipping preflight schema migrations: backfill mode is active.")
-        else:
-            logger.info("🧱 Running serial preflight schema migrations before brand workers...")
-            for idx in target_indices:
-                try:
-                    run_brand_preflight_schema_migrations(idx)
-                except Exception as e:
-                    brand_name = os.environ.get(f"BRAND_NAME_{idx}", f"Brand_{idx}")
-                    logger.error(f"❌ Preflight schema migration failed for {brand_name}: {e}")
-                    traceback.print_exc()
-                    raise
+        # Also runs in backfill mode: a brand reactivated after a long time
+        # can still have old table layouts, and the backfill's first write
+        # would otherwise fail with "Unknown column". The checks are
+        # idempotent (SHOW COLUMNS, ALTER only what is missing), and in
+        # backfill mode target_indices is already filtered to the backfill
+        # brands, so only those brands are checked.
+        logger.info("🧱 Running serial preflight schema migrations before brand workers...")
+        for idx in target_indices:
+            try:
+                run_brand_preflight_schema_migrations(idx)
+            except Exception as e:
+                brand_name = os.environ.get(f"BRAND_NAME_{idx}", f"Brand_{idx}")
+                logger.error(f"❌ Preflight schema migration failed for {brand_name}: {e}")
+                traceback.print_exc()
+                raise
 
         # Cap per-run concurrency to protect RDS I/O. The per-brand pipeline is
         # heavy (multi-table JOINs, summary rebuilds, session upserts); running
