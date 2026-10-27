@@ -57,7 +57,7 @@ class VariantWiseEventsWorkerTests(unittest.TestCase):
         fake_scheduler.add_job.assert_called_once()
         kwargs = fake_scheduler.add_job.call_args.kwargs
         self.assertEqual(kwargs["trigger"], "cron")
-        self.assertEqual((kwargs["hour"], kwargs["minute"]), (0, 15))
+        self.assertEqual((kwargs["hour"], kwargs["minute"]), (0, 17))
         self.assertEqual(kwargs["timezone"], "Asia/Kolkata")
         self.assertEqual(kwargs["max_instances"], 1)
         self.assertNotIn("minutes", kwargs)

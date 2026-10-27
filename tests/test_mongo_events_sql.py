@@ -1,7 +1,7 @@
 import sys
 import types
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -249,3 +249,85 @@ class PublicSyncFunctionsSkipNonCiEventsBrandsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _ChunkedCursor:
+    """Like a mysql cursor that supports fetchmany; records how it was read."""
+
+    def __init__(self, rows):
+        self.rows = list(rows)
+        self.pos = 0
+        self.fetchmany_sizes = []
+        self.fetchall_called = False
+        self.executed = []
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+
+    def fetchmany(self, size):
+        self.fetchmany_sizes.append(size)
+        chunk = self.rows[self.pos:self.pos + size]
+        self.pos += size
+        return chunk
+
+    def fetchall(self):
+        self.fetchall_called = True
+        return self.rows
+
+
+class StreamedFetchTests(unittest.TestCase):
+    def _rows(self, n):
+        base = datetime(2026, 8, 17, 10, 0, tzinfo=timezone.utc)
+        return [
+            ("buy_now", f"s{i % 40}", f"c{i % 40}", f"v{i % 3}", (base + timedelta(minutes=i % 600)).replace(tzinfo=None))
+            for i in range(n)
+        ]
+
+    def test_rows_are_read_in_chunks_not_with_fetchall(self):
+        cursor = _ChunkedCursor(self._rows(12000))
+        with mock.patch.object(mes, "CANDIDATE_FETCH_CHUNK", 5000):
+            streamed = list(mes._fetch_candidate_rows(cursor, date(2026, 8, 17), date(2026, 8, 17), IST, stream=True))
+
+        self.assertEqual(len(streamed), 12000)
+        self.assertFalse(cursor.fetchall_called)
+        self.assertEqual(cursor.fetchmany_sizes, [5000, 5000, 5000, 5000])  # last call returns the empty page
+
+    def test_default_call_still_returns_a_list(self):
+        cursor = _ChunkedCursor(self._rows(10))
+        rows = mes._fetch_candidate_rows(cursor, date(2026, 8, 17), date(2026, 8, 17), IST)
+        self.assertIsInstance(rows, list)
+        self.assertEqual(len(rows), 10)
+
+    def test_cursor_without_fetchmany_falls_back_to_fetchall(self):
+        cursor = _FakeCursor(self._rows(7))
+        rows = list(mes._fetch_candidate_rows(cursor, date(2026, 8, 17), date(2026, 8, 17), IST, stream=True))
+        self.assertEqual(len(rows), 7)
+
+    def test_pair_dedup_matches_the_previous_algorithm(self):
+        rows = self._rows(3000)
+        cursor = _ChunkedCursor(rows)
+        got = mes._iter_unique_daily_pair_events_from_sql(cursor, date(2026, 8, 17), date(2026, 8, 17), "buy_now", IST)
+
+        # oracle: the old "collect every event per pair, keep pairs seen once" rule
+        pairs = {}
+        for event_type, session_id, cart_token, variant, created in rows:
+            local_date = created.replace(tzinfo=timezone.utc).astimezone(IST).date()
+            if local_date != date(2026, 8, 17):
+                continue
+            pairs.setdefault((local_date, session_id, cart_token), []).append(variant)
+        expected = sorted((k[0], tuple(v)) for k, v in pairs.items() if len(v) == 1)
+
+        self.assertEqual(sorted((e["date"], tuple(e["variant_ids"])) for e in got), [(d, tuple(mes._normalize_variant_ids(v[0]))) for d, v in expected])
+
+    def test_all_types_dedup_counts_a_pair_once_per_event_type(self):
+        base = datetime(2026, 8, 17, 10, 0)
+        rows = [
+            ("buy_now", "s1", "c1", "v1", base),
+            ("login", "s1", "c1", "v1", base),
+            ("buy_now", "s2", "c2", "v1", base),
+            ("buy_now", "s2", "c2", "v1", base + timedelta(minutes=1)),  # repeat -> dropped
+        ]
+        got = mes._iter_unique_daily_pair_events_all_types_from_sql(
+            _ChunkedCursor(rows), date(2026, 8, 17), date(2026, 8, 17), IST
+        )
+        self.assertEqual(sorted(e["event_column"] for e in got), ["buy_now_count", "login_count"])

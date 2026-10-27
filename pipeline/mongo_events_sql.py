@@ -22,7 +22,7 @@ pipeline.mongo_events, not duplicated.
 """
 
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
 from pipeline.state import IST, logger
@@ -44,12 +44,34 @@ import aws_background
 MONGO_EVENTS_SUMMARY_TABLE = "mongo_events_summary"
 
 
+# Rows are pulled from MySQL in chunks of this size instead of one fetchall(), so a busy brand/day
+# is not copied into Python in full (one list of raw rows + one list of mapped dicts) at once.
+CANDIDATE_FETCH_CHUNK = 5000
+
+
+def _iter_candidate_rows(
+    cursor,
+    start_date: date,
+    end_date: date,
+    tz: ZoneInfo,
+    event_type: Optional[str] = None,
+) -> Iterator[Dict[str, Any]]:
+    """Streaming version of _fetch_candidate_rows: yields one mapped row at a time.
+    The query must be fully consumed before the cursor is reused."""
+    rows = _stream_cursor_rows(cursor, start_date, end_date, tz, event_type)
+    for row in rows:
+        mapped = _map_candidate_row(row)
+        if mapped is not None:
+            yield mapped
+
+
 def _fetch_candidate_rows(
     cursor,
     start_date: date,
     end_date: date,
     tz: ZoneInfo,
     event_type: Optional[str] = None,
+    stream: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Pulls candidate rows from this brand's own mongo_events_summary table
@@ -60,6 +82,13 @@ def _fetch_candidate_rows(
     "event_type". event_type=None fetches every event type in the window
     (used by the variant-wise-events path, which dedupes per type itself).
     """
+    rows = _iter_candidate_rows(cursor, start_date, end_date, tz, event_type)
+    # stream=True hands back the generator (rows read in chunks, consumed once); the default keeps the
+    # list that callers which sort or re-iterate rely on.
+    return rows if stream else list(rows)
+
+
+def _stream_cursor_rows(cursor, start_date: date, end_date: date, tz: ZoneInfo, event_type: Optional[str]):
     start_utc, end_utc = _ist_date_range_to_utc_bounds(start_date, end_date, tz)
     where = ["created_at_utc >= %s", "created_at_utc < %s"]
     params: List[Any] = [start_utc.replace(tzinfo=None), end_utc.replace(tzinfo=None)]
@@ -75,30 +104,35 @@ def _fetch_candidate_rows(
         """,
         tuple(params),
     )
-    rows = cursor.fetchall() or []
+    fetchmany = getattr(cursor, "fetchmany", None)
+    if not callable(fetchmany):
+        yield from (cursor.fetchall() or [])
+        return
+    while True:
+        chunk = fetchmany(CANDIDATE_FETCH_CHUNK)
+        if not chunk:
+            return
+        yield from chunk
 
-    mapped: List[Dict[str, Any]] = []
-    for row in rows:
-        if isinstance(row, dict):
-            event_type_val = row.get("event_type")
-            session_id = row.get("session_id")
-            cart_token = row.get("cart_token")
-            variant_id = row.get("variantId")
-            created_at = row.get("created_at_utc")
-        else:
-            event_type_val, session_id, cart_token, variant_id, created_at = row
-        if not isinstance(created_at, datetime):
-            continue
-        mapped.append(
-            {
-                "event_type": event_type_val,
-                "session_id": session_id,
-                "cart_token": cart_token,
-                "variantId": variant_id,
-                "createdAt": created_at.replace(tzinfo=None),  # naive UTC, matches Mongo's tz_aware=True->UTC
-            }
-        )
-    return mapped
+
+def _map_candidate_row(row) -> Optional[Dict[str, Any]]:
+    if isinstance(row, dict):
+        event_type_val = row.get("event_type")
+        session_id = row.get("session_id")
+        cart_token = row.get("cart_token")
+        variant_id = row.get("variantId")
+        created_at = row.get("created_at_utc")
+    else:
+        event_type_val, session_id, cart_token, variant_id, created_at = row
+    if not isinstance(created_at, datetime):
+        return None
+    return {
+        "event_type": event_type_val,
+        "session_id": session_id,
+        "cart_token": cart_token,
+        "variantId": variant_id,
+        "createdAt": created_at.replace(tzinfo=None),  # naive UTC, matches Mongo's tz_aware=True->UTC
+    }
 
 
 def _ist_date_range_to_utc_bounds(
@@ -192,10 +226,11 @@ def _iter_unique_daily_pair_events_from_sql(
     a (date, session_id, cart_token) pair counts only if it occurs exactly
     once in the window - two or more occurrences drop the whole pair.
     """
-    rows = _fetch_candidate_rows(cursor, start_date, end_date, tz, event_type=event_type)
-
-    pair_events: Dict[Tuple[date, str, str], List[Dict[str, Any]]] = {}
-    for doc in rows:
+    # Streamed: for each pair only its first event is kept, and None marks "seen more than once"
+    # (the pair is then dropped). Same result as collecting every event per pair, with one small
+    # dict per distinct pair instead of every row.
+    pair_events: Dict[Tuple[date, str, str], Optional[Dict[str, Any]]] = {}
+    for doc in _fetch_candidate_rows(cursor, start_date, end_date, tz, event_type=event_type, stream=True):
         session_id = _extract_session_id(doc)
         cart_token = _extract_cart_token(doc)
         if not session_id or not cart_token:
@@ -207,15 +242,12 @@ def _iter_unique_daily_pair_events_from_sql(
             continue
 
         pair_key = (local_date, session_id, cart_token)
-        pair_events.setdefault(pair_key, []).append(
-            {"date": local_date, "variant_ids": _normalize_variant_ids(doc.get("variantId"))}
-        )
+        if pair_key in pair_events:
+            pair_events[pair_key] = None
+        else:
+            pair_events[pair_key] = {"date": local_date, "variant_ids": _normalize_variant_ids(doc.get("variantId"))}
 
-    unique_events: List[Dict[str, Any]] = []
-    for events in pair_events.values():
-        if len(events) == 1:
-            unique_events.append(events[0])
-    return unique_events
+    return [event for event in pair_events.values() if event is not None]
 
 
 def _iter_unique_daily_pair_events_all_types_from_sql(
@@ -230,10 +262,9 @@ def _iter_unique_daily_pair_events_all_types_from_sql(
     pass (the dedup key includes the sanitized event type, so each type is
     still deduped independently).
     """
-    rows = _fetch_candidate_rows(cursor, start_date, end_date, tz, event_type=None)
-
-    pair_events: Dict[Tuple[date, str, str, str], List[Dict[str, Any]]] = {}
-    for doc in rows:
+    # Streamed, one small event kept per distinct pair (None = seen more than once, so dropped).
+    pair_events: Dict[Tuple[date, str, str, str], Optional[Dict[str, Any]]] = {}
+    for doc in _fetch_candidate_rows(cursor, start_date, end_date, tz, event_type=None, stream=True):
         session_id = _extract_session_id(doc)
         cart_token = _extract_cart_token(doc)
         event_column = _sanitize_event_type_column(doc.get("event_type"))
@@ -246,19 +277,16 @@ def _iter_unique_daily_pair_events_all_types_from_sql(
             continue
 
         pair_key = (local_date, session_id, cart_token, event_column)
-        pair_events.setdefault(pair_key, []).append(
-            {
+        if pair_key in pair_events:
+            pair_events[pair_key] = None
+        else:
+            pair_events[pair_key] = {
                 "date": local_date,
                 "event_column": event_column,
                 "variant_ids": _normalize_variant_ids(doc.get("variantId")),
             }
-        )
 
-    unique_events: List[Dict[str, Any]] = []
-    for events in pair_events.values():
-        if len(events) == 1:
-            unique_events.append(events[0])
-    return unique_events
+    return [event for event in pair_events.values() if event is not None]
 
 
 def _fetch_daily_unique_pair_event_counts_from_sql(

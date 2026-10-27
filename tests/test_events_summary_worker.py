@@ -201,18 +201,26 @@ class EventsSummaryWorkerTests(unittest.TestCase):
         self.assertIn("events-summary-worker:", content)
         self.assertIn("Dockerfile.events-worker", content)
 
-    def test_scheduled_mode_uses_same_cron_as_former_github_actions_workflow(self):
-        # Former GitHub Actions schedule was cron: '30 18 * * *' (UTC) == 00:00 IST.
-        # The container replicates this via APScheduler; assert the job is wired
-        # with the same hour/minute/timezone rather than re-parsing source text.
-        import inspect
+    def test_master_job_is_scheduled_daily_at_0003_ist(self):
+        # The former GitHub Actions cron was '30 18 * * *' (UTC) == 00:00 IST. It now runs 3 minutes later
+        # (18:33 UTC == 00:03 IST) so it does not start together with the ETL's :00 tick and the
+        # other midnight jobs. Assert the wiring on a scheduler double.
+        from unittest import mock
 
-        source = inspect.getsource(worker._run_scheduled)
-        self.assertIn('hour=18', source)
-        self.assertIn('minute=30', source)
-        self.assertIn('timezone="UTC"', source)
+        fake_scheduler = mock.Mock()
+        with mock.patch("apscheduler.schedulers.blocking.BlockingScheduler", return_value=fake_scheduler):
+            worker._run_scheduled()
 
-    def test_scheduled_mode_runs_master_summary_once_immediately_before_starting_scheduler(self):
+        master_call = next(
+            c for c in fake_scheduler.add_job.call_args_list if c.kwargs.get("id") == "events_summary_worker_job"
+        )
+        self.assertEqual(master_call.args[0], worker._run_master_events_summary)
+        self.assertEqual(master_call.kwargs["trigger"], "cron")
+        self.assertEqual((master_call.kwargs["hour"], master_call.kwargs["minute"]), (18, 33))
+        self.assertEqual(master_call.kwargs["timezone"], "UTC")
+        self.assertEqual(master_call.kwargs["max_instances"], 1)
+
+    def test_startup_does_not_run_the_master_job_or_any_work_inline(self):
         from unittest import mock
 
         fake_scheduler = mock.Mock()
@@ -222,9 +230,28 @@ class EventsSummaryWorkerTests(unittest.TestCase):
              mock.patch.object(worker, "run_incremental_events_job") as incremental:
             worker._run_scheduled()
 
-        master.assert_called_once_with()
-        incremental.assert_called_once_with()
+        master.assert_not_called()
+        incremental.assert_not_called()
         fake_scheduler.start.assert_called_once()
+
+    def test_incremental_first_run_is_delayed_and_shares_one_job_id(self):
+        from datetime import timedelta
+        from unittest import mock
+
+        fake_scheduler = mock.Mock()
+        before = datetime.now(timezone.utc)
+        with mock.patch(
+            "apscheduler.schedulers.blocking.BlockingScheduler", return_value=fake_scheduler
+        ), mock.patch.object(worker, "EVENTS_WORKER_STARTUP_DELAY_S", 90):
+            worker._run_scheduled()
+
+        calls = [c for c in fake_scheduler.add_job.call_args_list if c.kwargs.get("id") == "incremental_events_job"]
+        self.assertEqual(len(calls), 1, "one job id => the delayed first run can never overlap the 15-minute runs")
+        kwargs = calls[0].kwargs
+        self.assertEqual(kwargs["trigger"], "interval")
+        self.assertEqual(kwargs["minutes"], 15)
+        self.assertEqual(kwargs["max_instances"], 1)
+        self.assertGreaterEqual(kwargs["next_run_time"], before + timedelta(seconds=89))
 
 
 class _FakeDbCursorCtx:
@@ -372,3 +399,153 @@ class RawEventsPhaseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _reference_aggregate(docs, target_dates, tz):
+    """The previous implementation (keeps every document per pair key), used as the oracle."""
+    from collections import defaultdict as dd
+
+    aggregated = dd(lambda: dd(int))
+    event_columns = set()
+    pair_docs = dd(list)
+    for doc in docs:
+        created_at = doc.get("createdAt")
+        if not isinstance(created_at, datetime):
+            continue
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        local_date = created_at.astimezone(tz).date()
+        if local_date not in target_dates:
+            continue
+        shop_name = str(doc.get("shop_name") or "").strip()
+        if not shop_name:
+            continue
+        column_name = worker.sanitize_event_type(doc.get("event_type"))
+        if not column_name:
+            continue
+        session_id = worker._extract_session_id(doc)
+        cart_token = worker._extract_cart_token(doc)
+        if not session_id or not cart_token:
+            continue
+        pair_docs[(local_date, shop_name, column_name, session_id, cart_token)].append(doc)
+    for (local_date, shop_name, column_name, _s, _c), matched in pair_docs.items():
+        if len(matched) != 1:
+            continue
+        event_columns.add(column_name)
+        aggregated[(local_date, shop_name)][column_name] += 1
+    return aggregated, event_columns
+
+
+class StreamingAggregationTests(unittest.TestCase):
+    def _random_docs(self, n, seed=7):
+        import random
+        from datetime import timedelta
+
+        rnd = random.Random(seed)
+        base = datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc)
+        shops = ["tmc", "shyle", " bbb ", "", None]
+        events = ["Checkout Initiated", "login", "add to cart", "", "ATC!!"]
+        docs = []
+        for _ in range(n):
+            doc = {
+                "createdAt": base + timedelta(minutes=rnd.randint(0, 3 * 24 * 60)),
+                "event_type": rnd.choice(events),
+                "shop_name": rnd.choice(shops),
+                "session_id": rnd.choice(["s1", "s2", "s3", "", None] + [f"s{i}" for i in range(40)]),
+                "cart_token": rnd.choice(["c1", "c2", "", None] + [f"c{i}" for i in range(40)]),
+            }
+            if rnd.random() < 0.02:
+                doc["createdAt"] = "not-a-date"
+            elif rnd.random() < 0.05:
+                doc["createdAt"] = doc["createdAt"].replace(tzinfo=None)
+            docs.append(doc)
+        return docs
+
+    def test_streaming_result_matches_previous_implementation(self):
+        docs = self._random_docs(6000)
+        targets = {date(2026, 8, 17), date(2026, 8, 18)}
+        expected, expected_cols = _reference_aggregate(docs, targets, worker.IST)
+
+        stats = {}
+        got, got_cols = worker.aggregate_event_documents(iter(docs), targets, tz=worker.IST, stats=stats)
+
+        self.assertEqual(got_cols, expected_cols)
+        self.assertEqual({k: dict(v) for k, v in got.items()}, {k: dict(v) for k, v in expected.items()})
+        self.assertEqual(stats["docs"], len(docs))
+
+    def test_per_day_processing_equals_one_pass(self):
+        docs = self._random_docs(4000, seed=11)
+        days = [date(2026, 8, 17), date(2026, 8, 18)]
+        one_pass, one_cols = worker.aggregate_event_documents(docs, set(days), tz=worker.IST)
+
+        merged, cols = {}, set()
+        for day in days:
+            part, part_cols = worker.aggregate_event_documents(iter(docs), {day}, tz=worker.IST)
+            merged.update(part)
+            cols |= part_cols
+
+        self.assertEqual(cols, one_cols)
+        self.assertEqual({k: dict(v) for k, v in merged.items()}, {k: dict(v) for k, v in one_pass.items()})
+
+    def test_documents_are_consumed_one_at_a_time_and_not_retained(self):
+        import gc
+        import weakref
+
+        refs = []
+
+        class Doc(dict):
+            __slots__ = ("__weakref__",)
+
+        def stream():
+            for i in range(2000):
+                d = Doc(
+                    createdAt=datetime(2026, 8, 17, 10, 0, tzinfo=timezone.utc),
+                    event_type="login",
+                    shop_name="tmc",
+                    session_id=f"s{i}",
+                    cart_token=f"c{i}",
+                )
+                refs.append(weakref.ref(d))
+                yield d
+                del d
+
+        aggregated, _ = worker.aggregate_event_documents(stream(), {date(2026, 8, 17)}, tz=worker.IST)
+        gc.collect()
+
+        self.assertEqual(dict(aggregated[(date(2026, 8, 17), "tmc")]), {"login_count": 2000})
+        self.assertEqual(sum(1 for r in refs if r() is not None), 0, "no document may stay referenced")
+
+    def test_fetch_returns_a_generator_and_closes_the_client(self):
+        from unittest import mock
+
+        client = mock.Mock()
+        collection = mock.Mock()
+        collection.find.return_value = iter([{"a": 1}, {"a": 2}])
+        with mock.patch.object(worker, "resolve_mongo_collection", return_value=(client, collection)):
+            stream = worker.fetch_mongo_events_for_dates([date(2026, 8, 17)])
+            self.assertFalse(isinstance(stream, list))
+            self.assertEqual(list(stream), [{"a": 1}, {"a": 2}])
+
+        client.close.assert_called_once()
+        self.assertEqual(collection.find.call_args.kwargs["batch_size"], worker.EVENTS_FETCH_BATCH_SIZE)
+
+    def test_master_job_streams_each_day_separately(self):
+        from unittest import mock
+
+        seen_days = []
+
+        def fake_fetch(days):
+            seen_days.append(list(days))
+            return iter([])
+
+        with mock.patch.object(worker, "fetch_mongo_events_for_dates", side_effect=fake_fetch), \
+             mock.patch.object(worker, "get_master_db_cursor") as ctx, \
+             mock.patch.object(worker, "ensure_events_summary_table"), \
+             mock.patch.object(worker, "ensure_event_columns"), \
+             mock.patch.object(worker, "get_existing_columns", return_value=set()), \
+             mock.patch.object(worker, "delete_target_dates"), \
+             mock.patch.object(worker, "insert_event_summary_rows", return_value=0):
+            ctx.return_value.__enter__.return_value = (mock.Mock(), mock.Mock())
+            worker._run_master_events_summary(datetime(2026, 8, 19, 5, 0, tzinfo=worker.IST))
+
+        self.assertEqual(seen_days, [[date(2026, 8, 17)], [date(2026, 8, 18)]])

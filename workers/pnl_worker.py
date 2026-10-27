@@ -1231,9 +1231,9 @@ def run_worker(current_dt: Optional[datetime] = None, brand_key: Optional[str] =
 
 def _run_scheduled() -> None:
     """
-    Long-running mode for the standalone container: daily at 00:10 IST
-    (40 18 * * * UTC), after the other daily workers have rolled up the
-    tables this one reads. Set PNL_WORKER_SELF_RUN=false to run once and
+    Long-running mode for the standalone container: daily at 00:12 IST
+    (42 18 * * * UTC). It reads the ETL's summary tables, so it only needs to stay
+    off the ETL's :10 tick and the other midnight jobs. Set PNL_WORKER_SELF_RUN=false to run once and
     exit (e.g. for a one-off/manual invocation or a backfill).
     """
     from apscheduler.schedulers.blocking import BlockingScheduler
@@ -1243,14 +1243,14 @@ def _run_scheduled() -> None:
         run_worker,
         trigger="cron",
         hour=18,
-        minute=40,
+        minute=42,
         timezone="UTC",
         id="pnl_worker_job",
         coalesce=True,
         max_instances=1,
         misfire_grace_time=3600,
     )
-    logger.info("P&L worker scheduler started (cron 40 18 * * * UTC / 00:10 IST)")
+    logger.info("P&L worker scheduler started (cron 42 18 * * * UTC / 00:12 IST)")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):

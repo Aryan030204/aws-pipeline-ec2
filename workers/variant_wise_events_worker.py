@@ -157,7 +157,7 @@ def _run_rebuild(current_dt: Optional[datetime] = None) -> None:
 def _run_scheduled() -> None:
     """
     Long-running mode for the standalone container: runs run_worker once a
-    day at 00:15 IST (the window it rebuilds is the two closed days D-2..D-1,
+    day at 00:17 IST (the window it rebuilds is the two closed days D-2..D-1,
     so more frequent runs only re-scan identical data). No run at startup, so
     a container restart can't trigger the full-table scan. Set
     VARIANT_WISE_EVENTS_WORKER_SELF_RUN=false to instead run once and exit
@@ -170,14 +170,14 @@ def _run_scheduled() -> None:
         run_worker,
         trigger="cron",
         hour=0,
-        minute=15,
+        minute=17,
         timezone="Asia/Kolkata",
         id="variant_wise_events_worker_job",
         coalesce=True,
         max_instances=1,
         misfire_grace_time=6 * 3600,
     )
-    logger.info("Variant-wise events worker scheduler started (daily at 00:15 IST)")
+    logger.info("Variant-wise events worker scheduler started (daily at 00:17 IST)")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):

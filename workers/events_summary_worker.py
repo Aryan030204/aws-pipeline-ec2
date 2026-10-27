@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import logging
 import os
 import re
@@ -8,7 +9,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 from zoneinfo import ZoneInfo
 
 import certifi
@@ -46,6 +47,16 @@ MONGO_COLLECTION_NAME = (
 )
 EVENTS_SUMMARY_TABLE = "events_summary"
 EVENT_COLUMN_SUFFIX = "_count"
+
+# Mongo cursor batch size for the master job: documents are processed as they stream in and are
+# never collected into a list (see aggregate_event_documents).
+EVENTS_FETCH_BATCH_SIZE = int(os.environ.get("EVENTS_SUMMARY_FETCH_BATCH_SIZE", "5000") or 5000)
+# Wait this long after the container starts before the first incremental run, so a reboot/restart does
+# not start every pipeline's work at the same moment. The expensive master rebuild never runs at startup.
+EVENTS_WORKER_STARTUP_DELAY_S = int(os.environ.get("EVENTS_WORKER_STARTUP_DELAY_S", "90") or 0)
+# Master rebuild: 00:03 IST (18:33 UTC). Offset from the other midnight jobs and the ETL's :00 tick.
+MASTER_CRON_UTC_HOUR = 18
+MASTER_CRON_UTC_MINUTE = 33
 
 
 def now_ist() -> datetime:
@@ -93,18 +104,42 @@ def _extract_cart_token(doc: Dict) -> Optional[str]:
     return cart_token or None
 
 
+def _pair_digest(local_date: date, shop_name: str, column_name: str, session_id: str, cart_token: str) -> int:
+    """128-bit digest of one (date, shop, event column, session, cart token) pair.
+
+    The dedup rule only needs to know whether a pair was seen once or more than once, so the pair
+    is remembered as a 16-byte digest instead of keeping every Mongo document. Parts are
+    length-prefixed so different splits of the same characters cannot produce the same input.
+    """
+    h = hashlib.blake2b(digest_size=16)
+    for part in (local_date.isoformat(), shop_name, column_name, session_id, cart_token):
+        encoded = part.encode("utf-8")
+        h.update(len(encoded).to_bytes(4, "big"))
+        h.update(encoded)
+    return int.from_bytes(h.digest(), "big")
+
+
 def aggregate_event_documents(
     docs: Iterable[Dict],
     target_dates: Set[date],
     tz: ZoneInfo = IST,
+    stats: Optional[Dict[str, int]] = None,
 ) -> Tuple[Dict[Tuple[date, str], Dict[str, int]], Set[str]]:
-    aggregated: Dict[Tuple[date, str], Dict[str, int]] = defaultdict(
-        lambda: defaultdict(int)
-    )
-    event_columns: Set[str] = set()
+    """Counts events per (IST date, shop, event column), keeping only pairs seen exactly once.
 
-    pair_docs: Dict[Tuple[date, str, str, str, str], List[Dict]] = defaultdict(list)
+    Rule (unchanged): events sharing (date, shop, event_type, session_id, cart_token) are repeats;
+    when a pair occurs more than once it is dropped entirely, when it occurs once it counts as 1.
+
+    `docs` is consumed as a stream (any iterable, one pass). Only a digest per distinct pair is
+    kept, never the documents. `stats["docs"]` receives the number of documents read.
+    """
+    counts: Dict[Tuple[date, str], Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    seen_once: Set[int] = set()
+    seen_repeated: Set[int] = set()
+    read = 0
+
     for doc in docs:
+        read += 1
         created_at = doc.get("createdAt")
         if not isinstance(created_at, datetime):
             continue
@@ -130,15 +165,30 @@ def aggregate_event_documents(
         if not session_id or not cart_token:
             continue
 
-        pair_key = (local_date, shop_name, column_name, session_id, cart_token)
-        pair_docs[pair_key].append(doc)
-
-    for (local_date, shop_name, column_name, _session_id, _cart_token), matched_docs in pair_docs.items():
-        if len(matched_docs) != 1:
+        digest = _pair_digest(local_date, shop_name, column_name, session_id, cart_token)
+        if digest in seen_repeated:
             continue
-        event_columns.add(column_name)
-        aggregated[(local_date, shop_name)][column_name] += 1
+        bucket = counts[(local_date, shop_name)]
+        if digest in seen_once:
+            # Second sighting: the pair is a repeat, so take back the count it earned as unique.
+            seen_once.discard(digest)
+            seen_repeated.add(digest)
+            bucket[column_name] -= 1
+        else:
+            seen_once.add(digest)
+            bucket[column_name] += 1
 
+    if stats is not None:
+        stats["docs"] = read
+
+    # Only pairs that stayed unique leave a count behind; drop columns/rows that fell back to zero.
+    aggregated: Dict[Tuple[date, str], Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    event_columns: Set[str] = set()
+    for key, columns in counts.items():
+        for column_name, value in columns.items():
+            if value > 0:
+                aggregated[key][column_name] = value
+                event_columns.add(column_name)
     return aggregated, event_columns
 
 
@@ -362,7 +412,12 @@ def insert_event_summary_rows(
     return len(rows)
 
 
-def fetch_mongo_events_for_dates(target_dates: Sequence[date]) -> List[Dict]:
+def fetch_mongo_events_for_dates(target_dates: Sequence[date]) -> Iterator[Dict]:
+    """Streams the events of the given IST dates from Mongo, one batch at a time.
+
+    This is a generator: documents are never gathered into a list. The Mongo client is closed
+    when the stream is exhausted or abandoned.
+    """
     start_utc, end_utc = compute_utc_bounds_for_dates(target_dates)
     client = None
     try:
@@ -378,8 +433,10 @@ def fetch_mongo_events_for_dates(target_dates: Sequence[date]) -> List[Dict]:
                 "session_id": 1,
                 "cart_token": 1,
             },
+            batch_size=EVENTS_FETCH_BATCH_SIZE,
         )
-        return list(cursor)
+        for doc in cursor:
+            yield doc
     finally:
         if client is not None:
             client.close()
@@ -502,17 +559,27 @@ def run_worker(current_dt: Optional[datetime] = None) -> None:
 
 def _run_master_events_summary(current_dt: Optional[datetime] = None) -> None:
     target_dates = compute_rebuild_dates(current_dt=current_dt)
-    target_date_set = set(target_dates)
     logger.info(
         "Starting events summary worker for IST dates: %s",
         ", ".join(day.isoformat() for day in target_dates),
     )
 
-    docs = fetch_mongo_events_for_dates(target_dates)
-    aggregated, new_event_columns = aggregate_event_documents(docs, target_date_set, tz=IST)
+    # One IST day at a time, streamed. A pair key includes the date, so processing days separately
+    # gives the same result as one pass, and the dedup state of a day is released before the next.
+    aggregated: Dict[Tuple[date, str], Dict[str, int]] = {}
+    new_event_columns: Set[str] = set()
+    docs_read = 0
+    for target_day in target_dates:
+        day_stats: Dict[str, int] = {}
+        day_aggregated, day_columns = aggregate_event_documents(
+            fetch_mongo_events_for_dates([target_day]), {target_day}, tz=IST, stats=day_stats
+        )
+        aggregated.update(day_aggregated)
+        new_event_columns |= day_columns
+        docs_read += day_stats.get("docs", 0)
     logger.info(
-        "Fetched %s Mongo doc(s), aggregated into %s shop-date row(s), discovered %s event column(s)",
-        len(docs),
+        "Streamed %s Mongo doc(s), aggregated into %s shop-date row(s), discovered %s event column(s)",
+        docs_read,
         len(aggregated),
         len(new_event_columns),
     )
@@ -563,14 +630,15 @@ def _run_scheduled() -> None:
     """
     Long-running mode for the standalone container: two independent
     cadences on one scheduler.
-      - The master events_summary table: same daily cadence as before
-        (30 18 * * * UTC, i.e. 00:00 IST), plus one immediate run at
-        startup so a container restart doesn't wait up to a day for
-        fresh data.
-      - The incremental raw-ingest + CI/buy-now rollup job: every 15
-        minutes, plus one immediate run at startup (same pattern
-        workers/intent_events_worker.py uses) so a container restart
-        doesn't wait up to 15 minutes for fresh data.
+      - The master events_summary table: daily at 00:03 IST (18:33 UTC), offset
+        from the ETL's :00 tick and the other midnight jobs. It is NOT run at
+        startup: it re-reads two full days of Mongo events, so a container
+        restart (or a crash loop) must never trigger it. After an outage the
+        next scheduled run rebuilds the same two-day window.
+      - The incremental raw-ingest + CI/buy-now rollup job: every 15 minutes.
+        Its first run is delayed by EVENTS_WORKER_STARTUP_DELAY_S after start
+        (default 90 s) so that a restart does not make every pipeline start
+        working at the same moment; it is watermarked, so a delay loses nothing.
     Set EVENTS_WORKER_SELF_RUN=false to instead run both once and exit
     (e.g. for a one-off/manual invocation) - see run_worker.
     """
@@ -580,8 +648,8 @@ def _run_scheduled() -> None:
     scheduler.add_job(
         _run_master_events_summary,
         trigger="cron",
-        hour=18,
-        minute=30,
+        hour=MASTER_CRON_UTC_HOUR,
+        minute=MASTER_CRON_UTC_MINUTE,
         timezone="UTC",
         id="events_summary_worker_job",
         coalesce=True,
@@ -589,36 +657,29 @@ def _run_scheduled() -> None:
         misfire_grace_time=3600,
     )
 
-    logger.info("Running master events summary job once immediately on startup")
-    try:
-        _run_master_events_summary()
-    except Exception as e:
-        logger.error("Error in immediate startup run of master events summary job: %s", e)
-
-    logger.info("Running incremental events job once immediately on startup")
-    try:
-        run_incremental_events_job()
-    except Exception as e:
-        logger.error("Error in immediate startup run of incremental events job: %s", e)
-
+    # Same job id as the 15-minute cadence, so the delayed first run and the later runs can never
+    # overlap (max_instances=1).
     scheduler.add_job(
         run_incremental_events_job,
         trigger="interval",
         minutes=15,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=max(0, EVENTS_WORKER_STARTUP_DELAY_S)),
         id="incremental_events_job",
         coalesce=True,
         max_instances=1,
         misfire_grace_time=600,
     )
     logger.info(
-        "Events summary worker scheduler started (master table: cron 30 18 * * * UTC / "
-        "00:00 IST; incremental events job: every 15 minutes)"
+        "Events summary worker scheduler started (master table: cron %02d:%02d UTC / 00:03 IST, not run "
+        "at startup; incremental events job: every 15 minutes, first run in %ss)",
+        MASTER_CRON_UTC_HOUR,
+        MASTER_CRON_UTC_MINUTE,
+        EVENTS_WORKER_STARTUP_DELAY_S,
     )
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Events summary worker scheduler stopped")
-
 
 if __name__ == "__main__":
     self_run = os.environ.get("EVENTS_WORKER_SELF_RUN", "true").strip().lower() == "true"

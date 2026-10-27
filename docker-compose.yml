@@ -1,5 +1,18 @@
 version: "3.9"
 
+# Resource isolation. This host (t3.medium: 2 vCPU, ~4 GiB, swap on EBS) also runs the Datum APIs, so a
+# pipeline that misbehaves must be stopped at its own ceiling instead of swapping the whole machine.
+#  - mem_limit == memswap_limit: the container cannot spill into host swap; at the limit it is
+#    OOM-killed and restarted by Docker (every job here is idempotent / watermarked).
+#  - cpus: a ceiling, not a reservation; idle containers use nothing.
+#  - pids_limit: stops a thread/process leak from exhausting the host.
+# Raise a value with the *_MEM_LIMIT / *_CPUS variables in the host's .env if a measured peak needs it.
+x-pipeline-logging: &pipeline-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
 networks:
   pipeline-net:
     external: true
@@ -11,11 +24,18 @@ services:
     env_file:
       - .env
     restart: always
+    mem_limit: ${AWS_PIPELINE_MEM_LIMIT:-1g}
+    memswap_limit: ${AWS_PIPELINE_MEM_LIMIT:-1g}
+    cpus: ${AWS_PIPELINE_CPUS:-1.5}
+    pids_limit: 512
+    logging: *pipeline-logging
     networks:
       - pipeline-net
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
+  # No master job at startup: it runs only at 00:03 IST. The incremental job's first run waits
+  # EVENTS_WORKER_STARTUP_DELAY_S (default 90).
   events-summary-worker:
     build:
       context: .
@@ -23,7 +43,14 @@ services:
     container_name: events-summary-worker
     env_file:
       - .env
+    environment:
+      EVENTS_WORKER_STARTUP_DELAY_S: ${EVENTS_WORKER_STARTUP_DELAY_S:-90}
     restart: always
+    mem_limit: ${EVENTS_WORKER_MEM_LIMIT:-768m}
+    memswap_limit: ${EVENTS_WORKER_MEM_LIMIT:-768m}
+    cpus: ${EVENTS_WORKER_CPUS:-1.0}
+    pids_limit: 256
+    logging: *pipeline-logging
     networks:
       - pipeline-net
     extra_hosts:
@@ -37,6 +64,11 @@ services:
     env_file:
       - .env
     restart: always
+    mem_limit: ${VARIANT_WORKER_MEM_LIMIT:-512m}
+    memswap_limit: ${VARIANT_WORKER_MEM_LIMIT:-512m}
+    cpus: ${VARIANT_WORKER_CPUS:-0.75}
+    pids_limit: 256
+    logging: *pipeline-logging
     networks:
       - pipeline-net
     extra_hosts:
@@ -50,6 +82,11 @@ services:
     env_file:
       - .env
     restart: always
+    mem_limit: ${CHECKOUT_LOGIN_WORKER_MEM_LIMIT:-384m}
+    memswap_limit: ${CHECKOUT_LOGIN_WORKER_MEM_LIMIT:-384m}
+    cpus: ${CHECKOUT_LOGIN_WORKER_CPUS:-0.5}
+    pids_limit: 128
+    logging: *pipeline-logging
     networks:
       - pipeline-net
     extra_hosts:
@@ -63,6 +100,11 @@ services:
     env_file:
       - .env
     restart: always
+    mem_limit: ${PNL_WORKER_MEM_LIMIT:-512m}
+    memswap_limit: ${PNL_WORKER_MEM_LIMIT:-512m}
+    cpus: ${PNL_WORKER_CPUS:-0.5}
+    pids_limit: 128
+    logging: *pipeline-logging
     networks:
       - pipeline-net
     extra_hosts:

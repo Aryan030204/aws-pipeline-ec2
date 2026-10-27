@@ -106,7 +106,8 @@ def run_worker(current_dt: Optional[datetime] = None) -> None:
 def _run_scheduled() -> None:
     """
     Long-running mode for the standalone container: schedules run_worker
-    four times a day, at 00:00, 06:00, 12:00, and 18:00 IST (the job's own
+    four times a day, at 00:07, 06:07, 12:07, and 18:07 IST (minute 7 keeps it off the ETL's
+    :00/:10 ticks and the other midnight jobs; the job's own
     trigger timezone is Asia/Kolkata, so these hours are IST wall-clock
     directly - no UTC conversion to account for), then blocks. Set
     CHECKOUT_LOGIN_STATUS_WORKER_SELF_RUN=false to instead run once and exit
@@ -119,7 +120,7 @@ def _run_scheduled() -> None:
         run_worker,
         trigger="cron",
         hour="0,6,12,18",
-        minute=0,
+        minute=7,
         timezone="Asia/Kolkata",
         id="checkout_login_status_worker_job",
         coalesce=True,
@@ -127,7 +128,7 @@ def _run_scheduled() -> None:
         misfire_grace_time=3600,
     )
     logger.info(
-        "Checkout login-status worker scheduler started (cron 0,6,12,18 * * * IST)"
+        "Checkout login-status worker scheduler started (cron 7 0,6,12,18 * * * IST)"
     )
     try:
         scheduler.start()
