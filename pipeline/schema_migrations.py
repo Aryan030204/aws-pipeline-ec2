@@ -189,6 +189,80 @@ def ensure_overall_summary_payment_sales_columns(brand_index: int) -> None:
     )
 
 
+_PAYMENT_MODE_ENUM_TABLES = (
+    "dashboard_order_discount_fact",
+    "dashboard_discount_payment_daily",
+    "dashboard_discount_payment_hourly",
+)
+_PAYMENT_MODE_ENUM_SQL = "ENUM('prepaid','cod','partially_paid','unmapped') NOT NULL"
+
+
+def ensure_payment_unmapped_columns(brand_index: int) -> None:
+    """
+    Add the "unmapped" payment bucket (orders with no payment gateway name)
+    next to the existing cod/prepaid/ppcod columns on every summary table
+    that carries that breakdown.
+    """
+    for table_name, columns in {
+        "order_summary": {
+            "unmapped_orders": "INT DEFAULT 0",
+            "overall_unmapped_orders": "INT DEFAULT 0",
+            "rto_unmapped_orders_returned": "INT DEFAULT 0",
+            "overall_unmapped_sales": "DECIMAL(12,2) DEFAULT 0",
+        },
+        "hour_wise_sales": {
+            "number_of_unmapped_orders": "INT DEFAULT 0",
+            "unmapped_sales": "DECIMAL(12,2) DEFAULT 0",
+        },
+        "overall_summary": {
+            "unmapped_orders": "INT DEFAULT 0",
+            "unmapped_sales": "DECIMAL(12,2) DEFAULT 0",
+        },
+        "daily_citywise_summary": {"unmapped_orders": "INT DEFAULT 0"},
+        "hourly_citywise_summary": {"unmapped_orders": "INT DEFAULT 0"},
+    }.items():
+        _ensure_columns(brand_index, table_name, columns)
+
+
+def ensure_payment_mode_unmapped_enum(brand_index: int) -> None:
+    """
+    Add 'unmapped' to the payment_mode ENUM on the dashboard discount tables.
+    Appending a value at the end of an ENUM is an in-place change (no table
+    rebuild). Skips tables that don't exist yet or already have the value.
+    """
+    engine = sqlalchemy_engines.get(brand_index)
+    if not engine:
+        return
+    brand_name = os.environ.get(f"BRAND_NAME_{brand_index}", f"Brand_{brand_index}")
+    for table_name in _PAYMENT_MODE_ENUM_TABLES:
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text(f"SHOW COLUMNS FROM {table_name} LIKE 'payment_mode'")
+                ).fetchone()
+                if row is None:
+                    continue
+                column_type = row[1]
+                if isinstance(column_type, (bytes, bytearray)):
+                    column_type = column_type.decode()
+                if "'unmapped'" in str(column_type).lower():
+                    continue
+                conn.execute(
+                    text(
+                        f"ALTER TABLE {table_name} MODIFY COLUMN payment_mode "
+                        f"{_PAYMENT_MODE_ENUM_SQL}"
+                    )
+                )
+                conn.commit()
+                logger.info(
+                    f"✅ Added 'unmapped' to {table_name}.payment_mode for {brand_name}"
+                )
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Could not extend {table_name}.payment_mode for {brand_name}: {e}"
+            )
+
+
 def run_brand_preflight_schema_migrations(brand_index: int) -> None:
     brand_name = os.environ.get(f"BRAND_NAME_{brand_index}", f"Brand_{brand_index}")
     logger.info(f"🧱 Running preflight schema migrations for {brand_name}")
@@ -206,6 +280,8 @@ def run_brand_preflight_schema_migrations(brand_index: int) -> None:
     ensure_hour_wise_payment_sales_columns(brand_index)
     ensure_overall_summary_payment_sales_columns(brand_index)
     ensure_utm_names_column(brand_index, "overall_utm_summary")
+    ensure_payment_unmapped_columns(brand_index)
+    ensure_payment_mode_unmapped_enum(brand_index)
     logger.info(f"✅ Preflight schema migrations complete for {brand_name}")
 
 
@@ -321,6 +397,10 @@ def ensure_summary_tables(cursor, connection):
                 overall_cod_sales DECIMAL(12,2) DEFAULT 0,
                 overall_prepaid_sales DECIMAL(12,2) DEFAULT 0,
                 overall_partially_paid_sales DECIMAL(12,2) DEFAULT 0,
+                unmapped_orders INT DEFAULT 0,
+                overall_unmapped_orders INT DEFAULT 0,
+                rto_unmapped_orders_returned INT DEFAULT 0,
+                overall_unmapped_sales DECIMAL(12,2) DEFAULT 0,
                 KEY idx_date (date)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
@@ -400,6 +480,8 @@ def ensure_summary_tables(cursor, connection):
                 cod_sales DECIMAL(12,2) DEFAULT 0,
                 prepaid_sales DECIMAL(12,2) DEFAULT 0,
                 partially_prepaid_sales DECIMAL(12,2) DEFAULT 0,
+                number_of_unmapped_orders INT DEFAULT 0,
+                unmapped_sales DECIMAL(12,2) DEFAULT 0,
                 number_of_sessions INT DEFAULT 0,
                 number_of_atc_sessions INT DEFAULT 0,
                 PRIMARY KEY (date, hour),
@@ -440,6 +522,7 @@ def ensure_summary_tables(cursor, connection):
                 cod_orders INT DEFAULT 0,
                 prepaid_orders INT DEFAULT 0,
                 partially_paid_orders INT DEFAULT 0,
+                unmapped_orders INT DEFAULT 0,
                 sessions INT DEFAULT 0,
                 atc_sessions INT DEFAULT 0,
                 PRIMARY KEY (date, city),
@@ -457,6 +540,7 @@ def ensure_summary_tables(cursor, connection):
                 cod_orders INT DEFAULT 0,
                 prepaid_orders INT DEFAULT 0,
                 partially_paid_orders INT DEFAULT 0,
+                unmapped_orders INT DEFAULT 0,
                 sessions INT DEFAULT 0,
                 atc_sessions INT DEFAULT 0,
                 PRIMARY KEY (date, hour, city),
@@ -517,6 +601,8 @@ def ensure_summary_tables(cursor, connection):
                 cod_sales DECIMAL(12,2) DEFAULT 0,
                 prepaid_sales DECIMAL(12,2) DEFAULT 0,
                 partially_prepaid_sales DECIMAL(12,2) DEFAULT 0,
+                unmapped_orders INT DEFAULT 0,
+                unmapped_sales DECIMAL(12,2) DEFAULT 0,
                 total_sessions INT DEFAULT 0,
                 total_atc_sessions INT DEFAULT 0,
                 adjusted_total_sessions INT DEFAULT 0,
@@ -547,7 +633,7 @@ def ensure_summary_tables(cursor, connection):
                 discount_code VARCHAR(255) NOT NULL,
                 discount_amount DECIMAL(12,2) DEFAULT 0,
                 payment_gateway_names TEXT,
-                payment_mode ENUM('prepaid', 'cod', 'partially_paid') NOT NULL,
+                payment_mode ENUM('prepaid', 'cod', 'partially_paid', 'unmapped') NOT NULL,
                 total_price DECIMAL(12,2) NOT NULL DEFAULT 0,
                 PRIMARY KEY (order_id, discount_code),
                 KEY idx_discount_date (discount_code, created_date),
@@ -588,7 +674,7 @@ def ensure_summary_tables(cursor, connection):
             CREATE TABLE IF NOT EXISTS dashboard_discount_payment_daily (
                 date DATE NOT NULL,
                 discount_code VARCHAR(255) NOT NULL,
-                payment_mode ENUM('prepaid', 'cod', 'partially_paid') NOT NULL,
+                payment_mode ENUM('prepaid', 'cod', 'partially_paid', 'unmapped') NOT NULL,
                 total_orders INT NOT NULL DEFAULT 0,
                 gross_revenue DECIMAL(12,2) NOT NULL DEFAULT 0,
                 PRIMARY KEY (date, discount_code, payment_mode),
@@ -603,7 +689,7 @@ def ensure_summary_tables(cursor, connection):
                 date DATE NOT NULL,
                 hour TINYINT UNSIGNED NOT NULL,
                 discount_code VARCHAR(255) NOT NULL,
-                payment_mode ENUM('prepaid', 'cod', 'partially_paid') NOT NULL,
+                payment_mode ENUM('prepaid', 'cod', 'partially_paid', 'unmapped') NOT NULL,
                 total_orders INT NOT NULL DEFAULT 0,
                 gross_revenue DECIMAL(12,2) NOT NULL DEFAULT 0,
                 aov DECIMAL(12,2) NOT NULL DEFAULT 0,

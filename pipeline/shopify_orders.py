@@ -33,6 +33,7 @@ from pipeline.state import (
     sqlalchemy_engines,
 )
 from pipeline.db import get_db_cursor, executemany_chunked, timed
+from pipeline.payment_mode import classify_payment_mode
 from pipeline.shopifyql_sessions import _format_shopifyql_table, _make_shopifyql_session
 
 # aws_background still owns extract_bundle_item_columns_from_props (misc_utils),
@@ -742,16 +743,9 @@ def upsert_returns_fact_from_orders(
 # Discount dashboard fact helpers
 # ---------------------------
 def _classify_payment_mode(payment_gateway_names: Optional[str]) -> str:
-    pg = payment_gateway_names or ""
-    if "Gokwik PPCOD" in pg:
-        return "partially_paid"
-    if (
-        not pg
-        or "Cash on Delivery (COD)" in pg
-        or "cash_on_delivery" in pg
-    ):
-        return "cod"
-    return "prepaid"
+    # prepaid / cod / partially_paid / unmapped (no gateway name); the same
+    # rule the summary SQL uses, defined once in pipeline/payment_mode.py.
+    return classify_payment_mode(payment_gateway_names)
 
 
 def _normalize_city_name(raw_city: Optional[str]) -> str:

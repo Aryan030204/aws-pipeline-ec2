@@ -1,11 +1,14 @@
 """
-Focused backfill for cod/prepaid/ppcod order-count and sales-amount columns.
+Focused backfill for cod/prepaid/ppcod/unmapped order-count and sales-amount
+columns (unmapped = orders with no payment gateway name).
 
 Updates only:
 - hour_wise_sales.number_of_cod_orders, number_of_prepaid_orders,
-  number_of_ppcod_orders, cod_sales, prepaid_sales, partially_prepaid_sales
+  number_of_ppcod_orders, cod_sales, prepaid_sales, partially_prepaid_sales,
+  number_of_unmapped_orders, unmapped_sales
 - overall_summary.cod_orders, prepaid_orders, partially_paid_orders,
-  cod_sales, prepaid_sales, partially_prepaid_sales
+  cod_sales, prepaid_sales, partially_prepaid_sales,
+  unmapped_orders, unmapped_sales
 
 No other column on either table is touched.
 """
@@ -61,6 +64,7 @@ def backfill_brand(brand_index: int, start_dt: datetime, end_dt: datetime):
     aws_background.ensure_hour_wise_ppcod_column(brand_index)
     aws_background.ensure_hour_wise_payment_sales_columns(brand_index)
     aws_background.ensure_overall_summary_payment_sales_columns(brand_index)
+    aws_background.ensure_payment_unmapped_columns(brand_index)
 
     target_dates = list(_dates_between(start_dt, end_dt))
     aws_background.backfill_payment_mode_breakdown_columns(

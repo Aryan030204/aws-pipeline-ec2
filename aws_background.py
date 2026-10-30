@@ -149,6 +149,8 @@ from pipeline.schema_migrations import (
     ensure_hour_wise_ppcod_column,
     ensure_hour_wise_payment_sales_columns,
     ensure_overall_summary_payment_sales_columns,
+    ensure_payment_unmapped_columns,
+    ensure_payment_mode_unmapped_enum,
     run_brand_preflight_schema_migrations,
     ensure_summary_tables,
 )
