@@ -139,6 +139,7 @@ from pipeline.state import (
 )
 from pipeline.schema_migrations import (
     ensure_user_agent_column,
+    ensure_landing_page_columns,
     ensure_customer_tag_column,
     ensure_bundle_property_columns,
     ensure_device_summary_columns,

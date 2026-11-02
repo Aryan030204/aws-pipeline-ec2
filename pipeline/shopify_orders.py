@@ -34,6 +34,7 @@ from pipeline.state import (
 )
 from pipeline.db import get_db_cursor, executemany_chunked, timed
 from pipeline.payment_mode import classify_payment_mode
+from pipeline.landing_path import pick_landing_path
 from pipeline.shopifyql_sessions import _format_shopifyql_table, _make_shopifyql_session
 
 # aws_background still owns extract_bundle_item_columns_from_props (misc_utils),
@@ -289,6 +290,18 @@ def transform_orders_to_df_optimized(
                     if name in utm_data and not utm_data[name]:
                         utm_data[name] = val
 
+            # Normalized landing path for collection/PLP CVR: Shopify's
+            # landing_site, else the full_url note attribute (the last
+            # full_url note wins, same as the note-attribute copy below), per
+            # order. See pipeline/landing_path.py.
+            note_full_url = None
+            for note in order.get("note_attributes", []) or []:
+                if note and note.get("name") == "full_url":
+                    note_full_url = note.get("value")
+            landing_page_path = pick_landing_path(
+                landing_site, note_full_url or order.get("full_url")
+            )
+
             base = {
                 "created_at": format_datetime(created_at_str),
                 "created_date": created_date,
@@ -364,6 +377,8 @@ def transform_orders_to_df_optimized(
                 "app_version": order.get("app_version"),
                 # Add user_agent to base dictionary, defaulting to "unknown"
                 "user_agent": "unknown",
+                "landing_site": landing_site,
+                "landing_page_path": landing_page_path,
             }
 
             # Extract user_agent from note_attributes if present
@@ -479,6 +494,12 @@ def transform_orders_to_df_optimized(
                 for note in order.get("note_attributes", []) or []:
                     if note and note.get("name") in row:
                         row[note["name"]] = note.get("value")
+
+                # Set after the note-attribute copy so a note attribute can
+                # never overwrite these; every line-item row of an order
+                # carries the same values.
+                row["landing_site"] = landing_site
+                row["landing_page_path"] = landing_page_path
 
                 order_data.append(row)
 
@@ -1630,6 +1651,10 @@ def load_data_to_sql_optimized(
         Column("utm_content", Text),
         Column("utm_term", Text),
         Column("user_agent", Text),
+        # Raw Shopify landing_site + normalized landing path (landing_site,
+        # else full_url) used for collection/PLP CVR attribution.
+        Column("landing_site", Text),
+        Column("landing_page_path", String(500)),
     ]
     for n in range(1, 11):
         columns.append(Column(f"_ITEM{n}_name", String(255)))

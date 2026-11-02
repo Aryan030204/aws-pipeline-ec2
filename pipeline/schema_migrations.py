@@ -69,6 +69,18 @@ def ensure_user_agent_column(brand_index: int, table_name: str):
     _ensure_columns(brand_index, table_name, {"user_agent": "TEXT"})
 
 
+def ensure_landing_page_columns(brand_index: int, table_name: str):
+    """
+    Ensure landing_site (raw Shopify value) and landing_page_path (normalized
+    path: landing_site, else full_url) exist, for collection/PLP CVR.
+    """
+    _ensure_columns(
+        brand_index,
+        table_name,
+        {"landing_site": "TEXT", "landing_page_path": "VARCHAR(500)"},
+    )
+
+
 def ensure_customer_tag_column(brand_index: int, table_name: str):
     """
     Ensure customer_tag exists in the specific table.
@@ -268,6 +280,8 @@ def run_brand_preflight_schema_migrations(brand_index: int) -> None:
     logger.info(f"🧱 Running preflight schema migrations for {brand_name}")
     ensure_user_agent_column(brand_index, "shopify_orders")
     ensure_user_agent_column(brand_index, "shopify_orders_update")
+    ensure_landing_page_columns(brand_index, "shopify_orders")
+    ensure_landing_page_columns(brand_index, "shopify_orders_update")
     ensure_customer_tag_column(brand_index, "shopify_orders")
     ensure_bundle_property_columns(brand_index, "shopify_orders")
     ensure_bundle_property_columns(brand_index, "shopify_orders_update")
