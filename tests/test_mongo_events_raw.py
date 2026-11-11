@@ -1,3 +1,4 @@
+import json
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from unittest import mock
@@ -289,22 +290,113 @@ class FlushBatchTests(unittest.TestCase):
         self.assertNotIn("ingested_at", sql)
         self.assertIn("`event_type` = VALUES(`event_type`)", update_clause)
 
-    def test_mismatched_value_is_stored_as_null_without_failing_the_batch(self):
+    @staticmethod
+    def _main_rows(cursor):
+        sql, rows = cursor.executemany_calls[0]
+        columns = [c.strip(" `") for c in sql.split("(", 1)[1].split(") VALUES")[0].split(",")]
+        return [dict(zip(columns, r)) for r in rows]
+
+    @staticmethod
+    def _overflow(cursor):
+        for sql, rows in cursor.executemany_calls:
+            if "mongo_events_overflow" in sql:
+                return {event_id: json.loads(payload) for event_id, payload in rows}
+        return {}
+
+    def test_mismatched_value_widens_the_column_to_text_and_keeps_the_value(self):
         cursor = FakeCursor(_fixed_show_columns_rows() + [("score", "bigint")])
         good = raw._build_record(dict(SAMPLE_DOC, score=7))
         bad = raw._build_record(dict(SAMPLE_DOC, event_id="e2", score="not a number"))
         self._flush([good, bad], cursor)
 
-        sql, rows = cursor.executemany_calls[0]
-        columns = [c.strip(" `") for c in sql.split("(", 1)[1].split(") VALUES")[0].split(",")]
-        scores = [dict(zip(columns, r))["score"] for r in rows]
-        self.assertEqual(scores, [7, None])
+        self.assertIn("MODIFY COLUMN `score` TEXT", " ".join(cursor.alters))
+        self.assertEqual([r["score"] for r in self._main_rows(cursor)], ["7", "not a number"])
+        self.assertEqual(self._overflow(cursor), {})
 
-    def test_column_cap_stops_new_columns(self):
+    def test_empty_string_into_int_column_is_kept_not_nulled(self):
+        cursor = FakeCursor(_fixed_show_columns_rows() + [("data_custom_data_customer_id", "bigint")])
+        record = raw._build_record(
+            dict(SAMPLE_DOC, data={"custom_data": {"customer_id": ""}})
+        )
+        self._flush([record], cursor)
+
+        self.assertIn("MODIFY COLUMN `data_custom_data_customer_id` TEXT", " ".join(cursor.alters))
+        self.assertEqual(self._main_rows(cursor)[0]["data_custom_data_customer_id"], "")
+
+    def test_failed_widen_keeps_original_value_in_overflow(self):
+        cursor = FakeCursor(
+            _fixed_show_columns_rows() + [("score", "bigint")], fail_alter_containing="`score`"
+        )
+        bad = raw._build_record(dict(SAMPLE_DOC, score="not a number"))
+        self._flush([bad], cursor)
+
+        self.assertIsNone(self._main_rows(cursor)[0]["score"])
+        self.assertEqual(self._overflow(cursor), {SAMPLE_DOC["event_id"]: {"score": "not a number"}})
+
+    def test_failed_add_column_keeps_values_in_overflow_and_is_not_retried(self):
+        # e.g. MySQL error 1118 "Row size too large"
+        cursor = FakeCursor(fail_alter_containing="data_custom_data_order_name")
+        connection = FakeConnection()
+        catalog = raw._ColumnCatalog(cursor, connection)
+        doc = dict(SAMPLE_DOC, data={"custom_data": {"order_name": "#627813", "order_type": "cod"}})
+
+        for event_id in ("e1", "e2"):
+            raw._flush_batch(
+                cursor, connection, catalog,
+                [raw._build_record(dict(doc, event_id=event_id))], set(), "[test]",
+            )
+
+        overflow = {}
+        for sql, rows in cursor.executemany_calls:
+            if "mongo_events_overflow" in sql:
+                overflow.update({e: json.loads(p) for e, p in rows})
+        self.assertEqual(
+            overflow,
+            {"e1": {"data_custom_data_order_name": "#627813"},
+             "e2": {"data_custom_data_order_name": "#627813"}},
+        )
+        # attempted only in the first batch (combined ALTER + single retry), never again
+        self.assertEqual(
+            sum("`data_custom_data_order_name`" in s for s in cursor.alters), 2
+        )
+        main_rows = self._main_rows(cursor)
+        self.assertEqual(main_rows[0]["data_custom_data_order_type"], "cod")
+
+    def test_column_cap_sends_values_to_overflow(self):
         record = raw._build_record(dict(SAMPLE_DOC))
         with mock.patch.object(raw, "MAX_COLUMNS", 1):
             cursor = self._flush([record])
         self.assertEqual(cursor.alters, [])
+        self.assertEqual(
+            self._overflow(cursor)[SAMPLE_DOC["event_id"]],
+            {"data_collection": "bangles", "data_click": "https://www.shyle.in/collections/bracelets", "__v": 0},
+        )
+
+    def test_nothing_overflowing_writes_no_overflow_rows(self):
+        cursor = self._flush([raw._build_record(dict(SAMPLE_DOC))])
+        self.assertEqual(len(cursor.executemany_calls), 1)
+        self.assertEqual(self._overflow(cursor), {})
+
+    def test_purchase_event_custom_data_is_fully_stored(self):
+        doc = dict(
+            SAMPLE_DOC,
+            event_type="purchase_TECHIT",
+            data={
+                "custom_data": {
+                    "order_name": "#627813", "order_type": "cod", "isPpcod": False,
+                    "customer_id": "", "merchant_id": "", "cod_charges": "",
+                },
+                "referrer": "https://www.google.com/",
+                "page": "/collections/gifting/",
+            },
+        )
+        cursor = self._flush([raw._build_record(doc)])
+        row = self._main_rows(cursor)[0]
+        self.assertEqual(row["data_custom_data_order_name"], "#627813")
+        self.assertEqual(row["data_custom_data_order_type"], "cod")
+        self.assertEqual(row["data_custom_data_isPpcod"], 0)
+        self.assertEqual(row["data_custom_data_customer_id"], "")
+        self.assertEqual(row["data_page"], "/collections/gifting/")
 
     def test_empty_batch_writes_nothing(self):
         cursor = self._flush([])

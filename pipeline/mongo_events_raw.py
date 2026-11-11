@@ -12,6 +12,11 @@ keeps the full payload. The table's schema follows the documents' keys:
 - createdAt/updatedAt (UTC in Mongo) become four columns:
   created_at_utc, updated_at_utc, created_at_ist, updated_at_ist.
 - _id and idempotency_key are not stored.
+- A value that does not fit its column's type widens the column to TEXT (a
+  value is never replaced by NULL). Anything that still cannot be stored in
+  the main table (column could not be added, column cap, failed widen) goes to
+  the mongo_events_overflow table instead, so nothing is lost before the
+  source document is deleted from Mongo.
 
 Rows are keyed by event_id and upserted, so re-running the same window is
 idempotent (no duplicates), and late-arriving events are picked up by the
@@ -45,6 +50,16 @@ from pipeline.mongo_events import (
 import aws_background
 
 RAW_EVENTS_TABLE = "mongo_events_summary"
+
+# Safety net so no Mongo value is ever lost. Any flattened key/value that cannot
+# be stored in a mongo_events_summary column (the column could not be created -
+# e.g. MySQL's row-size limit - hit the column cap, or the value can't be
+# converted to the column's type) is kept here instead, one row per event:
+#   overflow = JSON text {flattened_column_name: original_value}
+# Read it with e.g. JSON_UNQUOTE(JSON_EXTRACT(overflow, '$.data_custom_data_sku')).
+# It is a separate table because the main table may already be at the row-size
+# limit and so cannot take even one more column.
+OVERFLOW_TABLE = "mongo_events_overflow"
 
 # Total-column guardrail (fixed + dynamic). A runaway key producing thousands
 # of columns would blow MySQL's row-size/column limits; past this cap, new keys
@@ -103,8 +118,12 @@ _FIXED_COLUMNS: Dict[str, str] = {
     "updated_at_ist": "DATETIME(3) NULL",
 }
 
-# Sentinel: value cannot be stored in its column's type (stored as NULL).
+# Sentinel: value cannot be stored in its column's type.
 _MISMATCH = object()
+
+# Column categories whose type can reject a value; such a column is widened
+# to TEXT when that happens (json/str columns accept anything).
+_NARROW_CATEGORIES = {"int", "bool", "float", "datetime"}
 
 
 def _quote(identifier: str) -> str:
@@ -268,6 +287,10 @@ class _ColumnCatalog:
         self._cursor = cursor
         self._connection = connection
         self._columns: Dict[str, Tuple[str, str]] = {}
+        # Lower-cased names whose ADD / MODIFY failed this run: not retried on
+        # every batch (their values go to the overflow table instead).
+        self.failed: set = set()
+        self.widen_failed: set = set()
         self._load()
 
     def _load(self) -> None:
@@ -315,9 +338,11 @@ class _ColumnCatalog:
                     _alter([definition])
                     groups.append([definition])
                 except Exception as single_error:
+                    self.failed.add(definition[0].lower())
                     logger.error(
                         f"[raw events] could not add column {definition[0]!r} "
-                        f"({definition[1]}): {single_error}"
+                        f"({definition[1]}): {single_error}; its values go to "
+                        f"{OVERFLOW_TABLE}"
                     )
         for group in groups:
             for name, sql_type in group:
@@ -355,9 +380,11 @@ class _ColumnCatalog:
                     _alter([definition])
                     groups.append([definition])
                 except Exception as single_error:
+                    self.widen_failed.add(definition[0].lower())
                     logger.error(
                         f"[raw events] could not widen column {definition[0]!r} "
-                        f"to {definition[1]}: {single_error}"
+                        f"to {definition[1]}: {single_error}; non-fitting values go to "
+                        f"{OVERFLOW_TABLE}"
                     )
         for group in groups:
             for name, sql_type in group:
@@ -378,6 +405,16 @@ def _ensure_raw_events_table(cursor, connection) -> None:
             KEY `idx_session_id` (`session_id`),
             KEY `idx_cart_token` (`cart_token`),
             KEY `idx_created_at_utc` (`created_at_utc`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """
+    )
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {_quote(OVERFLOW_TABLE)} (
+            `event_id` VARCHAR(64) NOT NULL,
+            `overflow` LONGTEXT NOT NULL,
+            `ingested_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (`event_id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """
     )
@@ -410,10 +447,17 @@ def _flush_batch(
             entry = catalog.get(name)
             if entry is not None:
                 actual, category = entry
+                if value is None or lower in catalog.widen_failed:
+                    continue
                 if category == "int" and isinstance(value, float) and not value.is_integer():
                     widen_definitions.setdefault(lower, (actual, "DOUBLE"))
+                elif category in _NARROW_CATEGORIES and _coerce_value(value, category) is _MISMATCH:
+                    # e.g. '' / '#627813' arriving for a column first created
+                    # as BIGINT: widen to TEXT instead of nulling the value.
+                    # TEXT wins over a DOUBLE queued for the same column.
+                    widen_definitions[lower] = (actual, "TEXT")
                 continue
-            if value is None or lower in new_definitions:
+            if value is None or lower in new_definitions or lower in catalog.failed:
                 continue
             if len(catalog) + len(new_definitions) >= MAX_COLUMNS:
                 if "__cap__" not in warned:
@@ -434,33 +478,52 @@ def _flush_batch(
         widened = catalog.widen(list(widen_definitions.values()))
         if widened:
             logger.info(
-                f"{log_prefix}: widened {len(widened)} column(s) from int to double "
-                f"(non-integer value seen): {widened}"
+                f"{log_prefix}: widened {len(widened)} column(s) "
+                f"(value did not fit the inferred type): {widened}"
             )
 
-    # 2. Map/coerce each record onto real column names.
+    # 2. Map/coerce each record onto real column names. Whatever cannot be
+    #    placed in a column goes to the overflow table, never dropped.
     mapped_records: List[Dict[str, Any]] = []
+    overflow_rows: List[Tuple[str, str]] = []
     column_order: Dict[str, None] = {name: None for name in _FIXED_COLUMNS}
     for record in records:
         mapped: Dict[str, Any] = {}
+        overflow: Dict[str, Any] = {}
         for name, value in record.items():
             entry = catalog.get(name)
             if entry is None:
-                continue  # null-only/unknown-type key, capped, or failed ALTER
+                # null-only key (nothing to store), capped, or failed ALTER
+                if value is not None:
+                    overflow[name] = value
+                    if ("no-col", name.lower()) not in warned:
+                        warned.add(("no-col", name.lower()))
+                        logger.warning(
+                            f"{log_prefix}: no column for key {name!r}; storing its "
+                            f"values in {OVERFLOW_TABLE} (logged once per key per run)"
+                        )
+                continue
             actual, category = entry
             coerced = _coerce_value(value, category)
             if coerced is _MISMATCH:
+                # Widening to TEXT failed (or was skipped): keep the original
+                # value in the overflow table rather than losing it.
+                overflow[name] = value
                 if actual.lower() not in warned:
                     warned.add(actual.lower())
                     logger.warning(
                         f"{log_prefix}: value {value!r} does not fit column {actual!r} "
-                        f"({category}); storing NULL (further mismatches for this column "
-                        "this run are not logged)"
+                        f"({category}); column left NULL, value stored in {OVERFLOW_TABLE} "
+                        "(further mismatches for this column this run are not logged)"
                     )
                 coerced = None
             mapped[actual] = coerced
             column_order.setdefault(actual, None)
         mapped_records.append(mapped)
+        if overflow:
+            overflow_rows.append(
+                (record["event_id"], json.dumps(overflow, default=_json_default))
+            )
 
     columns = [c for c in column_order if any(c in m for m in mapped_records)]
     if "event_id" not in columns:
@@ -476,7 +539,24 @@ def _flush_batch(
         f"INSERT INTO {_quote(RAW_EVENTS_TABLE)} ({quoted_columns}) "
         f"VALUES ({placeholders}) ON DUPLICATE KEY UPDATE {update_clause}"
     )
-    return executemany_chunked(cursor, connection, sql, rows)
+    written = executemany_chunked(cursor, connection, sql, rows)
+
+    if overflow_rows:
+        # Written before the caller deletes the source documents from Mongo:
+        # if this raises, the docs stay in Mongo and the watermark is not
+        # advanced, so the batch is retried on the next run.
+        executemany_chunked(
+            cursor,
+            connection,
+            f"INSERT INTO {_quote(OVERFLOW_TABLE)} (`event_id`, `overflow`) VALUES (%s, %s) "
+            "ON DUPLICATE KEY UPDATE `overflow` = VALUES(`overflow`)",
+            overflow_rows,
+        )
+        logger.info(
+            f"{log_prefix}: {len(overflow_rows)} event(s) had values that did not fit "
+            f"{RAW_EVENTS_TABLE} columns; stored in {OVERFLOW_TABLE}"
+        )
+    return written
 
 
 def _delete_ingested_documents(collection, event_ids: List[str]) -> int:
