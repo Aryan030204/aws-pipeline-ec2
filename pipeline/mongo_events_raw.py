@@ -61,6 +61,16 @@ RAW_EVENTS_TABLE = "mongo_events_summary"
 # limit and so cannot take even one more column.
 OVERFLOW_TABLE = "mongo_events_overflow"
 
+# Widening an existing column to TEXT (a value didn't fit its inferred type)
+# rebuilds the whole table, which on a big mongo_events_summary outlasts the
+# connector's read timeout and blocks writes. So it is OFF by default: such
+# values go to the overflow table, and the column is widened once, off-peak,
+# by hand (ALTER TABLE ... MODIFY COLUMN `x` TEXT NULL). Set true only for
+# small tables.
+AUTO_WIDEN_TO_TEXT = (
+    os.environ.get("MONGO_EVENTS_AUTO_WIDEN_TO_TEXT", "false").strip().lower() == "true"
+)
+
 # Total-column guardrail (fixed + dynamic). A runaway key producing thousands
 # of columns would blow MySQL's row-size/column limits; past this cap, new keys
 # are skipped with an error log instead.
@@ -451,7 +461,11 @@ def _flush_batch(
                     continue
                 if category == "int" and isinstance(value, float) and not value.is_integer():
                     widen_definitions.setdefault(lower, (actual, "DOUBLE"))
-                elif category in _NARROW_CATEGORIES and _coerce_value(value, category) is _MISMATCH:
+                elif (
+                    AUTO_WIDEN_TO_TEXT
+                    and category in _NARROW_CATEGORIES
+                    and _coerce_value(value, category) is _MISMATCH
+                ):
                     # e.g. '' / '#627813' arriving for a column first created
                     # as BIGINT: widen to TEXT instead of nulling the value.
                     # TEXT wins over a DOUBLE queued for the same column.

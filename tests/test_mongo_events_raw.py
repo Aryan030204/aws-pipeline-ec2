@@ -303,6 +303,7 @@ class FlushBatchTests(unittest.TestCase):
                 return {event_id: json.loads(payload) for event_id, payload in rows}
         return {}
 
+    @mock.patch.object(raw, "AUTO_WIDEN_TO_TEXT", True)
     def test_mismatched_value_widens_the_column_to_text_and_keeps_the_value(self):
         cursor = FakeCursor(_fixed_show_columns_rows() + [("score", "bigint")])
         good = raw._build_record(dict(SAMPLE_DOC, score=7))
@@ -313,6 +314,7 @@ class FlushBatchTests(unittest.TestCase):
         self.assertEqual([r["score"] for r in self._main_rows(cursor)], ["7", "not a number"])
         self.assertEqual(self._overflow(cursor), {})
 
+    @mock.patch.object(raw, "AUTO_WIDEN_TO_TEXT", True)
     def test_empty_string_into_int_column_is_kept_not_nulled(self):
         cursor = FakeCursor(_fixed_show_columns_rows() + [("data_custom_data_customer_id", "bigint")])
         record = raw._build_record(
@@ -323,6 +325,7 @@ class FlushBatchTests(unittest.TestCase):
         self.assertIn("MODIFY COLUMN `data_custom_data_customer_id` TEXT", " ".join(cursor.alters))
         self.assertEqual(self._main_rows(cursor)[0]["data_custom_data_customer_id"], "")
 
+    @mock.patch.object(raw, "AUTO_WIDEN_TO_TEXT", True)
     def test_failed_widen_keeps_original_value_in_overflow(self):
         cursor = FakeCursor(
             _fixed_show_columns_rows() + [("score", "bigint")], fail_alter_containing="`score`"
@@ -361,6 +364,16 @@ class FlushBatchTests(unittest.TestCase):
         )
         main_rows = self._main_rows(cursor)
         self.assertEqual(main_rows[0]["data_custom_data_order_type"], "cod")
+
+    def test_mismatch_goes_to_overflow_without_rebuilding_the_table_by_default(self):
+        cursor = FakeCursor(_fixed_show_columns_rows() + [("score", "bigint")])
+        good = raw._build_record(dict(SAMPLE_DOC, score=7))
+        bad = raw._build_record(dict(SAMPLE_DOC, event_id="e2", score="not a number"))
+        self._flush([good, bad], cursor)
+
+        self.assertNotIn("MODIFY COLUMN", " ".join(cursor.alters))
+        self.assertEqual([r["score"] for r in self._main_rows(cursor)], [7, None])
+        self.assertEqual(self._overflow(cursor), {"e2": {"score": "not a number"}})
 
     def test_column_cap_sends_values_to_overflow(self):
         record = raw._build_record(dict(SAMPLE_DOC))
