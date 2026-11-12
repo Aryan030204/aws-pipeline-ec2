@@ -113,6 +113,45 @@ class MetaFetchTests(unittest.TestCase):
         self.assertEqual(meta["a1"]["landing_url"], "https://b.com/products/deal-5")
 
 
+class MetaInsightsChunkingTests(unittest.TestCase):
+    @staticmethod
+    def _ranges(get):
+        import json
+
+        return [json.loads(c.kwargs["params"]["time_range"]) for c in get.call_args_list]
+
+    def test_long_range_is_fetched_in_windows(self):
+        start = date(2026, 10, 13)
+        with patch.object(ap, "META_INSIGHTS_CHUNK_DAYS", 7), patch(
+            "requests.get", return_value=_response({"data": []})
+        ) as get:
+            ap.fetch_meta_ad_insights("tok", "123", start, start + timedelta(days=29))
+        ranges = self._ranges(get)
+        self.assertEqual(len(ranges), 5)
+        self.assertEqual(ranges[0], {"since": "2026-10-13", "until": "2026-10-19"})
+        self.assertEqual(ranges[-1], {"since": "2026-11-10", "until": "2026-11-11"})
+
+    def test_timed_out_window_is_split_in_half(self):
+        import requests
+
+        responses = [requests.ReadTimeout(), _response({"data": [_meta_insight(D1)]}), _response({"data": [_meta_insight(D2)]})]
+        with patch("requests.get", side_effect=responses) as get:
+            rows = ap.fetch_meta_ad_insights("tok", "123", D1, D2)
+        self.assertEqual([r["date"] for r in rows], [D1, D2])
+        self.assertEqual(self._ranges(get)[1:], [
+            {"since": D1.isoformat(), "until": D1.isoformat()},
+            {"since": D2.isoformat(), "until": D2.isoformat()},
+        ])
+
+    def test_single_day_timeout_retries_once_then_raises(self):
+        import requests
+
+        with patch("requests.get", side_effect=requests.ReadTimeout()) as get:
+            with self.assertRaises(ap.MetaTimeoutError):
+                ap.fetch_meta_ad_insights("tok", "123", D1, D1)
+        self.assertEqual(get.call_count, 2)
+
+
 class ShapeMetaTests(unittest.TestCase):
     def _fetched(self):
         with patch("requests.get", return_value=_response({"data": [
