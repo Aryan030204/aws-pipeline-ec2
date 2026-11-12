@@ -84,6 +84,11 @@ META_AD_FIELDS = (
     "creative{link_url,object_story_spec,asset_feed_spec,template_url_spec}"
 )
 META_IDS_BATCH = 50
+# Ad-level insights: fetched in date windows with smaller pages and a longer
+# read timeout than the account-level spend calls (see fetch_meta_ad_insights).
+META_INSIGHTS_CHUNK_DAYS = int(os.environ.get("META_INSIGHTS_CHUNK_DAYS", "7"))
+META_INSIGHTS_PAGE_SIZE = int(os.environ.get("META_INSIGHTS_PAGE_SIZE", "200"))
+META_INSIGHTS_TIMEOUT_S = int(os.environ.get("META_INSIGHTS_TIMEOUT_S", "90"))
 
 ALERT_RULES_COLLECTION = os.environ.get("ADS_ALERT_RULES_COLLECTION", "ads_alert_rules").strip() or "ads_alert_rules"
 ALERT_EVENTS_COLLECTION = os.environ.get("ADS_ALERT_EVENTS_COLLECTION", "ads_alert_events").strip() or "ads_alert_events"
@@ -205,19 +210,64 @@ def _add_metrics(target: Dict, source: Dict) -> None:
 # ---------------------------
 # Meta
 # ---------------------------
-def _meta_get(url: str, params: Optional[Dict], label: str) -> Dict:
+class MetaTimeoutError(pw.AdSpendSyncError):
+    """Meta didn't answer in time - usually the query is too big, so the
+    caller retries with a smaller date window."""
+
+
+def _meta_get(url: str, params: Optional[Dict], label: str, timeout: Optional[int] = None) -> Dict:
     import requests
 
     try:
-        response = requests.get(url, params=params, timeout=pw.AD_API_TIMEOUT_S)
+        response = requests.get(url, params=params, timeout=timeout or pw.AD_API_TIMEOUT_S)
+    except requests.Timeout as e:
+        raise MetaTimeoutError(f"{label} request failed: {e.__class__.__name__}") from e
     except requests.RequestException as e:
         raise pw.AdSpendSyncError(f"{label} request failed: {e.__class__.__name__}") from e
     return pw._json_or_raise(response, label)
 
 
+def _date_chunks(start: date, end: date, days: int) -> List[Tuple[date, date]]:
+    chunks = []
+    cursor = start
+    while cursor <= end:
+        chunk_end = min(cursor + timedelta(days=days - 1), end)
+        chunks.append((cursor, chunk_end))
+        cursor = chunk_end + timedelta(days=1)
+    return chunks
+
+
 def fetch_meta_ad_insights(access_token: str, ad_account_id: str, start: date, end: date) -> List[Dict]:
     """Daily ad-level insights for one account, normalized to ads_ad_daily
-    rows (without landing/product, filled in later)."""
+    rows (without landing/product, filled in later).
+
+    Ad-level x daily insights over a 30-day backfill is a heavy synchronous
+    query that Meta often can't answer before the read timeout, so the range
+    is fetched in META_INSIGHTS_CHUNK_DAYS windows and a window that still
+    times out is split in half (down to a single day, retried once)."""
+    rows: List[Dict] = []
+    for chunk_start, chunk_end in _date_chunks(start, end, max(1, META_INSIGHTS_CHUNK_DAYS)):
+        rows.extend(_fetch_meta_ad_insights_window(access_token, ad_account_id, chunk_start, chunk_end))
+    return rows
+
+
+def _fetch_meta_ad_insights_window(access_token: str, ad_account_id: str, start: date, end: date, retried: bool = False) -> List[Dict]:
+    try:
+        return _fetch_meta_ad_insights_range(access_token, ad_account_id, start, end)
+    except MetaTimeoutError:
+        if start < end:
+            mid = start + timedelta(days=(end - start).days // 2)
+            logger.warning("Meta ad insights timed out for %s..%s; splitting at %s", start, end, mid)
+            return _fetch_meta_ad_insights_window(access_token, ad_account_id, start, mid) + _fetch_meta_ad_insights_window(
+                access_token, ad_account_id, mid + timedelta(days=1), end
+            )
+        if not retried:
+            logger.warning("Meta ad insights timed out for %s; retrying once", start)
+            return _fetch_meta_ad_insights_window(access_token, ad_account_id, start, end, retried=True)
+        raise
+
+
+def _fetch_meta_ad_insights_range(access_token: str, ad_account_id: str, start: date, end: date) -> List[Dict]:
     account = pw.normalize_meta_ad_account_id(ad_account_id)
     url = f"{pw.META_GRAPH_URL}/{pw.META_API_VERSION}/{account}/insights"
     params: Optional[Dict] = {
@@ -225,12 +275,12 @@ def fetch_meta_ad_insights(access_token: str, ad_account_id: str, start: date, e
         "level": "ad",
         "time_increment": 1,
         "time_range": json.dumps({"since": start.isoformat(), "until": end.isoformat()}),
-        "limit": 500,
+        "limit": META_INSIGHTS_PAGE_SIZE,
         "access_token": access_token,
     }
     rows: List[Dict] = []
     for _ in range(pw.AD_API_MAX_PAGES):
-        payload = _meta_get(url, params, "Meta ad insights")
+        payload = _meta_get(url, params, "Meta ad insights", timeout=META_INSIGHTS_TIMEOUT_S)
         for item in payload.get("data") or []:
             if not item.get("date_start") or not item.get("ad_id"):
                 continue
