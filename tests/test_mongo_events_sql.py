@@ -29,7 +29,7 @@ class _DummyConnection:
 
 
 class _FakeCursor:
-    """Fakes a dict-cursor's SELECT ... FROM mongo_events_summary - rows are
+    """Fakes a dict-cursor's SELECT ... FROM raw_mongo_events - rows are
     given as dicts with event_type/session_id/cart_token/variantId/
     created_at_utc, matching what _fetch_candidate_rows expects back."""
 
@@ -55,12 +55,12 @@ def _row(event_type, session_id, cart_token, created_at, variant_id=None):
 
 
 class FetchCandidateRowsTests(unittest.TestCase):
-    def test_queries_mongo_events_summary_with_date_window_and_event_type(self):
+    def test_queries_raw_mongo_events_with_date_window_and_event_type(self):
         cursor = _FakeCursor([])
         mes._fetch_candidate_rows(cursor, date(2026, 8, 17), date(2026, 8, 17), IST, event_type="buy_now")
 
         sql, params = cursor.executed[0]
-        self.assertIn("FROM mongo_events_summary", sql)
+        self.assertIn("FROM raw_mongo_events", sql)
         self.assertIn("event_type = %s", sql)
         self.assertEqual(params[-1], "buy_now")
 

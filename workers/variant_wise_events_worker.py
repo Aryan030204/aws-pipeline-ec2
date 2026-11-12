@@ -9,7 +9,7 @@ worker writes into each brand's own database - the same place
 daily_ci_events_summary/daily_buy_now_events_summary already live - so it
 reuses the main pipeline's existing brand infrastructure (aws_background)
 rather than reimplementing per-brand DB config loading. Reads from that
-brand's own mongo_events_summary table (MySQL), not Mongo directly -
+brand's own raw_mongo_events table (MySQL), not Mongo directly -
 pipeline/mongo_events_raw.py is the only thing that still queries
 alerts.sessions. The fetch/dedup/aggregate/upsert logic lives in
 pipeline/mongo_events_sql.py (sync_variant_wise_events_summary_sql) and is

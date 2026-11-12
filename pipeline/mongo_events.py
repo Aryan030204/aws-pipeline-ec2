@@ -9,7 +9,7 @@ The Mongo-querying sync functions that used to live here (sync_checkout_
 initiated_ci_events, sync_buy_now_events, their variant counterparts,
 sync_variant_wise_events_summary, update_overall_summary_event_columns) have
 moved to pipeline/mongo_events_sql.py, which reads the same brand's own
-mongo_events_summary table (MySQL) instead of querying alerts.sessions
+raw_mongo_events table (MySQL) instead of querying alerts.sessions
 (Mongo) directly - see that module's docstring. pipeline/mongo_events_raw.py
 is now the only thing in this pipeline that still queries alerts.sessions.
 The upsert/table-maintenance functions below never touched Mongo in the

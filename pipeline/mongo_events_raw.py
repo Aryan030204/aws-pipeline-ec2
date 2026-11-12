@@ -1,26 +1,40 @@
 """
 Raw alerts.sessions event ingestion: every document from the main cluster's
 alerts.sessions collection is stored, one row per event, in a per-brand
-mongo_events_summary table (in the brand's own database, not the master DB).
+raw_mongo_events table (in the brand's own database, not the master DB).
 
-Unlike the aggregate syncs in pipeline/mongo_events.py (counts only), this
-keeps the full payload. The table's schema follows the documents' keys:
-- Nested objects are flattened into columns (data.click -> data_click).
-- A key never seen before gets its column created automatically (type
-  inferred from the first non-null value), and the value is ingested in
-  the same run.
+This replaces the older mongo_events_summary table, whose per-key typed columns
+turned values into NULL (a value that did not fit the column type inferred from
+the first value ever seen) and dropped keys once MySQL's row-size limit was
+reached. The design here cannot do either:
+
+- Nested objects are flattened into columns (data.custom_data.order_name ->
+  data_custom_data_order_name). A key never seen before gets its column created
+  automatically and the value is ingested in the same run.
+- Every dynamic column is MEDIUMTEXT and every value is stored as text
+  (numbers as their digits, booleans as true/false, lists/objects as JSON,
+  empty strings as empty strings). There is no inferred type, so there is no
+  type mismatch and no table rebuild (ADD COLUMN is cheap).
+- A value that still cannot get its own column (column cap reached, MySQL
+  row-size limit, two keys that collide on one case-insensitive column name,
+  or a value longer than an indexed column allows) is kept in the same row's
+  `extra_data` column as JSON {flattened_name: original_value}. A document's
+  value is therefore always stored - either in its column or in extra_data -
+  before the source document is deleted from Mongo.
 - createdAt/updatedAt (UTC in Mongo) become four columns:
   created_at_utc, updated_at_utc, created_at_ist, updated_at_ist.
 - _id and idempotency_key are not stored.
-- A value that does not fit its column's type widens the column to TEXT (a
-  value is never replaced by NULL). Anything that still cannot be stored in
-  the main table (column could not be added, column cap, failed widen) goes to
-  the mongo_events_overflow table instead, so nothing is lost before the
-  source document is deleted from Mongo.
 
 Rows are keyed by event_id and upserted, so re-running the same window is
 idempotent (no duplicates), and late-arriving events are picked up by the
 rolling window the worker/backfill pass in.
+
+Migration is automatic, per brand, on the first run after deploy: the table is
+created if missing, and the history in the legacy mongo_events_summary table
+(the columns the rollups read: event_id/type, session, cart_token, variantId,
+user_agent, url, timestamps) is copied into it newest-first, in small chunks,
+a few days per run, resumable and idempotent (INSERT IGNORE). The legacy table
+is left untouched.
 """
 
 import hashlib
@@ -49,91 +63,85 @@ from pipeline.mongo_events import (
 # the sync is actually called (same pattern as pipeline/mongo_events.py).
 import aws_background
 
-RAW_EVENTS_TABLE = "mongo_events_summary"
+RAW_EVENTS_TABLE = "raw_mongo_events"
+LEGACY_EVENTS_TABLE = "mongo_events_summary"
 
-# Safety net so no Mongo value is ever lost. Any flattened key/value that cannot
-# be stored in a mongo_events_summary column (the column could not be created -
-# e.g. MySQL's row-size limit - hit the column cap, or the value can't be
-# converted to the column's type) is kept here instead, one row per event:
-#   overflow = JSON text {flattened_column_name: original_value}
-# Read it with e.g. JSON_UNQUOTE(JSON_EXTRACT(overflow, '$.data_custom_data_sku')).
-# It is a separate table because the main table may already be at the row-size
-# limit and so cannot take even one more column.
-OVERFLOW_TABLE = "mongo_events_overflow"
-
-# Widening an existing column to TEXT (a value didn't fit its inferred type)
-# rebuilds the whole table, which on a big mongo_events_summary outlasts the
-# connector's read timeout and blocks writes. So it is OFF by default: such
-# values go to the overflow table, and the column is widened once, off-peak,
-# by hand (ALTER TABLE ... MODIFY COLUMN `x` TEXT NULL). Set true only for
-# small tables.
-AUTO_WIDEN_TO_TEXT = (
-    os.environ.get("MONGO_EVENTS_AUTO_WIDEN_TO_TEXT", "false").strip().lower() == "true"
-)
-
-# Total-column guardrail (fixed + dynamic). A runaway key producing thousands
-# of columns would blow MySQL's row-size/column limits; past this cap, new keys
-# are skipped with an error log instead.
-MAX_COLUMNS = int(os.environ.get("MONGO_EVENTS_MAX_COLUMNS", "400"))
+# Total-column guardrail (fixed + dynamic). Every dynamic column is a
+# TEXT-family column that counts ~20 bytes toward InnoDB's 8,126-byte row
+# limit, so ~380 columns is the hard ceiling; 300 leaves headroom. Past it (or
+# once MySQL itself refuses a column) new keys are stored in extra_data.
+MAX_COLUMNS = int(os.environ.get("MONGO_EVENTS_MAX_COLUMNS", "300"))
 BATCH_SIZE = int(os.environ.get("MONGO_EVENTS_RAW_BATCH_SIZE", "2000"))
 
 # Incremental ingest (live worker path, no explicit start/end given): watermark
-# on createdAt (server-set, not user/tracker-written - see pipeline/intent_events.py's
-# identical reasoning for why createdAt, not a client timestamp). 5-minute
-# overlap re-checks the boundary in case of any in-flight writes at query time;
-# the upsert is idempotent so re-matching a handful of already-ingested docs is
-# harmless (and if delete-after-ingest already removed them, they just won't
-# match the query at all).
+# on createdAt (server-set, not user/tracker-written). The metadata key is the
+# same one the legacy table used, so the cutover to raw_mongo_events continues
+# exactly where the old ingest stopped. 5-minute overlap re-checks the boundary
+# in case of any in-flight writes at query time; the upsert is idempotent so
+# re-matching a handful of already-ingested docs is harmless.
 RAW_EVENTS_METADATA_KEY = "mongo_events_raw_last_created_at"
 RAW_EVENTS_OVERLAP = timedelta(minutes=5)
 # First run under this watermark key: look back further than one 15-minute
-# cycle to recover anything the old daily-window job's last run missed. Safe -
-# idempotent upsert, and ingested docs get deleted, so what's left to re-scan
-# next run is small.
+# cycle. Safe - idempotent upsert, and ingested docs get deleted.
 RAW_EVENTS_DEFAULT_LOOKBACK = timedelta(hours=24)
 
 # Deletes each batch's documents from Mongo once it's durably upserted into
-# mongo_events_summary, so the alerts.sessions collection doesn't grow
-# unbounded. Every document here is a one-shot event (no mutable-rollup
-# analog like the Intent cluster's session_history), so there's no excluded
-# sub-stream - everything successfully ingested is eligible for deletion.
+# raw_mongo_events, so the alerts.sessions collection doesn't grow unbounded.
 MONGO_EVENTS_DELETE_INGESTED_DOCS = (
     os.environ.get("MONGO_EVENTS_DELETE_INGESTED_DOCS", "true").strip().lower() == "true"
 )
 
+# Legacy history copy (mongo_events_summary -> raw_mongo_events).
+LEGACY_COPY_ENABLED = (
+    os.environ.get("MONGO_EVENTS_LEGACY_COPY", "true").strip().lower() == "true"
+)
+LEGACY_COPY_CHUNK_HOURS = int(os.environ.get("MONGO_EVENTS_LEGACY_COPY_CHUNK_HOURS", "6"))
+LEGACY_COPY_CHUNKS_PER_RUN = int(os.environ.get("MONGO_EVENTS_LEGACY_COPY_CHUNKS_PER_RUN", "12"))
+LEGACY_COPY_PROGRESS_KEY = "raw_mongo_events_legacy_copy_oldest_utc"
+LEGACY_COPY_DONE_KEY = "raw_mongo_events_legacy_copy_done_at"
+_LEGACY_COPY_COLUMNS = [
+    "event_id", "event_type", "session_id", "shop_name", "cart_token",
+    "variantId", "user_agent", "url",
+    "created_at_utc", "updated_at_utc", "created_at_ist", "updated_at_ist",
+]
+
 MAX_FLATTEN_DEPTH = 5
 MYSQL_MAX_IDENTIFIER_LENGTH = 64
-_BIGINT_MIN = -(2**63)
-_BIGINT_MAX = 2**63 - 1
 
 # Top-level keys never stored as-is: _id / idempotency_key are deliberately
 # dropped; createdAt/updatedAt are replaced by the four *_utc/*_ist columns;
 # event_id is the primary key column.
 _EXCLUDED_TOP_LEVEL_KEYS = {"_id", "idempotency_key", "createdAt", "updatedAt", "event_id"}
 
-# Columns created up front. Anything else is discovered dynamically.
-# variantId is TEXT because it is null / int / list / comma-string in the wild.
+# Columns created up front. Anything else is discovered dynamically (MEDIUMTEXT).
 _FIXED_COLUMNS: Dict[str, str] = {
-    "event_id": "VARCHAR(64) NOT NULL",
-    "event_type": "VARCHAR(100) NULL",
-    "session_id": "VARCHAR(100) NULL",
-    "shop_name": "VARCHAR(100) NULL",
+    "event_id": "VARCHAR(255) NOT NULL",
+    "event_type": "VARCHAR(255) NULL",
+    "session_id": "VARCHAR(255) NULL",
+    "shop_name": "VARCHAR(255) NULL",
     "cart_token": "VARCHAR(255) NULL",
-    "variantId": "TEXT NULL",
-    "user_agent": "TEXT NULL",
-    "url": "TEXT NULL",
+    "variantId": "MEDIUMTEXT NULL",
+    "user_agent": "MEDIUMTEXT NULL",
+    "url": "MEDIUMTEXT NULL",
     "created_at_utc": "DATETIME(3) NULL",
     "updated_at_utc": "DATETIME(3) NULL",
     "created_at_ist": "DATETIME(3) NULL",
     "updated_at_ist": "DATETIME(3) NULL",
+    "extra_data": "LONGTEXT NULL",
 }
-
-# Sentinel: value cannot be stored in its column's type.
-_MISMATCH = object()
-
-# Column categories whose type can reject a value; such a column is widened
-# to TEXT when that happens (json/str columns accept anything).
-_NARROW_CATEGORIES = {"int", "bool", "float", "datetime"}
+_TIMESTAMP_COLUMNS = {"created_at_utc", "updated_at_utc", "created_at_ist", "updated_at_ist"}
+# Indexed VARCHAR columns: a longer value keeps its full text in extra_data and
+# a prefix here, instead of failing the whole batch with "Data too long".
+_VARCHAR_LIMITS = {
+    "event_id": 255,
+    "event_type": 255,
+    "session_id": 255,
+    "shop_name": 255,
+    "cart_token": 255,
+}
+# Names a Mongo key can never claim (they would collide with our own columns);
+# such a key's value goes to extra_data under its original name.
+_RESERVED_NAMES = {"extra_data", "ingested_at"}
 
 
 def _quote(identifier: str) -> str:
@@ -207,200 +215,102 @@ def _build_record(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return record
 
 
-def _infer_sql_type(value: Any) -> str:
-    if isinstance(value, bool):  # before int: bool is an int subclass
-        return "TINYINT(1)"
-    if isinstance(value, int):
-        return "BIGINT" if _BIGINT_MIN <= value <= _BIGINT_MAX else "TEXT"
-    if isinstance(value, float):
-        return "DOUBLE"
-    if isinstance(value, datetime):
-        return "DATETIME(3)"
-    if isinstance(value, (list, tuple, dict)):
-        return "JSON"
-    # str and anything exotic (ObjectId, Decimal128, ...): TEXT, not VARCHAR -
-    # wide flattened tables would exceed MySQL's 65,535-byte row limit.
-    return "TEXT"
-
-
-def _category_from_sql_type(sql_type: str) -> str:
-    t = str(sql_type).lower()
-    if t.startswith("tinyint"):
-        return "bool"
-    if t.startswith(("bigint", "int", "smallint", "mediumint")):
-        return "int"
-    if t.startswith(("double", "float", "decimal")):
-        return "float"
-    if t.startswith(("datetime", "timestamp")):
-        return "datetime"
-    if t.startswith("json"):
-        return "json"
-    return "str"
-
-
 def _json_default(value: Any) -> str:
     if isinstance(value, datetime):
         return value.isoformat()
     return str(value)
 
 
-def _coerce_value(value: Any, category: str) -> Any:
-    """Convert a raw Mongo value to what its column type accepts. Returns
-    _MISMATCH when it can't (caller stores NULL) - a stray odd value must
-    never fail a whole batch."""
+def _to_text(value: Any) -> Optional[str]:
+    """Every stored value is text: nothing is ever rejected for its type.
+    Empty strings stay empty strings (not NULL)."""
     if value is None:
         return None
-    if category == "json":
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):  # before int: bool is an int subclass
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple, dict)):
         return json.dumps(value, default=_json_default)
-    if category == "str":
-        if isinstance(value, str):
-            return value
-        if isinstance(value, bool):
-            return "true" if value else "false"
-        if isinstance(value, (list, tuple, dict)):
-            return json.dumps(value, default=_json_default)
-        if isinstance(value, datetime):
-            return value.isoformat()
-        return str(value)
-    if category == "int":
-        if isinstance(value, bool):
-            return int(value)
-        if isinstance(value, int):
-            return value if _BIGINT_MIN <= value <= _BIGINT_MAX else _MISMATCH
-        if isinstance(value, float) and value.is_integer():
-            return int(value)
-        return _MISMATCH
-    if category == "bool":
-        if isinstance(value, bool):
-            return int(value)
-        if isinstance(value, int) and value in (0, 1):
-            return value
-        return _MISMATCH
-    if category == "float":
-        if isinstance(value, (bool, int, float)):
-            return float(value)
-        return _MISMATCH
-    if category == "datetime":
-        if isinstance(value, datetime):
-            return _naive(_to_utc(value)) if value.tzinfo is not None else value
-        return _MISMATCH
-    return _MISMATCH
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def _is_row_size_error(error: Exception) -> bool:
+    text = str(error)
+    return "1118" in text or "row size too large" in text.lower()
 
 
 class _ColumnCatalog:
     """The table's columns, cached for one brand run: case-insensitive name
     lookup (MySQL column names are case-insensitive, so `variantid` must
-    reuse `variantId` rather than collide with it) plus each column's type
-    category for coercion. Refreshed only by our own ALTERs."""
+    reuse `variantId` rather than collide with it). Refreshed only by our own
+    ALTERs."""
 
     def __init__(self, cursor, connection):
         self._cursor = cursor
         self._connection = connection
-        self._columns: Dict[str, Tuple[str, str]] = {}
-        # Lower-cased names whose ADD / MODIFY failed this run: not retried on
-        # every batch (their values go to the overflow table instead).
+        self._columns: Dict[str, str] = {}
+        # Lower-cased names whose ADD failed this run: not retried on every
+        # batch (their values go to extra_data instead).
         self.failed: set = set()
-        self.widen_failed: set = set()
+        # True once MySQL refused a column for row size: no further ADDs this run.
+        self.full = False
         self._load()
 
     def _load(self) -> None:
         self._cursor.execute(f"SHOW COLUMNS FROM {_quote(RAW_EVENTS_TABLE)}")
         for row in self._cursor.fetchall() or []:
-            if isinstance(row, dict):
-                name, sql_type = row["Field"], row["Type"]
-            else:
-                name, sql_type = row[0], row[1]
-            if isinstance(sql_type, (bytes, bytearray)):
-                sql_type = sql_type.decode()
-            name = str(name)
-            self._columns[name.lower()] = (name, _category_from_sql_type(sql_type))
+            name = row["Field"] if isinstance(row, dict) else row[0]
+            self._columns[str(name).lower()] = str(name)
 
-    def get(self, name: str) -> Optional[Tuple[str, str]]:
+    def get(self, name: str) -> Optional[str]:
         return self._columns.get(name.lower())
 
     def __len__(self) -> int:
         return len(self._columns)
 
-    def add(self, definitions: List[Tuple[str, str]]) -> List[str]:
-        """ALTER TABLE ... ADD COLUMN for each (name, sql_type). Tries one
-        statement, falls back to one column at a time so a single bad column
-        (e.g. row-size limit) doesn't block the rest. Returns names added."""
+    def add(self, names: List[str]) -> List[str]:
+        """ALTER TABLE ... ADD COLUMN <name> MEDIUMTEXT NULL for each name.
+        Tries one statement, falls back to one column at a time so a single
+        bad column doesn't block the rest. Stops adding as soon as MySQL
+        reports the row-size limit (1118) - everything after goes to
+        extra_data. Returns the names added."""
         added: List[str] = []
-        if not definitions:
+        if not names:
             return added
 
-        def _alter(defs: List[Tuple[str, str]]) -> None:
-            clauses = ", ".join(f"ADD COLUMN {_quote(n)} {t} NULL" for n, t in defs)
+        def _alter(batch: List[str]) -> None:
+            clauses = ", ".join(f"ADD COLUMN {_quote(n)} MEDIUMTEXT NULL" for n in batch)
             self._cursor.execute(f"ALTER TABLE {_quote(RAW_EVENTS_TABLE)} {clauses}")
             self._connection.commit()
 
         try:
-            _alter(definitions)
-            groups = [definitions]
+            _alter(names)
+            added = list(names)
         except Exception as e:
             logger.warning(
-                f"[raw events] combined ALTER for {len(definitions)} new column(s) failed "
+                f"[raw events] combined ALTER for {len(names)} new column(s) failed "
                 f"({e}); retrying one at a time"
             )
-            groups = []
-            for definition in definitions:
+            for index, name in enumerate(names):
                 try:
-                    _alter([definition])
-                    groups.append([definition])
+                    _alter([name])
+                    added.append(name)
                 except Exception as single_error:
-                    self.failed.add(definition[0].lower())
+                    self.failed.add(name.lower())
                     logger.error(
-                        f"[raw events] could not add column {definition[0]!r} "
-                        f"({definition[1]}): {single_error}; its values go to "
-                        f"{OVERFLOW_TABLE}"
+                        f"[raw events] could not add column {name!r}: {single_error}; "
+                        "its values go to extra_data"
                     )
-        for group in groups:
-            for name, sql_type in group:
-                self._columns[name.lower()] = (name, _category_from_sql_type(sql_type))
-                added.append(name)
+                    if _is_row_size_error(single_error):
+                        self.full = True
+                        self.failed.update(n.lower() for n in names[index + 1:])
+                        break
+        for name in added:
+            self._columns[name.lower()] = name
         return added
-
-    def widen(self, definitions: List[Tuple[str, str]]) -> List[str]:
-        """ALTER TABLE ... MODIFY COLUMN for each (name, sql_type), widening
-        an existing column whose type (inferred from its first-seen value)
-        turns out too narrow for a later value - e.g. a price column created
-        as BIGINT from an early whole-number value, widened to DOUBLE once a
-        decimal value arrives, instead of silently storing NULL for it. Same
-        combined-then-one-at-a-time fallback as add()."""
-        widened: List[str] = []
-        if not definitions:
-            return widened
-
-        def _alter(defs: List[Tuple[str, str]]) -> None:
-            clauses = ", ".join(f"MODIFY COLUMN {_quote(n)} {t} NULL" for n, t in defs)
-            self._cursor.execute(f"ALTER TABLE {_quote(RAW_EVENTS_TABLE)} {clauses}")
-            self._connection.commit()
-
-        try:
-            _alter(definitions)
-            groups = [definitions]
-        except Exception as e:
-            logger.warning(
-                f"[raw events] combined MODIFY for {len(definitions)} widened column(s) failed "
-                f"({e}); retrying one at a time"
-            )
-            groups = []
-            for definition in definitions:
-                try:
-                    _alter([definition])
-                    groups.append([definition])
-                except Exception as single_error:
-                    self.widen_failed.add(definition[0].lower())
-                    logger.error(
-                        f"[raw events] could not widen column {definition[0]!r} "
-                        f"to {definition[1]}: {single_error}; non-fitting values go to "
-                        f"{OVERFLOW_TABLE}"
-                    )
-        for group in groups:
-            for name, sql_type in group:
-                self._columns[name.lower()] = (name, _category_from_sql_type(sql_type))
-                widened.append(name)
-        return widened
 
 
 def _ensure_raw_events_table(cursor, connection) -> None:
@@ -415,17 +325,7 @@ def _ensure_raw_events_table(cursor, connection) -> None:
             KEY `idx_session_id` (`session_id`),
             KEY `idx_cart_token` (`cart_token`),
             KEY `idx_created_at_utc` (`created_at_utc`)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """
-    )
-    cursor.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {_quote(OVERFLOW_TABLE)} (
-            `event_id` VARCHAR(64) NOT NULL,
-            `overflow` LONGTEXT NOT NULL,
-            `ingested_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (`event_id`)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC
         """
     )
     connection.commit()
@@ -439,105 +339,79 @@ def _flush_batch(
     warned: set,
     log_prefix: str,
 ) -> int:
-    """Discover+create any new columns, coerce values, and upsert one batch."""
+    """Discover+create any new columns, convert values to text, and upsert one
+    batch. Whatever cannot be placed in a column goes to the row's extra_data."""
     if not records:
         return 0
 
     # 1. Discover new keys. A key that is null in every record so far creates
-    #    no column yet (its type is unknowable); it will once a value appears.
-    #    Also detect existing int columns that need widening to DOUBLE - a
-    #    column whose first-seen value was a whole number (e.g. 300) gets
-    #    BIGINT, but a later decimal value (299.5) for the same key can't fit
-    #    it; widen instead of letting that value fall back to NULL.
-    new_definitions: Dict[str, Tuple[str, str]] = {}
-    widen_definitions: Dict[str, Tuple[str, str]] = {}
-    for record in records:
-        for name, value in record.items():
-            lower = name.lower()
-            entry = catalog.get(name)
-            if entry is not None:
-                actual, category = entry
-                if value is None or lower in catalog.widen_failed:
+    #    no column yet (there is nothing to store); it will once a value appears.
+    if not catalog.full:
+        new_names: Dict[str, str] = {}
+        for record in records:
+            for name, value in record.items():
+                if value is None:
                     continue
-                if category == "int" and isinstance(value, float) and not value.is_integer():
-                    widen_definitions.setdefault(lower, (actual, "DOUBLE"))
-                elif (
-                    AUTO_WIDEN_TO_TEXT
-                    and category in _NARROW_CATEGORIES
-                    and _coerce_value(value, category) is _MISMATCH
+                lower = name.lower()
+                if (
+                    lower in _RESERVED_NAMES
+                    or catalog.get(name) is not None
+                    or lower in new_names
+                    or lower in catalog.failed
                 ):
-                    # e.g. '' / '#627813' arriving for a column first created
-                    # as BIGINT: widen to TEXT instead of nulling the value.
-                    # TEXT wins over a DOUBLE queued for the same column.
-                    widen_definitions[lower] = (actual, "TEXT")
-                continue
-            if value is None or lower in new_definitions or lower in catalog.failed:
-                continue
-            if len(catalog) + len(new_definitions) >= MAX_COLUMNS:
-                if "__cap__" not in warned:
-                    warned.add("__cap__")
-                    logger.error(
-                        f"{log_prefix}: column cap of {MAX_COLUMNS} reached; new keys "
-                        f"(e.g. {name!r}) are skipped. Raise MONGO_EVENTS_MAX_COLUMNS if intended."
-                    )
-                continue
-            new_definitions[lower] = (name, _infer_sql_type(value))
+                    continue
+                if len(catalog) + len(new_names) >= MAX_COLUMNS:
+                    if "__cap__" not in warned:
+                        warned.add("__cap__")
+                        logger.error(
+                            f"{log_prefix}: column cap of {MAX_COLUMNS} reached; new keys "
+                            f"(e.g. {name!r}) are stored in extra_data. Raise "
+                            "MONGO_EVENTS_MAX_COLUMNS only if the table has row-size room."
+                        )
+                    continue
+                new_names[lower] = name
+        if new_names:
+            added = catalog.add(list(new_names.values()))
+            if added:
+                logger.info(f"{log_prefix}: discovered and added {len(added)} new column(s): {added}")
 
-    if new_definitions:
-        added = catalog.add(list(new_definitions.values()))
-        if added:
-            logger.info(f"{log_prefix}: discovered and added {len(added)} new column(s): {added}")
-
-    if widen_definitions:
-        widened = catalog.widen(list(widen_definitions.values()))
-        if widened:
-            logger.info(
-                f"{log_prefix}: widened {len(widened)} column(s) "
-                f"(value did not fit the inferred type): {widened}"
-            )
-
-    # 2. Map/coerce each record onto real column names. Whatever cannot be
-    #    placed in a column goes to the overflow table, never dropped.
+    # 2. Map each record onto real column names, converting values to text.
     mapped_records: List[Dict[str, Any]] = []
-    overflow_rows: List[Tuple[str, str]] = []
     column_order: Dict[str, None] = {name: None for name in _FIXED_COLUMNS}
     for record in records:
         mapped: Dict[str, Any] = {}
-        overflow: Dict[str, Any] = {}
+        extra: Dict[str, Any] = {}
+        used: set = set()
         for name, value in record.items():
-            entry = catalog.get(name)
-            if entry is None:
-                # null-only key (nothing to store), capped, or failed ALTER
-                if value is not None:
-                    overflow[name] = value
-                    if ("no-col", name.lower()) not in warned:
-                        warned.add(("no-col", name.lower()))
-                        logger.warning(
-                            f"{log_prefix}: no column for key {name!r}; storing its "
-                            f"values in {OVERFLOW_TABLE} (logged once per key per run)"
-                        )
+            if value is None:
                 continue
-            actual, category = entry
-            coerced = _coerce_value(value, category)
-            if coerced is _MISMATCH:
-                # Widening to TEXT failed (or was skipped): keep the original
-                # value in the overflow table rather than losing it.
-                overflow[name] = value
-                if actual.lower() not in warned:
-                    warned.add(actual.lower())
+            lower = name.lower()
+            actual = None if lower in _RESERVED_NAMES else catalog.get(name)
+            if actual is None or lower in used:
+                # no column (cap / failed ALTER / reserved name) or a second key
+                # that collides, case-insensitively, with one already mapped
+                extra[name] = value
+                if ("no-col", lower) not in warned:
+                    warned.add(("no-col", lower))
                     logger.warning(
-                        f"{log_prefix}: value {value!r} does not fit column {actual!r} "
-                        f"({category}); column left NULL, value stored in {OVERFLOW_TABLE} "
-                        "(further mismatches for this column this run are not logged)"
+                        f"{log_prefix}: no own column for key {name!r}; its values are "
+                        "kept in extra_data (logged once per key per run)"
                     )
-                coerced = None
-            mapped[actual] = coerced
+                continue
+            used.add(lower)
+            if actual in _TIMESTAMP_COLUMNS:
+                mapped[actual] = value
+            else:
+                text = _to_text(value)
+                limit = _VARCHAR_LIMITS.get(actual)
+                if limit is not None and text is not None and len(text) > limit:
+                    extra[name] = text  # full value preserved
+                    text = text[:limit]
+                mapped[actual] = text
             column_order.setdefault(actual, None)
+        if extra:
+            mapped["extra_data"] = json.dumps(extra, default=_json_default)
         mapped_records.append(mapped)
-        if overflow:
-            overflow_rows.append(
-                (record["event_id"], json.dumps(overflow, default=_json_default))
-            )
 
     columns = [c for c in column_order if any(c in m for m in mapped_records)]
     if "event_id" not in columns:
@@ -553,24 +427,95 @@ def _flush_batch(
         f"INSERT INTO {_quote(RAW_EVENTS_TABLE)} ({quoted_columns}) "
         f"VALUES ({placeholders}) ON DUPLICATE KEY UPDATE {update_clause}"
     )
-    written = executemany_chunked(cursor, connection, sql, rows)
+    return executemany_chunked(cursor, connection, sql, rows)
 
-    if overflow_rows:
-        # Written before the caller deletes the source documents from Mongo:
-        # if this raises, the docs stay in Mongo and the watermark is not
-        # advanced, so the batch is retried on the next run.
-        executemany_chunked(
-            cursor,
-            connection,
-            f"INSERT INTO {_quote(OVERFLOW_TABLE)} (`event_id`, `overflow`) VALUES (%s, %s) "
-            "ON DUPLICATE KEY UPDATE `overflow` = VALUES(`overflow`)",
-            overflow_rows,
+
+def _table_columns(cursor, table: str) -> set:
+    cursor.execute(
+        "SELECT column_name AS col FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = %s",
+        (table,),
+    )
+    names = set()
+    for row in cursor.fetchall() or []:
+        names.add(str(row["col"] if isinstance(row, dict) else row[0]))
+    return names
+
+
+def _floor_hour(value: datetime) -> datetime:
+    return value.replace(minute=0, second=0, microsecond=0)
+
+
+def _copy_legacy_history(cursor, connection, log_prefix: str) -> int:
+    """Copy the legacy mongo_events_summary rows into raw_mongo_events, newest
+    first, LEGACY_COPY_CHUNK_HOURS at a time, at most LEGACY_COPY_CHUNKS_PER_RUN
+    chunks per call (so one 15-minute cycle never gets long). Newest-first means
+    the days the rollups recompute are complete first. Progress is stored in
+    pipeline_metadata, so it resumes across runs; INSERT IGNORE means rows
+    already ingested live (which are authoritative) are never overwritten.
+    Returns the number of rows copied this call."""
+    if not LEGACY_COPY_ENABLED:
+        return 0
+    if get_pipeline_metadata_timestamp(cursor, LEGACY_COPY_DONE_KEY) is not None:
+        return 0
+
+    legacy_columns = _table_columns(cursor, LEGACY_EVENTS_TABLE)
+    if not legacy_columns:
+        update_pipeline_metadata_timestamp(cursor, connection, LEGACY_COPY_DONE_KEY, datetime.now(IST))
+        return 0
+    columns = [c for c in _LEGACY_COPY_COLUMNS if c in legacy_columns]
+    if "event_id" not in columns or "created_at_utc" not in columns:
+        logger.warning(f"{log_prefix}: legacy table lacks event_id/created_at_utc; history copy skipped")
+        return 0
+
+    cursor.execute(
+        f"SELECT MIN(created_at_utc) AS lo, MAX(created_at_utc) AS hi FROM {_quote(LEGACY_EVENTS_TABLE)}"
+    )
+    row = cursor.fetchone()
+    lo = row["lo"] if isinstance(row, dict) else (row[0] if row else None)
+    hi = row["hi"] if isinstance(row, dict) else (row[1] if row else None)
+    if lo is None or hi is None:
+        update_pipeline_metadata_timestamp(cursor, connection, LEGACY_COPY_DONE_KEY, datetime.now(IST))
+        return 0
+
+    floor_lo = _floor_hour(lo)
+    stored = get_pipeline_metadata_timestamp(cursor, LEGACY_COPY_PROGRESS_KEY)
+    if stored is None:
+        boundary = _floor_hour(hi) + timedelta(hours=1)  # exclusive upper bound, covers hi
+    else:
+        boundary = stored.astimezone(timezone.utc).replace(tzinfo=None)
+
+    chunk = timedelta(hours=max(1, LEGACY_COPY_CHUNK_HOURS))
+    quoted = ", ".join(_quote(c) for c in columns)
+    sql = (
+        f"INSERT IGNORE INTO {_quote(RAW_EVENTS_TABLE)} ({quoted}) "
+        f"SELECT {quoted} FROM {_quote(LEGACY_EVENTS_TABLE)} "
+        "WHERE created_at_utc >= %s AND created_at_utc < %s"
+    )
+
+    copied = 0
+    chunks = 0
+    while boundary > floor_lo and chunks < LEGACY_COPY_CHUNKS_PER_RUN:
+        start = max(boundary - chunk, floor_lo)
+        cursor.execute(sql, (start, boundary))
+        copied += max(getattr(cursor, "rowcount", 0) or 0, 0)
+        connection.commit()
+        boundary = start
+        update_pipeline_metadata_timestamp(
+            cursor, connection, LEGACY_COPY_PROGRESS_KEY,
+            boundary.replace(tzinfo=timezone.utc).astimezone(IST),
         )
-        logger.info(
-            f"{log_prefix}: {len(overflow_rows)} event(s) had values that did not fit "
-            f"{RAW_EVENTS_TABLE} columns; stored in {OVERFLOW_TABLE}"
-        )
-    return written
+        chunks += 1
+
+    finished = boundary <= floor_lo
+    if finished:
+        update_pipeline_metadata_timestamp(cursor, connection, LEGACY_COPY_DONE_KEY, datetime.now(IST))
+    logger.info(
+        f"{log_prefix}: legacy history copy {'finished' if finished else 'in progress'} - "
+        f"{copied} row(s) copied this run, copied back to {boundary:%Y-%m-%d %H:%M} UTC "
+        f"(oldest legacy row {lo:%Y-%m-%d %H:%M} UTC)"
+    )
+    return copied
 
 
 def _delete_ingested_documents(collection, event_ids: List[str]) -> int:
@@ -600,7 +545,7 @@ def sync_mongo_events_raw_for_brand(
     """
     Returns the set of IST date strings (YYYY-MM-DD) touched by whatever was
     upserted this call - callers (events-summary-worker) use this to know
-    which dates' CI/buy-now rollups need recomputing from mongo_events_summary,
+    which dates' CI/buy-now rollups need recomputing from raw_mongo_events,
     without rescanning dates nothing changed for. Empty set on a brand-skip
     or an error (logged, not raised - matches every other per-brand sync in
     this pipeline).
@@ -643,9 +588,13 @@ def sync_mongo_events_raw_for_brand(
         started_at = time.monotonic()
         _ensure_raw_events_table(c, conn)
         catalog = _ColumnCatalog(c, conn)
-        # Belt and braces for a table created by an older version of this code.
-        catalog.add([(n, t.replace(" NOT NULL", "").replace(" NULL", ""))
-                     for n, t in _FIXED_COLUMNS.items() if catalog.get(n) is None])
+
+        # Automatic migration of the legacy table's history. A failure here
+        # must not stop live ingestion; it just retries next run.
+        try:
+            _copy_legacy_history(c, conn, log_prefix)
+        except Exception as e:
+            logger.error(f"{log_prefix}: legacy history copy failed (will retry next run): {e}")
 
         if explicit_window:
             lower_bound = query_lower_bound

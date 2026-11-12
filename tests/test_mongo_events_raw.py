@@ -1,4 +1,5 @@
 import json
+import re
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from unittest import mock
@@ -23,23 +24,25 @@ class FakeConnection:
 
 
 def _fixed_show_columns_rows():
-    rows = [
-        (name, definition.replace(" NOT NULL", "").replace(" NULL", "").lower())
-        for name, definition in raw._FIXED_COLUMNS.items()
-    ]
+    rows = [(name, "text") for name in raw._FIXED_COLUMNS]
     rows.append(("ingested_at", "datetime(6)"))
     return rows
 
 
 class FakeCursor:
     """Answers SHOW COLUMNS from a mutable column list (updated by ALTERs, like
-    a real table) and records everything else."""
+    a real table), simulates MySQL's row-size limit via max_columns, and
+    records everything else."""
 
-    def __init__(self, show_columns_rows=None, fail_alter_containing=None):
+    def __init__(self, show_columns_rows=None, max_columns=None, legacy_columns=None, legacy_minmax=None):
         self.columns = list(show_columns_rows if show_columns_rows is not None else _fixed_show_columns_rows())
+        self.max_columns = max_columns
+        self.legacy_columns = legacy_columns or []
+        self.legacy_minmax = legacy_minmax
         self.executed = []
         self.executemany_calls = []
-        self.fail_alter_containing = fail_alter_containing
+        self.insert_ignore_calls = []
+        self.rowcount = 0
         self._result = []
 
     def execute(self, sql, params=None):
@@ -48,23 +51,27 @@ class FakeCursor:
         if sql.startswith("SHOW COLUMNS"):
             self._result = list(self.columns)
         elif sql.startswith("ALTER TABLE"):
-            if self.fail_alter_containing and self.fail_alter_containing in sql:
-                raise RuntimeError("Row size too large")
-            import re
-
-            for name, sql_type in re.findall(r"ADD COLUMN `([^`]+)` (\w+(?:\(\d+\))?)", sql):
-                self.columns.append((name, sql_type.lower()))
-            for name, sql_type in re.findall(r"MODIFY COLUMN `([^`]+)` (\w+(?:\(\d+\))?)", sql):
-                self.columns = [
-                    (existing_name, sql_type.lower()) if existing_name == name else (existing_name, existing_type)
-                    for existing_name, existing_type in self.columns
-                ]
+            names = re.findall(r"ADD COLUMN `([^`]+)` MEDIUMTEXT", sql)
+            if self.max_columns is not None and len(self.columns) + len(names) > self.max_columns:
+                raise RuntimeError("1118 (42000): Row size too large. The maximum row size is 8126")
+            for name in names:
+                self.columns.append((name, "mediumtext"))
+        elif "information_schema.columns" in sql:
+            self._result = [(c,) for c in self.legacy_columns]
+        elif sql.startswith("SELECT MIN(created_at_utc)"):
+            self._result = [self.legacy_minmax] if self.legacy_minmax else [(None, None)]
+        elif sql.startswith("INSERT IGNORE"):
+            self.insert_ignore_calls.append((sql, params))
+            self.rowcount = 10
 
     def executemany(self, sql, rows):
         self.executemany_calls.append((sql, list(rows)))
 
     def fetchall(self):
         return list(self._result)
+
+    def fetchone(self):
+        return self._result[0] if self._result else None
 
     @property
     def alters(self):
@@ -87,6 +94,25 @@ SAMPLE_DOC = {
     "updatedAt": datetime(2026, 9, 25, 11, 56, 50, 100000, tzinfo=timezone.utc),
     "__v": 0,
 }
+
+PURCHASE_DOC = dict(
+    SAMPLE_DOC,
+    event_id="69c9e404-43e7-43d1-beb9-793e20511c30",
+    event_type="purchase_TECHIT",
+    data={
+        "custom_data": {
+            "order_name": "#627813",
+            "order_type": "cod",
+            "isPpcod": False,
+            "customer_id": "",
+            "merchant_id": "",
+            "cod_charges": "",
+        },
+        "referrer": "https://www.google.com/",
+        "page": "/collections/gifting/",
+        "session": "f99bd1f3-d873-46c8-ae76-772a0dbf022c",
+    },
+)
 
 
 class FlattenAndSanitizeTests(unittest.TestCase):
@@ -156,84 +182,49 @@ class BuildRecordTests(unittest.TestCase):
         self.assertIsNone(raw._build_record({k: v for k, v in SAMPLE_DOC.items() if k != "createdAt"}))
 
 
-class TypeInferenceAndCoercionTests(unittest.TestCase):
-    def test_infer_sql_types(self):
-        self.assertEqual(raw._infer_sql_type(True), "TINYINT(1)")  # bool before int
-        self.assertEqual(raw._infer_sql_type(5), "BIGINT")
-        self.assertEqual(raw._infer_sql_type(1.5), "DOUBLE")
-        self.assertEqual(raw._infer_sql_type(datetime(2026, 1, 1)), "DATETIME(3)")
-        self.assertEqual(raw._infer_sql_type([1, 2]), "JSON")
-        self.assertEqual(raw._infer_sql_type("x"), "TEXT")
-        self.assertEqual(raw._infer_sql_type(2**70), "TEXT")
-
-    def test_coerce_mismatch_returns_sentinel(self):
-        self.assertIs(raw._coerce_value("abc", "int"), raw._MISMATCH)
-        self.assertIs(raw._coerce_value("abc", "float"), raw._MISMATCH)
-        self.assertIs(raw._coerce_value(5, "bool"), raw._MISMATCH)
-        self.assertIs(raw._coerce_value("2026", "datetime"), raw._MISMATCH)
-        self.assertIs(raw._coerce_value(2**70, "int"), raw._MISMATCH)
-
-    def test_coerce_lists_and_scalars_into_text(self):
-        self.assertEqual(raw._coerce_value(["1", "2"], "str"), '["1", "2"]')
-        self.assertEqual(raw._coerce_value(123, "str"), "123")
-        self.assertEqual(raw._coerce_value(True, "str"), "true")
-
-    def test_coerce_anything_into_json_is_valid_json(self):
-        self.assertEqual(raw._coerce_value("plain string", "json"), '"plain string"')
-        self.assertEqual(raw._coerce_value([1], "json"), "[1]")
-
-    def test_coerce_none_is_none(self):
-        self.assertIsNone(raw._coerce_value(None, "int"))
-
-    def test_category_from_sql_type(self):
-        self.assertEqual(raw._category_from_sql_type("tinyint(1)"), "bool")
-        self.assertEqual(raw._category_from_sql_type("bigint"), "int")
-        self.assertEqual(raw._category_from_sql_type("double"), "float")
-        self.assertEqual(raw._category_from_sql_type("datetime(3)"), "datetime")
-        self.assertEqual(raw._category_from_sql_type("json"), "json")
-        self.assertEqual(raw._category_from_sql_type("varchar(100)"), "str")
-        self.assertEqual(raw._category_from_sql_type("text"), "str")
+class ToTextTests(unittest.TestCase):
+    def test_every_value_type_becomes_text_and_nothing_is_rejected(self):
+        self.assertIsNone(raw._to_text(None))
+        self.assertEqual(raw._to_text(""), "")
+        self.assertEqual(raw._to_text("abc"), "abc")
+        self.assertEqual(raw._to_text(True), "true")
+        self.assertEqual(raw._to_text(False), "false")
+        self.assertEqual(raw._to_text(7), "7")
+        self.assertEqual(raw._to_text(299.5), "299.5")
+        self.assertEqual(raw._to_text([1, "a"]), '[1, "a"]')
+        self.assertEqual(json.loads(raw._to_text({"k": datetime(2026, 1, 1)})), {"k": "2026-01-01T00:00:00"})
+        self.assertEqual(raw._to_text(datetime(2026, 1, 1)), "2026-01-01T00:00:00")
 
 
 class ColumnCatalogTests(unittest.TestCase):
     def test_lookup_is_case_insensitive_and_returns_existing_name(self):
         catalog = raw._ColumnCatalog(FakeCursor(), FakeConnection())
-        self.assertEqual(catalog.get("variantid")[0], "variantId")
+        self.assertEqual(catalog.get("VARIANTID"), "variantId")
+        self.assertIsNone(catalog.get("nope"))
 
     def test_dict_cursor_rows_are_supported(self):
-        cursor = FakeCursor([{"Field": "event_id", "Type": "varchar(64)"}])
+        cursor = FakeCursor([{"Field": "event_id", "Type": "varchar(255)"}])
+        self.assertEqual(raw._ColumnCatalog(cursor, FakeConnection()).get("event_id"), "event_id")
+
+    def test_add_creates_mediumtext_columns_in_one_statement(self):
+        cursor = FakeCursor()
         catalog = raw._ColumnCatalog(cursor, FakeConnection())
-        self.assertEqual(catalog.get("EVENT_ID"), ("event_id", "str"))
+        added = catalog.add(["a", "b"])
+        self.assertEqual(added, ["a", "b"])
+        self.assertEqual(len(cursor.alters), 1)
+        self.assertIn("ADD COLUMN `a` MEDIUMTEXT NULL", cursor.alters[0])
 
-    def test_add_falls_back_to_one_at_a_time_when_combined_alter_fails(self):
-        cursor = FakeCursor(fail_alter_containing="bad_col")
+    def test_row_size_error_stops_adding_and_marks_the_catalog_full(self):
+        base = _fixed_show_columns_rows()
+        cursor = FakeCursor(base, max_columns=len(base) + 2)  # room for only 2 more
         catalog = raw._ColumnCatalog(cursor, FakeConnection())
-        # The combined ALTER contains bad_col and fails; each is then retried alone.
-        added = catalog.add([("good_col", "TEXT"), ("bad_col", "TEXT")])
-        self.assertEqual(added, ["good_col"])
-        self.assertIsNotNone(catalog.get("good_col"))
-        self.assertIsNone(catalog.get("bad_col"))
+        added = catalog.add(["a", "b", "c", "d"])
 
-    def test_widen_changes_column_category_and_records_the_alter(self):
-        cursor = FakeCursor(_fixed_show_columns_rows() + [("price", "bigint")])
-        catalog = raw._ColumnCatalog(cursor, FakeConnection())
-        widened = catalog.widen([("price", "DOUBLE")])
-
-        self.assertEqual(widened, ["price"])
-        self.assertEqual(catalog.get("price"), ("price", "float"))
-        self.assertIn("MODIFY COLUMN `price` DOUBLE", " ".join(cursor.alters))
-
-    def test_widen_falls_back_to_one_at_a_time_when_combined_alter_fails(self):
-        cursor = FakeCursor(
-            _fixed_show_columns_rows() + [("good_col", "bigint"), ("bad_col", "bigint")],
-            fail_alter_containing="bad_col",
-        )
-        catalog = raw._ColumnCatalog(cursor, FakeConnection())
-        widened = catalog.widen([("good_col", "DOUBLE"), ("bad_col", "DOUBLE")])
-
-        self.assertEqual(widened, ["good_col"])
-        self.assertEqual(catalog.get("good_col"), ("good_col", "float"))
-        self.assertEqual(catalog.get("bad_col"), ("bad_col", "int"))
+        self.assertEqual(added, ["a", "b"])
+        self.assertTrue(catalog.full)
+        self.assertEqual(catalog.failed, {"c", "d"})
+        self.assertIsNotNone(catalog.get("a"))
+        self.assertIsNone(catalog.get("c"))
 
 
 class FlushBatchTests(unittest.TestCase):
@@ -244,223 +235,263 @@ class FlushBatchTests(unittest.TestCase):
         raw._flush_batch(cursor, connection, catalog, records, set(), "[test]")
         return cursor
 
+    @staticmethod
+    def _rows(cursor):
+        sql, rows = cursor.executemany_calls[0]
+        columns = [c.strip(" `") for c in sql.split("(", 1)[1].split(") VALUES")[0].split(",")]
+        return [dict(zip(columns, r)) for r in rows]
+
     def test_new_key_gets_a_column_and_value_is_ingested_in_the_same_run(self):
-        record = raw._build_record(dict(SAMPLE_DOC))
-        cursor = self._flush([record])
+        cursor = self._flush([raw._build_record(dict(SAMPLE_DOC))])
 
         altered = " ".join(cursor.alters)
-        self.assertIn("`data_collection` TEXT", altered)
-        self.assertIn("`data_click` TEXT", altered)
-        self.assertIn("`__v` BIGINT", altered)
-
-        sql, rows = cursor.executemany_calls[0]
-        self.assertIn("`data_collection`", sql)
-        columns = [c.strip(" `") for c in sql.split("(", 1)[1].split(") VALUES")[0].split(",")]
-        row = dict(zip(columns, rows[0]))
+        self.assertIn("`data_collection` MEDIUMTEXT", altered)
+        self.assertIn("`data_click` MEDIUMTEXT", altered)
+        self.assertIn("`__v` MEDIUMTEXT", altered)
+        row = self._rows(cursor)[0]
         self.assertEqual(row["data_collection"], "bangles")
-        self.assertEqual(row["__v"], 0)
+        self.assertEqual(row["__v"], "0")
 
     def test_existing_columns_are_not_altered_again(self):
-        record = raw._build_record(dict(SAMPLE_DOC))
         cursor = FakeCursor()
         catalog = raw._ColumnCatalog(cursor, FakeConnection())
-        self._flush([record], cursor, catalog)
+        self._flush([raw._build_record(dict(SAMPLE_DOC))], cursor, catalog)
         alters_after_first = len(cursor.alters)
         self._flush([raw._build_record(dict(SAMPLE_DOC, event_id="other"))], cursor, catalog)
-
         self.assertEqual(len(cursor.alters), alters_after_first)
 
     def test_null_only_key_creates_no_column(self):
-        doc = dict(SAMPLE_DOC, brand_new_key=None)
-        cursor = self._flush([raw._build_record(doc)])
+        cursor = self._flush([raw._build_record(dict(SAMPLE_DOC, brand_new_key=None))])
         self.assertNotIn("brand_new_key", " ".join(cursor.alters))
 
     def test_key_differing_only_by_case_reuses_existing_column(self):
         doc = dict(SAMPLE_DOC, variantid="123", variantId=None)
         cursor = self._flush([raw._build_record(doc)])
         self.assertNotIn("`variantid`", " ".join(cursor.alters))
+        self.assertEqual(self._rows(cursor)[0]["variantId"], "123")
 
     def test_upsert_updates_everything_except_event_id_and_ingested_at(self):
         cursor = self._flush([raw._build_record(dict(SAMPLE_DOC))])
         sql, _ = cursor.executemany_calls[0]
 
-        self.assertIn("INSERT INTO `mongo_events_summary`", sql)
+        self.assertIn("INSERT INTO `raw_mongo_events`", sql)
         update_clause = sql.split("ON DUPLICATE KEY UPDATE")[1]
         self.assertNotIn("`event_id` = VALUES", update_clause)
         self.assertNotIn("ingested_at", sql)
         self.assertIn("`event_type` = VALUES(`event_type`)", update_clause)
 
-    @staticmethod
-    def _main_rows(cursor):
-        sql, rows = cursor.executemany_calls[0]
-        columns = [c.strip(" `") for c in sql.split("(", 1)[1].split(") VALUES")[0].split(",")]
-        return [dict(zip(columns, r)) for r in rows]
+    def test_purchase_event_custom_data_is_fully_stored_with_no_nulls(self):
+        cursor = self._flush([raw._build_record(dict(PURCHASE_DOC))])
+        row = self._rows(cursor)[0]
 
-    @staticmethod
-    def _overflow(cursor):
-        for sql, rows in cursor.executemany_calls:
-            if "mongo_events_overflow" in sql:
-                return {event_id: json.loads(payload) for event_id, payload in rows}
-        return {}
+        self.assertEqual(row["data_custom_data_order_name"], "#627813")
+        self.assertEqual(row["data_custom_data_order_type"], "cod")
+        self.assertEqual(row["data_custom_data_isPpcod"], "false")
+        # empty strings are values: stored as '', not NULL
+        self.assertEqual(row["data_custom_data_customer_id"], "")
+        self.assertEqual(row["data_custom_data_merchant_id"], "")
+        self.assertEqual(row["data_custom_data_cod_charges"], "")
+        self.assertEqual(row["data_page"], "/collections/gifting/")
+        self.assertEqual(row["data_referrer"], "https://www.google.com/")
+        self.assertNotIn("extra_data", row)
 
-    @mock.patch.object(raw, "AUTO_WIDEN_TO_TEXT", True)
-    def test_mismatched_value_widens_the_column_to_text_and_keeps_the_value(self):
-        cursor = FakeCursor(_fixed_show_columns_rows() + [("score", "bigint")])
-        good = raw._build_record(dict(SAMPLE_DOC, score=7))
-        bad = raw._build_record(dict(SAMPLE_DOC, event_id="e2", score="not a number"))
-        self._flush([good, bad], cursor)
+    def test_value_of_a_different_type_than_earlier_events_is_kept_as_text(self):
+        # the old typed design nulled '' / '#627813' arriving for a numeric column
+        cursor = FakeCursor(_fixed_show_columns_rows() + [("score", "mediumtext")])
+        records = [
+            raw._build_record(dict(SAMPLE_DOC, score=7)),
+            raw._build_record(dict(SAMPLE_DOC, event_id="e2", score="not a number")),
+            raw._build_record(dict(SAMPLE_DOC, event_id="e3", score="")),
+            raw._build_record(dict(SAMPLE_DOC, event_id="e4", score=299.5)),
+        ]
+        self._flush(records, cursor)
+        self.assertEqual([r["score"] for r in self._rows(cursor)], ["7", "not a number", "", "299.5"])
 
-        self.assertIn("MODIFY COLUMN `score` TEXT", " ".join(cursor.alters))
-        self.assertEqual([r["score"] for r in self._main_rows(cursor)], ["7", "not a number"])
-        self.assertEqual(self._overflow(cursor), {})
-
-    @mock.patch.object(raw, "AUTO_WIDEN_TO_TEXT", True)
-    def test_empty_string_into_int_column_is_kept_not_nulled(self):
-        cursor = FakeCursor(_fixed_show_columns_rows() + [("data_custom_data_customer_id", "bigint")])
-        record = raw._build_record(
-            dict(SAMPLE_DOC, data={"custom_data": {"customer_id": ""}})
+    def test_column_cap_keeps_values_in_extra_data(self):
+        with mock.patch.object(raw, "MAX_COLUMNS", 1):
+            cursor = self._flush([raw._build_record(dict(SAMPLE_DOC))])
+        self.assertEqual(cursor.alters, [])
+        extra = json.loads(self._rows(cursor)[0]["extra_data"])
+        self.assertEqual(
+            extra,
+            {"data_collection": "bangles", "data_click": "https://www.shyle.in/collections/bracelets", "__v": 0},
         )
-        self._flush([record], cursor)
 
-        self.assertIn("MODIFY COLUMN `data_custom_data_customer_id` TEXT", " ".join(cursor.alters))
-        self.assertEqual(self._main_rows(cursor)[0]["data_custom_data_customer_id"], "")
-
-    @mock.patch.object(raw, "AUTO_WIDEN_TO_TEXT", True)
-    def test_failed_widen_keeps_original_value_in_overflow(self):
-        cursor = FakeCursor(
-            _fixed_show_columns_rows() + [("score", "bigint")], fail_alter_containing="`score`"
-        )
-        bad = raw._build_record(dict(SAMPLE_DOC, score="not a number"))
-        self._flush([bad], cursor)
-
-        self.assertIsNone(self._main_rows(cursor)[0]["score"])
-        self.assertEqual(self._overflow(cursor), {SAMPLE_DOC["event_id"]: {"score": "not a number"}})
-
-    def test_failed_add_column_keeps_values_in_overflow_and_is_not_retried(self):
-        # e.g. MySQL error 1118 "Row size too large"
-        cursor = FakeCursor(fail_alter_containing="data_custom_data_order_name")
+    def test_row_size_failure_keeps_values_in_extra_data_and_is_not_retried(self):
+        base = _fixed_show_columns_rows()
+        cursor = FakeCursor(base, max_columns=len(base))  # no room at all (MySQL 1118)
         connection = FakeConnection()
         catalog = raw._ColumnCatalog(cursor, connection)
-        doc = dict(SAMPLE_DOC, data={"custom_data": {"order_name": "#627813", "order_type": "cod"}})
 
         for event_id in ("e1", "e2"):
             raw._flush_batch(
                 cursor, connection, catalog,
-                [raw._build_record(dict(doc, event_id=event_id))], set(), "[test]",
+                [raw._build_record(dict(PURCHASE_DOC, event_id=event_id))], set(), "[test]",
             )
 
-        overflow = {}
-        for sql, rows in cursor.executemany_calls:
-            if "mongo_events_overflow" in sql:
-                overflow.update({e: json.loads(p) for e, p in rows})
-        self.assertEqual(
-            overflow,
-            {"e1": {"data_custom_data_order_name": "#627813"},
-             "e2": {"data_custom_data_order_name": "#627813"}},
-        )
-        # attempted only in the first batch (combined ALTER + single retry), never again
-        self.assertEqual(
-            sum("`data_custom_data_order_name`" in s for s in cursor.alters), 2
-        )
-        main_rows = self._main_rows(cursor)
-        self.assertEqual(main_rows[0]["data_custom_data_order_type"], "cod")
+        attempts_after_first_batch = len(cursor.alters)
+        self.assertTrue(catalog.full)
+        rows = []
+        for sql, batch_rows in cursor.executemany_calls:
+            columns = [c.strip(" `") for c in sql.split("(", 1)[1].split(") VALUES")[0].split(",")]
+            rows.extend(dict(zip(columns, r)) for r in batch_rows)
+        for row in rows:
+            extra = json.loads(row["extra_data"])
+            self.assertEqual(extra["data_custom_data_order_name"], "#627813")
+            self.assertEqual(extra["data_custom_data_isPpcod"], False)
+            self.assertEqual(extra["data_custom_data_customer_id"], "")
+        # the second batch did not even try another ALTER
+        self.assertEqual(len(cursor.alters), attempts_after_first_batch)
 
-    def test_mismatch_goes_to_overflow_without_rebuilding_the_table_by_default(self):
-        cursor = FakeCursor(_fixed_show_columns_rows() + [("score", "bigint")])
-        good = raw._build_record(dict(SAMPLE_DOC, score=7))
-        bad = raw._build_record(dict(SAMPLE_DOC, event_id="e2", score="not a number"))
-        self._flush([good, bad], cursor)
-
-        self.assertNotIn("MODIFY COLUMN", " ".join(cursor.alters))
-        self.assertEqual([r["score"] for r in self._main_rows(cursor)], [7, None])
-        self.assertEqual(self._overflow(cursor), {"e2": {"score": "not a number"}})
-
-    def test_column_cap_sends_values_to_overflow(self):
-        record = raw._build_record(dict(SAMPLE_DOC))
-        with mock.patch.object(raw, "MAX_COLUMNS", 1):
-            cursor = self._flush([record])
-        self.assertEqual(cursor.alters, [])
-        self.assertEqual(
-            self._overflow(cursor)[SAMPLE_DOC["event_id"]],
-            {"data_collection": "bangles", "data_click": "https://www.shyle.in/collections/bracelets", "__v": 0},
-        )
-
-    def test_nothing_overflowing_writes_no_overflow_rows(self):
-        cursor = self._flush([raw._build_record(dict(SAMPLE_DOC))])
-        self.assertEqual(len(cursor.executemany_calls), 1)
-        self.assertEqual(self._overflow(cursor), {})
-
-    def test_purchase_event_custom_data_is_fully_stored(self):
-        doc = dict(
-            SAMPLE_DOC,
-            event_type="purchase_TECHIT",
-            data={
-                "custom_data": {
-                    "order_name": "#627813", "order_type": "cod", "isPpcod": False,
-                    "customer_id": "", "merchant_id": "", "cod_charges": "",
-                },
-                "referrer": "https://www.google.com/",
-                "page": "/collections/gifting/",
-            },
-        )
+    def test_keys_colliding_case_insensitively_in_one_document_lose_nothing(self):
+        doc = dict(SAMPLE_DOC, data={"utm_source": "google", "Utm_Source": "Google-Ads"})
         cursor = self._flush([raw._build_record(doc)])
-        row = self._main_rows(cursor)[0]
-        self.assertEqual(row["data_custom_data_order_name"], "#627813")
-        self.assertEqual(row["data_custom_data_order_type"], "cod")
-        self.assertEqual(row["data_custom_data_isPpcod"], 0)
-        self.assertEqual(row["data_custom_data_customer_id"], "")
-        self.assertEqual(row["data_page"], "/collections/gifting/")
+        row = self._rows(cursor)[0]
+        self.assertEqual(row["data_utm_source"], "google")
+        self.assertEqual(json.loads(row["extra_data"]), {"data_Utm_Source": "Google-Ads"})
+
+    def test_a_mongo_key_named_extra_data_does_not_clobber_our_column(self):
+        doc = dict(SAMPLE_DOC, extra_data="from mongo")
+        cursor = self._flush([raw._build_record(doc)])
+        self.assertEqual(json.loads(self._rows(cursor)[0]["extra_data"]), {"extra_data": "from mongo"})
+
+    def test_value_too_long_for_an_indexed_column_keeps_a_prefix_and_the_full_text(self):
+        long_value = "x" * 400
+        cursor = self._flush([raw._build_record(dict(SAMPLE_DOC, cart_token=long_value))])
+        row = self._rows(cursor)[0]
+        self.assertEqual(row["cart_token"], "x" * 255)
+        self.assertEqual(json.loads(row["extra_data"]), {"cart_token": long_value})
+
+    def test_extra_data_column_is_left_out_when_nothing_overflowed(self):
+        cursor = self._flush([raw._build_record(dict(SAMPLE_DOC))])
+        sql, _ = cursor.executemany_calls[0]
+        self.assertNotIn("extra_data", sql)
 
     def test_empty_batch_writes_nothing(self):
         cursor = self._flush([])
         self.assertEqual(cursor.executemany_calls, [])
 
-    def test_non_integer_value_widens_an_existing_int_column_instead_of_nulling_it(self):
-        cursor = FakeCursor(_fixed_show_columns_rows() + [("price", "bigint")])
-        catalog = raw._ColumnCatalog(cursor, FakeConnection())
-        record = raw._build_record(dict(SAMPLE_DOC, price=299.5))
-        self._flush([record], cursor, catalog)
 
-        self.assertIn("MODIFY COLUMN `price` DOUBLE", " ".join(cursor.alters))
-        sql, rows = cursor.executemany_calls[0]
-        columns = [c.strip(" `") for c in sql.split("(", 1)[1].split(") VALUES")[0].split(",")]
-        self.assertEqual(dict(zip(columns, rows[0]))["price"], 299.5)
+class LegacyCopyTests(unittest.TestCase):
+    LEGACY_COLUMNS = raw._LEGACY_COPY_COLUMNS + ["data_click", "ingested_at"]
+    MINMAX = (datetime(2026, 11, 10, 3, 20), datetime(2026, 11, 11, 14, 25))
 
-    def test_whole_number_float_into_int_column_does_not_widen(self):
-        cursor = FakeCursor(_fixed_show_columns_rows() + [("price", "bigint")])
-        catalog = raw._ColumnCatalog(cursor, FakeConnection())
-        record = raw._build_record(dict(SAMPLE_DOC, price=300.0))
-        self._flush([record], cursor, catalog)
+    def _run(self, cursor, store, chunks_per_run=3):
+        def get(cur, key, default=None):
+            return store.get(key, default)
 
-        self.assertNotIn("MODIFY COLUMN", " ".join(cursor.alters))
-        self.assertEqual(catalog.get("price"), ("price", "int"))
+        def update(cur, conn, key, ts):
+            store[key] = ts
+
+        with mock.patch.object(raw, "get_pipeline_metadata_timestamp", side_effect=get), \
+             mock.patch.object(raw, "update_pipeline_metadata_timestamp", side_effect=update), \
+             mock.patch.object(raw, "LEGACY_COPY_CHUNKS_PER_RUN", chunks_per_run), \
+             mock.patch.object(raw, "LEGACY_COPY_CHUNK_HOURS", 6):
+            return raw._copy_legacy_history(cursor, FakeConnection(), "[test]")
+
+    def _cursor(self):
+        return FakeCursor(legacy_columns=self.LEGACY_COLUMNS, legacy_minmax=self.MINMAX)
+
+    def test_copies_newest_first_in_chunks_and_resumes_until_done(self):
+        store = {}
+        cursor = self._cursor()
+
+        copied = self._run(cursor, store, chunks_per_run=3)
+        self.assertEqual(copied, 30)
+        self.assertEqual(len(cursor.insert_ignore_calls), 3)
+        # newest chunk first; bounds are whole hours, upper bound exclusive
+        self.assertEqual(
+            cursor.insert_ignore_calls[0][1],
+            (datetime(2026, 11, 11, 9), datetime(2026, 11, 11, 15)),
+        )
+        self.assertEqual(
+            store[raw.LEGACY_COPY_PROGRESS_KEY].astimezone(timezone.utc).replace(tzinfo=None),
+            datetime(2026, 11, 10, 21),
+        )
+        self.assertNotIn(raw.LEGACY_COPY_DONE_KEY, store)
+
+        cursor2 = self._cursor()
+        self._run(cursor2, store, chunks_per_run=10)
+        self.assertEqual(
+            [params for _, params in cursor2.insert_ignore_calls],
+            [
+                (datetime(2026, 11, 10, 15), datetime(2026, 11, 10, 21)),
+                (datetime(2026, 11, 10, 9), datetime(2026, 11, 10, 15)),
+                (datetime(2026, 11, 10, 3), datetime(2026, 11, 10, 9)),
+            ],
+        )
+        self.assertIn(raw.LEGACY_COPY_DONE_KEY, store)
+
+    def test_insert_ignore_never_overwrites_live_rows_and_copies_only_known_columns(self):
+        cursor = self._cursor()
+        self._run(cursor, {})
+        sql = cursor.insert_ignore_calls[0][0]
+        self.assertIn("INSERT IGNORE INTO `raw_mongo_events`", sql)
+        self.assertIn("FROM `mongo_events_summary`", sql)
+        self.assertIn("`event_id`", sql)
+        self.assertNotIn("data_click", sql)
+        self.assertNotIn("ingested_at", sql)
+
+    def test_no_legacy_table_marks_it_done_and_copies_nothing(self):
+        store = {}
+        cursor = FakeCursor(legacy_columns=[])
+        self.assertEqual(self._run(cursor, store), 0)
+        self.assertEqual(cursor.insert_ignore_calls, [])
+        self.assertIn(raw.LEGACY_COPY_DONE_KEY, store)
+
+    def test_empty_legacy_table_is_marked_done(self):
+        store = {}
+        cursor = FakeCursor(legacy_columns=self.LEGACY_COLUMNS, legacy_minmax=(None, None))
+        self.assertEqual(self._run(cursor, store), 0)
+        self.assertIn(raw.LEGACY_COPY_DONE_KEY, store)
+
+    def test_once_done_nothing_is_queried(self):
+        cursor = self._cursor()
+        self._run(cursor, {raw.LEGACY_COPY_DONE_KEY: datetime.now(IST)})
+        self.assertEqual(cursor.executed, [])
+
+    def test_can_be_switched_off(self):
+        cursor = self._cursor()
+        with mock.patch.object(raw, "LEGACY_COPY_ENABLED", False):
+            self.assertEqual(self._run(cursor, {}), 0)
+        self.assertEqual(cursor.executed, [])
+
+
+def _sync(docs, cursor=None, explicit_window=True, delete_enabled=True, stored_watermark=None,
+          find_side_effect=None, brand_name="SHYLENEW"):
+    """Runs sync_mongo_events_raw_for_brand against fakes, with the legacy copy
+    stubbed out (it has its own tests above)."""
+    cursor = cursor or FakeCursor()
+    collection = mock.Mock()
+    collection.delete_many.return_value = mock.Mock(deleted_count=len(docs) if docs else 0)
+    if find_side_effect:
+        collection.find.side_effect = find_side_effect
+    else:
+        collection.find.return_value = list(docs)
+    client = mock.Mock()
+    kwargs = {}
+    if explicit_window:
+        kwargs = {"start_date": date(2026, 9, 24), "end_date": date(2026, 9, 25)}
+    with mock.patch.object(raw.aws_background, "get_brand_timezone", return_value=IST), \
+         mock.patch.object(raw, "_resolve_mongo_sessions_collection", return_value=(client, collection)), \
+         mock.patch.object(raw, "_copy_legacy_history", return_value=0) as copy_history, \
+         mock.patch.object(raw, "MONGO_EVENTS_DELETE_INGESTED_DOCS", delete_enabled), \
+         mock.patch.object(raw, "get_pipeline_metadata_timestamp", return_value=stored_watermark) as get_wm, \
+         mock.patch.object(raw, "update_pipeline_metadata_timestamp") as update_wm:
+        affected = raw.sync_mongo_events_raw_for_brand(
+            brand_index=8,
+            brand_name=brand_name,
+            brand_key=brand_name,
+            cursor=cursor,
+            connection=FakeConnection(),
+            **kwargs,
+        )
+    return cursor, collection, client, affected, get_wm, update_wm, copy_history
 
 
 class SyncForBrandTests(unittest.TestCase):
-    def _run(self, docs, brand_name="SHYLENEW", brand_key="SHYLENEW", cursor=None, find_side_effect=None):
-        cursor = cursor or FakeCursor()
-        collection = mock.Mock()
-        collection.delete_many.return_value = mock.Mock(deleted_count=len(docs) if docs else 0)
-        if find_side_effect:
-            collection.find.side_effect = find_side_effect
-        else:
-            collection.find.return_value = list(docs)
-        client = mock.Mock()
-        with mock.patch.object(raw.aws_background, "get_brand_timezone", return_value=IST), \
-             mock.patch.object(raw, "_resolve_mongo_sessions_collection", return_value=(client, collection)):
-            raw.sync_mongo_events_raw_for_brand(
-                brand_index=8,
-                brand_name=brand_name,
-                brand_key=brand_key,
-                start_date=date(2026, 9, 24),
-                end_date=date(2026, 9, 25),
-                cursor=cursor,
-                connection=FakeConnection(),
-            )
-        return cursor, collection, client
-
     def test_queries_shop_and_window_without_sort_and_excluding_id(self):
-        cursor, collection, client = self._run([dict(SAMPLE_DOC)])
+        _, collection, client, *_ = _sync([dict(SAMPLE_DOC)])
 
         args, kwargs = collection.find.call_args
         query, projection = args
@@ -472,66 +503,61 @@ class SyncForBrandTests(unittest.TestCase):
         client.close.assert_called_once()
 
     def test_window_bounds_use_the_brand_timezone(self):
-        _, collection, _ = self._run([])
+        _, collection, *_ = _sync([])
         query = collection.find.call_args.args[0]
         # 2026-09-24 00:00 IST == 2026-09-23 18:30 UTC
         self.assertEqual(query["createdAt"]["$gte"], datetime(2026, 9, 23, 18, 30, tzinfo=timezone.utc))
         self.assertEqual(query["createdAt"]["$lt"], datetime(2026, 9, 25, 18, 30, tzinfo=timezone.utc))
 
-    def test_creates_table_and_upserts_rows(self):
-        cursor, _, _ = self._run([dict(SAMPLE_DOC)])
-        self.assertTrue(any("CREATE TABLE IF NOT EXISTS `mongo_events_summary`" in s for s in cursor.executed))
+    def test_creates_table_runs_legacy_copy_and_upserts_rows(self):
+        cursor, *_, copy_history = _sync([dict(SAMPLE_DOC)])
+        self.assertTrue(any("CREATE TABLE IF NOT EXISTS `raw_mongo_events`" in s for s in cursor.executed))
         self.assertEqual(len(cursor.executemany_calls), 1)
+        copy_history.assert_called_once()
+
+    def test_legacy_copy_failure_does_not_stop_live_ingestion(self):
+        cursor = FakeCursor()
+        collection = mock.Mock()
+        collection.find.return_value = [dict(SAMPLE_DOC)]
+        collection.delete_many.return_value = mock.Mock(deleted_count=1)
+        with mock.patch.object(raw.aws_background, "get_brand_timezone", return_value=IST), \
+             mock.patch.object(raw, "_resolve_mongo_sessions_collection", return_value=(mock.Mock(), collection)), \
+             mock.patch.object(raw, "_copy_legacy_history", side_effect=RuntimeError("copy boom")):
+            raw.sync_mongo_events_raw_for_brand(
+                brand_index=8, brand_name="SHYLENEW", brand_key="SHYLENEW",
+                start_date=date(2026, 9, 24), end_date=date(2026, 9, 25),
+                cursor=cursor, connection=FakeConnection(),
+            )
+        self.assertEqual(len(cursor.executemany_calls), 1)
+        collection.delete_many.assert_called_once()
 
     def test_documents_without_event_id_are_skipped(self):
         bad = {k: v for k, v in SAMPLE_DOC.items() if k != "event_id"}
-        cursor, _, _ = self._run([bad])
+        cursor, *_ = _sync([bad])
         self.assertEqual(cursor.executemany_calls, [])
 
     def test_non_ci_events_brand_is_skipped_entirely(self):
-        cursor, collection, _ = self._run([dict(SAMPLE_DOC)], brand_name="SomeOtherBrand", brand_key="other")
+        cursor, collection, *_ = _sync([dict(SAMPLE_DOC)], brand_name="SomeOtherBrand")
         collection.find.assert_not_called()
         self.assertEqual(cursor.executed, [])
 
     def test_mongo_failure_is_logged_not_raised(self):
-        self._run([], find_side_effect=RuntimeError("mongo down"))  # must not raise
+        _sync([], find_side_effect=RuntimeError("mongo down"))  # must not raise
 
     def test_batches_are_flushed_at_batch_size(self):
         docs = [dict(SAMPLE_DOC, event_id=f"e{i}") for i in range(5)]
         with mock.patch.object(raw, "BATCH_SIZE", 2):
-            cursor, _, _ = self._run(docs)
+            cursor, *_ = _sync(docs)
         self.assertEqual([len(rows) for _, rows in cursor.executemany_calls], [2, 2, 1])
 
 
 class DeleteAfterIngestTests(unittest.TestCase):
-    def _run(self, docs, delete_enabled=True):
-        cursor = FakeCursor()
-        collection = mock.Mock()
-        collection.find.return_value = list(docs)
-        collection.delete_many.return_value = mock.Mock(deleted_count=len(docs))
-        client = mock.Mock()
-        with mock.patch.object(raw.aws_background, "get_brand_timezone", return_value=IST), \
-             mock.patch.object(raw, "_resolve_mongo_sessions_collection", return_value=(client, collection)), \
-             mock.patch.object(raw, "MONGO_EVENTS_DELETE_INGESTED_DOCS", delete_enabled):
-            raw.sync_mongo_events_raw_for_brand(
-                brand_index=8,
-                brand_name="SHYLENEW",
-                brand_key="SHYLENEW",
-                start_date=date(2026, 9, 24),
-                end_date=date(2026, 9, 25),
-                cursor=cursor,
-                connection=FakeConnection(),
-            )
-        return collection
-
     def test_ingested_documents_are_deleted_by_event_id(self):
-        collection = self._run([dict(SAMPLE_DOC)])
-        collection.delete_many.assert_called_once_with(
-            {"event_id": {"$in": [SAMPLE_DOC["event_id"]]}}
-        )
+        _, collection, *_ = _sync([dict(SAMPLE_DOC)])
+        collection.delete_many.assert_called_once_with({"event_id": {"$in": [SAMPLE_DOC["event_id"]]}})
 
     def test_kill_switch_disables_deletion(self):
-        collection = self._run([dict(SAMPLE_DOC)], delete_enabled=False)
+        _, collection, *_ = _sync([dict(SAMPLE_DOC)], delete_enabled=False)
         collection.delete_many.assert_not_called()
 
     def test_delete_failure_is_caught_and_does_not_raise(self):
@@ -539,9 +565,9 @@ class DeleteAfterIngestTests(unittest.TestCase):
         collection = mock.Mock()
         collection.find.return_value = [dict(SAMPLE_DOC)]
         collection.delete_many.side_effect = RuntimeError("mongo boom")
-        client = mock.Mock()
         with mock.patch.object(raw.aws_background, "get_brand_timezone", return_value=IST), \
-             mock.patch.object(raw, "_resolve_mongo_sessions_collection", return_value=(client, collection)):
+             mock.patch.object(raw, "_resolve_mongo_sessions_collection", return_value=(mock.Mock(), collection)), \
+             mock.patch.object(raw, "_copy_legacy_history", return_value=0):
             raw.sync_mongo_events_raw_for_brand(
                 brand_index=8, brand_name="SHYLENEW", brand_key="SHYLENEW",
                 start_date=date(2026, 9, 24), end_date=date(2026, 9, 25),
@@ -550,25 +576,18 @@ class DeleteAfterIngestTests(unittest.TestCase):
         # the upsert itself must still have gone through despite the delete failure
         self.assertEqual(len(cursor.executemany_calls), 1)
 
+    def test_documents_are_kept_in_mongo_when_the_upsert_fails(self):
+        cursor = FakeCursor()
+        cursor.executemany = mock.Mock(side_effect=RuntimeError("db down"))
+        _, collection, *_ = _sync([dict(SAMPLE_DOC)], cursor=cursor)
+        collection.delete_many.assert_not_called()
+
 
 class WatermarkIncrementalTests(unittest.TestCase):
     def _run_incremental(self, docs, stored_watermark=None):
-        cursor = FakeCursor()
-        collection = mock.Mock()
-        collection.find.return_value = list(docs)
-        collection.delete_many.return_value = mock.Mock(deleted_count=len(docs))
-        client = mock.Mock()
-        with mock.patch.object(raw.aws_background, "get_brand_timezone", return_value=IST), \
-             mock.patch.object(raw, "_resolve_mongo_sessions_collection", return_value=(client, collection)), \
-             mock.patch.object(raw, "get_pipeline_metadata_timestamp", return_value=stored_watermark) as get_wm, \
-             mock.patch.object(raw, "update_pipeline_metadata_timestamp") as update_wm:
-            raw.sync_mongo_events_raw_for_brand(
-                brand_index=8,
-                brand_name="SHYLENEW",
-                brand_key="SHYLENEW",
-                cursor=cursor,
-                connection=FakeConnection(),
-            )
+        _, collection, _, _, get_wm, update_wm, _ = _sync(
+            docs, explicit_window=False, stored_watermark=stored_watermark
+        )
         return collection, get_wm, update_wm
 
     def test_no_window_given_queries_by_watermark_only(self):
@@ -583,11 +602,12 @@ class WatermarkIncrementalTests(unittest.TestCase):
         expected_lower = (watermark - raw.RAW_EVENTS_OVERLAP).astimezone(timezone.utc)
         self.assertEqual(query["createdAt"]["$gt"], expected_lower)
 
+    def test_watermark_key_is_shared_with_the_legacy_ingest_so_cutover_has_no_gap(self):
+        self.assertEqual(raw.RAW_EVENTS_METADATA_KEY, "mongo_events_raw_last_created_at")
+
     def test_first_run_with_no_stored_watermark_looks_back_further(self):
         collection, get_wm, update_wm = self._run_incremental([], stored_watermark=None)
         query = collection.find.call_args.args[0]
-        # No stored watermark -> falls back to "now - RAW_EVENTS_DEFAULT_LOOKBACK",
-        # a much wider window than a 5-minute overlap off "now" would give.
         barely_before_now = datetime.now(timezone.utc) - timedelta(minutes=10)
         self.assertLess(query["createdAt"]["$gt"], barely_before_now)
 
@@ -612,19 +632,7 @@ class WatermarkIncrementalTests(unittest.TestCase):
             event_id="e1",
             createdAt=datetime(2026, 9, 24, 20, 0, tzinfo=timezone.utc),  # 2026-09-25 01:30 IST
         )
-        cursor = FakeCursor()
-        collection = mock.Mock()
-        collection.find.return_value = [doc]
-        collection.delete_many.return_value = mock.Mock(deleted_count=1)
-        client = mock.Mock()
-        with mock.patch.object(raw.aws_background, "get_brand_timezone", return_value=IST), \
-             mock.patch.object(raw, "_resolve_mongo_sessions_collection", return_value=(client, collection)), \
-             mock.patch.object(raw, "get_pipeline_metadata_timestamp", return_value=None), \
-             mock.patch.object(raw, "update_pipeline_metadata_timestamp"):
-            affected = raw.sync_mongo_events_raw_for_brand(
-                brand_index=8, brand_name="SHYLENEW", brand_key="SHYLENEW",
-                cursor=cursor, connection=FakeConnection(),
-            )
+        *_, affected, _, _, _ = _sync([doc], explicit_window=False)
         self.assertEqual(affected, {"2026-09-25"})
 
 

@@ -1,7 +1,7 @@
 """
 SQL-sourced replacements for pipeline/mongo_events.py's checkout-initiated /
 buy-now / variant-wise sync functions. These used to query alerts.sessions
-(Mongo) directly; now they read the same brand's own mongo_events_summary
+(Mongo) directly; now they read the same brand's own raw_mongo_events
 table (MySQL - see pipeline/mongo_events_raw.py, which ingests it from
 Mongo and is the only thing that still talks to alerts.sessions for these
 metrics).
@@ -11,7 +11,7 @@ query: pipeline/mongo_events.py's existing dedup rules are stateful/
 sequential in ways a GROUP BY can't losslessly reproduce (see this
 function's docstrings below, and the module docstring in
 pipeline/mongo_events_raw.py's sibling plan notes). Instead, every
-candidate-row fetch here pulls rows from mongo_events_summary via SQL and
+candidate-row fetch here pulls rows from raw_mongo_events via SQL and
 feeds them through the *exact same* dedup algorithms pipeline/mongo_events.py
 already uses (copied, not re-derived) - only the row source changed, from a
 Mongo cursor to a MySQL cursor. The upsert/table-maintenance helpers that
@@ -41,7 +41,9 @@ from pipeline.mongo_events import (
 
 import aws_background
 
-MONGO_EVENTS_SUMMARY_TABLE = "mongo_events_summary"
+# Ingested by pipeline/mongo_events_raw.py. (Replaces the legacy mongo_events_summary
+# table; its history is copied into this one automatically by that module.)
+MONGO_EVENTS_SUMMARY_TABLE = "raw_mongo_events"
 
 
 # Rows are pulled from MySQL in chunks of this size instead of one fetchall(), so a busy brand/day
@@ -74,7 +76,7 @@ def _fetch_candidate_rows(
     stream: bool = False,
 ) -> List[Dict[str, Any]]:
     """
-    Pulls candidate rows from this brand's own mongo_events_summary table
+    Pulls candidate rows from this brand's own raw_mongo_events table
     (no shop_name filter needed - the table only ever holds this one
     brand's events) and maps each row into the same shape the dedup
     functions below already expect from a Mongo document: "createdAt" (a
@@ -175,7 +177,7 @@ def _iter_counted_pair_events_from_sql(
     it's more than `dedupe_window_minutes` after the last *counted* event
     for its (date, session_id, cart_token) key - not simply the gap since
     the previous row, which is why this can't be a one-shot SQL aggregate),
-    sourced from mongo_events_summary instead of Mongo. Rows are sorted by
+    sourced from raw_mongo_events instead of Mongo. Rows are sorted by
     createdAt in Python since the source query doesn't guarantee order.
     """
     dedupe_window = timedelta(minutes=dedupe_window_minutes)
@@ -351,7 +353,7 @@ def _brand_gate(brand_name: str, brand_key: Optional[str], what: str) -> Optiona
     """Shared brand-gating + logging for every sync_* below. Returns the
     Mongo shop-name mapping purely as a "this brand is onboarded" check -
     none of these functions touch Mongo, but a brand with no shop-name
-    mapping was never going to have rows in mongo_events_summary either."""
+    mapping was never going to have rows in raw_mongo_events either."""
     if not is_ci_events_brand(brand_name, brand_key):
         logger.info(f"Skipping {what} for {brand_name}: brand not enabled for ci_events")
         return None

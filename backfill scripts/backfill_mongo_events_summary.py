@@ -1,5 +1,5 @@
 """
-Backfill for the per-brand mongo_events_summary table (full raw alerts.sessions
+Backfill for the per-brand raw_mongo_events table (full raw alerts.sessions
 events, one row per event - see pipeline/mongo_events_raw.py).
 
 The daily events-summary-worker only keeps a rolling 2-day window; use this to
@@ -69,7 +69,7 @@ def backfill_brand(brand_index: int, start_dt: datetime, end_dt: datetime):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Backfill the per-brand mongo_events_summary table from alerts.sessions"
+        description="Backfill the per-brand raw_mongo_events table from alerts.sessions"
     )
     parser.add_argument(
         "--start",

@@ -442,7 +442,7 @@ def fetch_mongo_events_for_dates(target_dates: Sequence[date]) -> Iterator[Dict]
             client.close()
 
 
-# Sync functions run against each brand's freshly-ingested mongo_events_summary
+# Sync functions run against each brand's freshly-ingested raw_mongo_events
 # rows, per affected-date window, after the raw ingest below - these used to
 # run inside the main pipeline every 10 minutes, querying alerts.sessions
 # (Mongo) directly; see pipeline/mongo_events_sql.py and
@@ -461,7 +461,7 @@ def run_incremental_events_job() -> None:
     """
     Every 15 minutes: incremental raw ingest (pipeline/mongo_events_raw.py -
     watermarked, deletes each document from Mongo once it's durably
-    upserted) into each CI-events brand's own mongo_events_summary table,
+    upserted) into each CI-events brand's own raw_mongo_events table,
     then recomputes that brand's CI/buy-now rollups
     (hourly_sessions_summary_shopify's ci_events/buy_now_events,
     daily_ci_events_summary, daily_buy_now_events_summary, their variant

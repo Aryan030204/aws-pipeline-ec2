@@ -4,7 +4,7 @@ Daily checkout login-status rollups: for every deduplicated checkout_initiated
 non-logged-in based on whether a login event with the same cart_token
 occurred in the same window, then upsert daily and daily+variant summaries.
 
-Reads from this brand's own mongo_events_summary table (MySQL), not Mongo
+Reads from this brand's own raw_mongo_events table (MySQL), not Mongo
 directly - pipeline/mongo_events_raw.py is the only thing that still queries
 alerts.sessions for these event types (see that module's docstring).
 Reuses pipeline.mongo_events_sql's row-fetch/dedup building blocks rather
@@ -44,7 +44,7 @@ def _fetch_login_cart_tokens(
     tz: ZoneInfo = IST,
 ) -> Set[str]:
     """The cart_tokens that had a login event in the window, from this
-    brand's own mongo_events_summary table. Used as an O(1)-lookup set for
+    brand's own raw_mongo_events table. Used as an O(1)-lookup set for
     classification, not fetched per-checkout."""
     rows = _fetch_candidate_rows(cursor, start_date, end_date, tz, event_type="login")
     return {

@@ -247,7 +247,7 @@ def update_sessions_summary(
             # Checkout-initiated/buy-now event sync (ci_events, buy_now_events,
             # their variant tables) used to run here, querying alerts.sessions
             # directly every 10 minutes. That's now owned entirely by
-            # events-summary-worker (every 15 minutes, reading mongo_events_summary
+            # events-summary-worker (every 15 minutes, reading raw_mongo_events
             # instead) - see pipeline/mongo_events_sql.py.
 
             web_vitals_start_dt = None
