@@ -9,7 +9,9 @@ try:
 except ModuleNotFoundError:  # PyYAML is only needed for the compose checks
     yaml = None
 
-from workers import checkout_login_status_worker, events_summary_worker, pnl_worker, variant_wise_events_worker
+from workers import (
+    checkout_login_status_worker, data_purge_worker, events_summary_worker, pnl_worker, variant_wise_events_worker,
+)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -25,7 +27,7 @@ class ComposeIsolationTests(unittest.TestCase):
         self.assertEqual(
             set(self.services),
             {"shopify-pipeline", "events-summary-worker", "variant-wise-events-worker",
-             "checkout-login-status-worker", "pnl-worker"},
+             "checkout-login-status-worker", "pnl-worker", "data-purge-worker"},
         )
         for name, svc in self.services.items():
             with self.subTest(service=name):
@@ -69,12 +71,26 @@ class MidnightScheduleTests(unittest.TestCase):
         kwargs = fake.add_job.call_args.kwargs
         self.assertEqual((kwargs["hour"], kwargs["minute"]), (0, 17))
 
+    def test_data_purge_runs_monthly_on_the_1st_at_0323_ist_and_not_at_startup(self):
+        fake = mock.Mock()
+        with mock.patch("apscheduler.schedulers.blocking.BlockingScheduler", return_value=fake),              mock.patch.object(data_purge_worker, "run_worker") as run_worker:
+            data_purge_worker._run_scheduled()
+        kwargs = fake.add_job.call_args.kwargs
+        self.assertEqual(kwargs["trigger"], "cron")
+        self.assertEqual((kwargs["day"], kwargs["hour"], kwargs["minute"], kwargs["timezone"]), (1, 3, 23, "Asia/Kolkata"))
+        self.assertTrue(kwargs["coalesce"])
+        self.assertEqual(kwargs["max_instances"], 1)
+        self.assertGreaterEqual(kwargs["misfire_grace_time"], 6 * 3600)
+        run_worker.assert_not_called()
+        fake.start.assert_called_once()
+
     def test_no_daily_job_starts_on_an_etl_tick_and_none_collide(self):
         ist_minutes = {
             "events-summary": (events_summary_worker.MASTER_CRON_UTC_MINUTE - 30) % 60,  # 18:33 UTC -> 00:03 IST
             "checkout-login": 7,
             "pnl": (42 - 30) % 60,  # 18:42 UTC -> 00:12 IST
             "variant-wise": 17,
+            "data-purge (monthly)": 23,
         }
         self.assertEqual(ist_minutes["events-summary"], 3)
         self.assertEqual(ist_minutes["pnl"], 12)

@@ -109,3 +109,27 @@ services:
       - pipeline-net
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  # Monthly archive-to-S3 + purge of rows older than 6 calendar months. SAFE BY DEFAULT: nothing is
+  # archived or deleted until DATA_PURGE_ENABLED=true (and nothing is deleted until DATA_PURGE_ARCHIVE_ONLY=false
+  # AND the table is listed in DATA_PURGE_DELETE_TABLES). Streams to S3, so memory stays small. See README.
+  data-purge-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.data-purge-worker
+    container_name: data-purge-worker
+    env_file:
+      - .env
+    environment:
+      # COUNT / EXPLAIN on large tables can outlast the default 120 s read timeout (this container only).
+      DB_READ_TIMEOUT_S: ${DATA_PURGE_DB_READ_TIMEOUT_S:-600}
+    restart: always
+    mem_limit: ${DATA_PURGE_WORKER_MEM_LIMIT:-512m}
+    memswap_limit: ${DATA_PURGE_WORKER_MEM_LIMIT:-512m}
+    cpus: ${DATA_PURGE_WORKER_CPUS:-0.5}
+    pids_limit: 128
+    logging: *pipeline-logging
+    networks:
+      - pipeline-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

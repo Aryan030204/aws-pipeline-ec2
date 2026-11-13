@@ -67,6 +67,13 @@ WORKERS: Dict[str, WorkerSpec] = {
             description="Daily checkout counts by login status -> each brand DB",
             self_run_env="CHECKOUT_LOGIN_STATUS_WORKER_SELF_RUN",
         ),
+        WorkerSpec(
+            name="data-purge",
+            module="workers.data_purge_worker",
+            description="Monthly: archive rows older than 6 calendar months to S3, then (if enabled) delete them",
+            self_run_env="DATA_PURGE_WORKER_SELF_RUN",
+            accepts_brand=True,
+        ),
     )
 }
 

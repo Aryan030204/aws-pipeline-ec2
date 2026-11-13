@@ -167,7 +167,7 @@ With `BRANDS_CRON_MAP` set, each distinct cron value gets its own scheduler job 
 
 ## Triggering a worker manually
 
-Every standalone worker (`pnl`, `events-summary`, `variant-wise-events`, `checkout-login-status`) can be run on demand, once, without waiting for its own schedule. Both knobs below use the same registry in `workers/registry.py`, so adding a worker there makes it available to both.
+Every standalone worker (`pnl`, `events-summary`, `variant-wise-events`, `checkout-login-status`, `data-purge`) can be run on demand, once, without waiting for its own schedule. Both knobs below use the same registry in `workers/registry.py`, so adding a worker there makes it available to both.
 
 ### From a shell
 
@@ -197,6 +197,137 @@ curl http://localhost:5000/workers/pnl/status                            # runni
 ```
 
 The trigger spawns `python -m workers.run <name>` as a child process of the pipeline container, so the worker's output shows up in `docker logs shopify-pipeline`. One run per worker at a time; a second trigger while one is running returns 409.
+
+## Data purge worker
+
+A monthly worker (`workers/data_purge_worker.py`, logic in `pipeline/data_purge.py`) that keeps the live databases from growing without bound: it **archives** rows older than the retention cutoff to S3 as CSV, **verifies** the archive, and only then (and only when explicitly allowed) **deletes** them in batches. The archive is the historical backup. **Deploying it does nothing destructive** - it ships disabled.
+
+### Retention rule and cutoff
+
+Keep the most recent 6 calendar months. `cutoff = first day of the run's month (IST) - 6 calendar months` (calendar-month arithmetic, never "180 days"); a row is eligible when `date_column < cutoff`, strictly.
+
+```text
+Run:     2026-10-01
+Cutoff:  2026-04-01
+Archive: s3://<bucket>/<prefix>/2026-10/<brand>/<table>.csv
+Purged:  all rows where the table's date column < 2026-04-01   (March 2026 and earlier)
+Kept:    2026-04-01 and later
+```
+
+2026-11-01 -> 2026-05-01; 2026-01-01 -> 2025-07-01. Any day of the month gives the same cutoff, so a late or repeated run is identical. `raw_mongo_events` is purged by `created_at_ist` (a naive DATETIME that already holds IST wall-clock time), so its cutoff is simply `2026-04-01 00:00:00`. For columns stored in UTC (the legacy `mongo_events_summary`) the cutoff instant is 00:00 of the cutoff date **in the brand's timezone** converted to UTC (IST: `2026-03-31 18:30:00`).
+
+### Tables and date columns
+
+Every table is processed per brand database. The date column is explicit configuration (`PURGE_TABLES` in `pipeline/data_purge.py`), and **every table is re-validated against the live schema before anything happens** (it must be a base table, the date column must exist with an accepted type, a date index must exist and the export/delete plans must use it via `EXPLAIN`); otherwise the table is skipped with a reason.
+
+| Table | Date column | Type / timezone | Notes |
+|---|---|---|---|
+| `shopify_orders_update` | `updated_date` | `YYYY-MM-DD`, brand timezone | no PK in code; append-only; live code only reads `max(updated_at)` |
+| `mongo_events_summary` | `created_at_utc` | UTC datetime | legacy table, no DDL in repo -> **schema not confirmed**: skipped until confirmed |
+| `shopify_orders` | `created_date` | `YYYY-MM-DD`, brand timezone | no PK in code; see the warning below |
+| `raw_mongo_events` | `created_at_ist` | IST wall-clock datetime | PK `event_id`; **needs an index leading with `created_at_ist` (`migrations/009`) - skipped until it exists**; the archive is the only backup of these events |
+| `product_sessions_snapshot` | `date` | date | no DDL/writer in repo -> **schema not confirmed**: skipped until confirmed |
+| `mv_product_sessions_by_path_daily`, `mv_product_sessions_by_type_daily` | none | - | not referenced in the repo (may be views): `SKIPPED_AMBIGUOUS` until their schema is verified |
+
+"Not confirmed" tables are validated and described in the dry run only; archive/delete stay skipped until their live schema (`SHOW CREATE TABLE`) is confirmed and `schema_confirmed` is flipped in `PURGE_TABLES`. Tables with a real, NOT NULL primary key are exported by keyset paging; tables without a unique key (e.g. `shopify_orders`) are exported one calendar-day window at a time (never pretending to be keyset).
+
+### S3 archive structure
+
+Deterministic keys, one isolated prefix per purge month, one folder per brand (every brand database has the same table names):
+
+```text
+<prefix>/2026-10/<brand>/shopify_orders.csv
+<prefix>/2026-10/<brand>/shopify_orders.manifest.json        <- written last; the only proof of a complete archive
+<prefix>/2026-10/<brand>/shopify_orders.purge-complete.json  <- written after the delete finished (reporting only)
+...
+```
+
+The CSV has a header and **every column** of the table (read from `information_schema`, not hand-listed), UTF-8, streamed straight to S3 (multipart, no temp file, bounded memory). **NULL is written as `\N`**; an empty string stays empty; a literal string that starts with a backslash gets one extra backslash, so a field that is exactly `\N` is always NULL. The manifest records table, brand, month, cutoff, date column, row count, byte size, sha256, min/max date, column list and key. The sha256 is also stored as an S3 object tag. Encryption: the bucket's default encryption is used (optional `DATA_PURGE_S3_SSE` / `DATA_PURGE_S3_KMS_KEY_ID`); credentials come only from the default AWS chain (instance role) - none are in code.
+
+### Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DATA_PURGE_ENABLED` | `false` | `false` -> the worker does nothing destructive |
+| `DATA_PURGE_DRY_RUN` | `false` | `true` -> **read-only** report; takes precedence over everything; runs even when disabled; no S3 writes, no deletes |
+| `DATA_PURGE_ARCHIVE_ONLY` | `true` | destructive only when **explicitly** `false` |
+| `PURGE_TEST` | `false` | `true` = **export to S3 but never delete**: a hard override that caps any enabled run at archive-only, whatever `ARCHIVE_ONLY` / `DATA_PURGE_DELETE_TABLES` say. It does not enable a disabled worker (`DATA_PURGE_ENABLED=true` and a bucket are still needed) and does not change dry-run |
+| `DATA_PURGE_DELETE_TABLES` | empty | comma list of tables allowed to be deleted (must be a subset of `DATA_PURGE_TABLES`); required when `ARCHIVE_ONLY=false` |
+| `DATA_PURGE_TABLES` | all seven | tables to archive |
+| `DATA_PURGE_S3_BUCKET` | - | required for archive/delete runs |
+| `DATA_PURGE_S3_PREFIX` | `data-purge` | archive root |
+| `DATA_PURGE_BATCH_SIZE` | `1000` | rows per delete batch (**conservative, untuned** - tune from the per-batch logs) |
+| `DATA_PURGE_EXPORT_BATCH_SIZE` | `2000` | rows per export read |
+| `DATA_PURGE_SLEEP_BETWEEN_BATCHES_S` | `1.0` | pause after each delete batch (throttle for EBS/replicas) |
+| `DATA_PURGE_MAX_WINDOW_ROWS` | `200000` | per-day window cap for tables without a unique key (over -> the table fails, nothing deleted) |
+| `DATA_PURGE_S3_SSE`, `DATA_PURGE_S3_KMS_KEY_ID` | unset | optional explicit encryption |
+| `DATA_PURGE_WORKER_SELF_RUN` | `true` | `false` = run once and exit |
+| `DATA_PURGE_WORKER_MEM_LIMIT`, `DATA_PURGE_WORKER_CPUS`, `DATA_PURGE_DB_READ_TIMEOUT_S` | `512m`, `0.5`, `600` | compose overrides (the longer read timeout is for COUNT/EXPLAIN on large tables) |
+
+| ENABLED | DRY_RUN | ARCHIVE_ONLY | Mode |
+|---|---|---|---|
+| any | true | any | **DRY_RUN** (read-only) |
+| false | false | any | **DISABLED** |
+| true | false | true (default) | **ARCHIVE_ONLY**: archive + verify + manifest, never delete |
+| true | false | false | **FULL**: archive, verify, then delete - only tables in `DATA_PURGE_DELETE_TABLES` |
+
+`PURGE_TEST=true` is the safe way to test the export end to end: the CSV and manifest are written and verified, no `DELETE` is ever issued, and the summary says so. Archive keys are deterministic per month, so a second test run in the same month reuses the verified archive instead of exporting again - to re-test an export, remove that month's objects from S3 or run with a different `--as-of` month. Turning `PURGE_TEST` off later in the same month reuses the archive and (if mode and allowlist permit) deletes.
+
+Booleans accept only `true`/`false`; anything else (or an invalid number, an unknown table, a missing bucket, `ARCHIVE_ONLY=false` without a delete allowlist) makes the worker **refuse to run**.
+
+### Schedule
+
+The 1st of every month at **03:23 IST** (`Asia/Kolkata`, like the other workers; the purge month is the IST month). `coalesce`, `max_instances=1`, a 24 h misfire grace so a container that was down at the trigger still runs once after it starts. Nothing runs at startup.
+
+### Dry run and manual execution
+
+```bash
+# read-only report: cutoff, eligible rows, detected date column/type/index/unique key, EXPLAIN verdict,
+# whether the table is archiveable / deletion would be supported, table size (metadata only)
+DATA_PURGE_DRY_RUN=true python -m workers.run data-purge
+DATA_PURGE_DRY_RUN=true python -m workers.run data-purge --brand-id PTS --as-of 2026-10-01T03:23:00+05:30
+
+# real run once (still obeys ENABLED / ARCHIVE_ONLY / DELETE_TABLES)
+python -m workers.run data-purge [--brand-id PTS] [--as-of <ISO datetime>]
+
+# inside Docker
+docker compose exec -T data-purge-worker python -m workers.run data-purge
+```
+
+The dry run never scans a whole table: the exact eligible count runs under a 60 s `MAX_EXECUTION_TIME` hint and falls back to the `EXPLAIN` estimate (labelled "estimated") or "skipped (expensive)".
+
+### Failure and retry behaviour
+
+Per table, in order: validate config -> validate table/schema/index/`EXPLAIN` -> compute cutoff -> preflight guards -> count -> (dry run stops here) -> reuse a valid manifest or export + upload -> verify the S3 object (exists, size equals the bytes written) -> recount sanity check -> write the manifest -> only now: delete in committed batches -> verify nothing eligible remains.
+
+- Export, upload, verification or manifest failure -> **nothing is deleted**; the table is `FAILED` and the next run retries.
+- Crash after the upload but before the manifest -> the CSV is reused only if it is positively confirmed complete (completion tags, size, row count, cutoff and header all match); otherwise it is deterministically replaced. A CSV without a manifest is never trusted for deletion.
+- A manifest that exists is authoritative and **never overwritten**; if it does not match this table/brand/month/cutoff/columns, the table fails for manual review.
+- Crash or error mid-delete -> the archive stays; the next run finds the manifest, re-validates it and deletes the remainder. Deletes are capped at the archived row count, and refused if more rows are eligible than were archived.
+- It refuses to delete when that would empty the table (ingestion watermarks need a row).
+- Statuses: `SUCCESS`, `ARCHIVED_ONLY`, `FAILED`, `NO_DATA`, `DRY_RUN`, `SKIPPED_*` (with the reason). One table or brand failing never stops the others; the process exits non-zero if any table failed. Zero eligible rows -> no S3 objects, no `DELETE`.
+
+### Safety guarantees and the operational invariant
+
+Nothing is deleted before the archive is complete and verified; batches are small and committed individually (no giant `DELETE`/transaction); rows are never loaded into memory wholesale; `date >= cutoff` can never match; logs contain counts, never row data.
+
+**Invariant: rows with `date < cutoff` must be treated as immutable while a purge runs.** The row-count recount is a sanity check only - it does not prove the exact same rows were exported. What can break the invariant (nothing in the repo locks against it): env-driven `BACKFILL_MODE` (re-inserts order windows) and manual `backfill scripts/` runs over old windows; `MONGO_EVENTS_LEGACY_COPY=true`; `backfill_mongo_events_summary.py`. Best-effort guards skip a table when a conflicting env flag is set in this container or another session is currently running a write against it (`SHOW FULL PROCESSLIST`); manual scripts are invisible. **Runbook rule: do not run backfills over windows older than the cutoff while the purge runs.**
+
+### `shopify_orders`: not proven safe to delete
+
+Old orders are not dead data. A cancel/RTO/refund of an old order puts its **old `created_date`** into the rebuild set (`returns_fact.order_created_date`, no age limit), and the summary rebuilds read `shopify_orders` for that date. If the rows are gone, those rebuilds can **overwrite with zeros** (`sales_summary` when refund events exist, `hour_wise_sales`, `daily/hourly_citywise_summary` when session rows exist, order columns of `shopify_orders_utm_daily`) or **delete** bundle rollup rows; `order_summary`, `discount_summary`, `gross_summary`, `rto_summary` and the `dashboard_discount_*` tables keep their old rows. Manual `backfill_citywise_summary.py` / `bundle_rollup_backfill.py` over purged dates are destructive too. The repo cannot establish that nothing needs this history, so the **first destructive rollout should exclude `shopify_orders`** (archive it, keep it in `DATA_PURGE_TABLES`, leave it out of `DATA_PURGE_DELETE_TABLES`). `shopify_orders_update` (only `max(updated_at)` is read) is the lowest-risk order table. `raw_mongo_events` is safe for live workers (they read recent windows) but its archive is the only backup once deleted.
+
+### Production rollout
+
+1. **Month 0:** deploy (idle). Run the read-only schema/index/`EXPLAIN` checks and `DATA_PURGE_DRY_RUN=true`; apply missing date-index migrations manually where the dry run reports `SKIPPED_NO_INDEX` (006/007 for the order tables, `009` for `raw_mongo_events.created_at_ist` - an online but I/O-heavy index build, off-peak, one brand at a time); confirm the schemas of the "not confirmed" tables.
+2. **Month 1 (archive only):** set bucket/prefix + IAM, `DATA_PURGE_ENABLED=true` (leave `ARCHIVE_ONLY` at its default). Start with one brand and one small table; check S3 sizes/row counts/manifests and DB load/EBS; do a restore drill (load a sample CSV into a scratch table, mapping `\N` to NULL); widen to all brands/tables. Validate the `shopify_orders` dependencies above.
+3. **Only after that:** `DATA_PURGE_ARCHIVE_ONLY=false` and `DATA_PURGE_DELETE_TABLES` listing only tables proven safe (suggested order: `shopify_orders_update`, `raw_mongo_events` once restore is proven, then the rest; `shopify_orders` last or never). Tune `DATA_PURGE_BATCH_SIZE` / `DATA_PURGE_SLEEP_BETWEEN_BATCHES_S` from the per-batch logs. New variables go in the Jenkins `.env` secret file.
+
+IAM for the host role: `s3:PutObject`, `s3:GetObject` (HEAD/read), `s3:ListBucket` on the prefix, and `s3:PutObjectTagging` / `s3:GetObjectTagging` (tagging failures are non-fatal). With a Docker bridge network the instance-metadata hop limit may need to be 2 for the role to be reachable.
+
+### Operational notes
+
+Deleting InnoDB rows frees space **inside** the tablespaces; it does not shrink the RDS *allocated storage* metric, and the worker never runs `OPTIMIZE TABLE` (heavy I/O, temp space and locking - treat reclaiming space as a separate, planned operation). The point is to cap live row counts and future growth while keeping history recoverable in S3. Deletes are write-heavy: brands and tables are processed strictly one at a time, in small batches with a pause, at 03:23 IST.
 
 ## Testing
 
