@@ -376,7 +376,7 @@ class LegacyCopyTests(unittest.TestCase):
     LEGACY_COLUMNS = raw._LEGACY_COPY_COLUMNS + ["data_click", "ingested_at"]
     MINMAX = (datetime(2026, 11, 10, 3, 20), datetime(2026, 11, 11, 14, 25))
 
-    def _run(self, cursor, store, chunks_per_run=3):
+    def _run(self, cursor, store, chunks_per_run=3, enabled=True, max_seconds=1e9):
         def get(cur, key, default=None):
             return store.get(key, default)
 
@@ -385,6 +385,8 @@ class LegacyCopyTests(unittest.TestCase):
 
         with mock.patch.object(raw, "get_pipeline_metadata_timestamp", side_effect=get), \
              mock.patch.object(raw, "update_pipeline_metadata_timestamp", side_effect=update), \
+             mock.patch.object(raw, "LEGACY_COPY_ENABLED", enabled), \
+             mock.patch.object(raw, "LEGACY_COPY_MAX_SECONDS", max_seconds), \
              mock.patch.object(raw, "LEGACY_COPY_CHUNKS_PER_RUN", chunks_per_run), \
              mock.patch.object(raw, "LEGACY_COPY_CHUNK_HOURS", 6):
             return raw._copy_legacy_history(cursor, FakeConnection(), "[test]")
@@ -450,10 +452,26 @@ class LegacyCopyTests(unittest.TestCase):
         self._run(cursor, {raw.LEGACY_COPY_DONE_KEY: datetime.now(IST)})
         self.assertEqual(cursor.executed, [])
 
+    def test_time_budget_stops_the_copy_after_the_first_chunk_and_it_resumes_later(self):
+        store = {}
+        cursor = self._cursor()
+        clock = mock.Mock(monotonic=mock.Mock(side_effect=[0, 100]))  # start, then budget exceeded
+        with mock.patch.object(raw, "time", clock):
+            self._run(cursor, store, chunks_per_run=10, max_seconds=45)
+
+        self.assertEqual(len(cursor.insert_ignore_calls), 1)  # progress is still guaranteed
+        self.assertIn(raw.LEGACY_COPY_PROGRESS_KEY, store)
+        self.assertNotIn(raw.LEGACY_COPY_DONE_KEY, store)
+
+    def test_is_off_by_default(self):
+        import os
+
+        if "MONGO_EVENTS_LEGACY_COPY" not in os.environ:
+            self.assertFalse(raw.LEGACY_COPY_ENABLED)
+
     def test_can_be_switched_off(self):
         cursor = self._cursor()
-        with mock.patch.object(raw, "LEGACY_COPY_ENABLED", False):
-            self.assertEqual(self._run(cursor, {}), 0)
+        self.assertEqual(self._run(cursor, {}, enabled=False), 0)
         self.assertEqual(cursor.executed, [])
 
 
@@ -509,11 +527,39 @@ class SyncForBrandTests(unittest.TestCase):
         self.assertEqual(query["createdAt"]["$gte"], datetime(2026, 9, 23, 18, 30, tzinfo=timezone.utc))
         self.assertEqual(query["createdAt"]["$lt"], datetime(2026, 9, 25, 18, 30, tzinfo=timezone.utc))
 
+    def test_table_ddl_has_only_the_indexes_the_rollups_need(self):
+        cursor, *_ = _sync([dict(SAMPLE_DOC)])
+        ddl = next(s for s in cursor.executed if "CREATE TABLE IF NOT EXISTS `raw_mongo_events`" in s)
+        self.assertIn("`idx_type_created` (`event_type`, `created_at_utc`)", ddl)
+        self.assertIn("`idx_created_at_utc` (`created_at_utc`)", ddl)
+        for dropped in ("idx_event_type", "idx_session_id", "idx_cart_token"):
+            self.assertNotIn(dropped, ddl)
+
     def test_creates_table_runs_legacy_copy_and_upserts_rows(self):
         cursor, *_, copy_history = _sync([dict(SAMPLE_DOC)])
         self.assertTrue(any("CREATE TABLE IF NOT EXISTS `raw_mongo_events`" in s for s in cursor.executed))
         self.assertEqual(len(cursor.executemany_calls), 1)
         copy_history.assert_called_once()
+
+    def test_legacy_copy_runs_after_live_ingestion_so_it_never_delays_fresh_events(self):
+        cursor = FakeCursor()
+        seen_at_copy = {}
+        collection = mock.Mock()
+        collection.find.return_value = [dict(SAMPLE_DOC)]
+        collection.delete_many.return_value = mock.Mock(deleted_count=1)
+
+        def fake_copy(c, conn, prefix):
+            seen_at_copy["upserts"] = len(c.executemany_calls)
+            seen_at_copy["deleted"] = collection.delete_many.call_count
+            return 0
+
+        with mock.patch.object(raw.aws_background, "get_brand_timezone", return_value=IST),              mock.patch.object(raw, "_resolve_mongo_sessions_collection", return_value=(mock.Mock(), collection)),              mock.patch.object(raw, "_copy_legacy_history", side_effect=fake_copy):
+            raw.sync_mongo_events_raw_for_brand(
+                brand_index=8, brand_name="SHYLENEW", brand_key="SHYLENEW",
+                start_date=date(2026, 9, 24), end_date=date(2026, 9, 25),
+                cursor=cursor, connection=FakeConnection(),
+            )
+        self.assertEqual(seen_at_copy, {"upserts": 1, "deleted": 1})
 
     def test_legacy_copy_failure_does_not_stop_live_ingestion(self):
         cursor = FakeCursor()
@@ -626,13 +672,36 @@ class WatermarkIncrementalTests(unittest.TestCase):
         _, _, update_wm = self._run_incremental([], stored_watermark=datetime(2026, 9, 24, 9, 0, tzinfo=IST))
         update_wm.assert_not_called()
 
-    def test_returns_affected_ist_dates(self):
+    def test_returns_affected_ist_dates_for_rollup_event_types(self):
         doc = dict(
             SAMPLE_DOC,
             event_id="e1",
+            event_type="checkout_initiated",
             createdAt=datetime(2026, 9, 24, 20, 0, tzinfo=timezone.utc),  # 2026-09-25 01:30 IST
         )
         *_, affected, _, _, _ = _sync([doc], explicit_window=False)
+        self.assertEqual(affected, {"2026-09-25"})
+
+    def test_events_the_rollups_do_not_use_trigger_no_rollup_dates(self):
+        docs = [
+            dict(SAMPLE_DOC, event_id="e1", event_type="TAB_Click"),
+            dict(SAMPLE_DOC, event_id="e2", event_type="purchase_TECHIT"),
+            dict(SAMPLE_DOC, event_id="e3", event_type="login"),
+        ]
+        cursor, collection, _, affected, *_ = _sync(docs, explicit_window=False)
+        self.assertEqual(affected, set())
+        # ...but they are still all ingested and deleted from Mongo
+        self.assertEqual(sum(len(rows) for _, rows in cursor.executemany_calls), 3)
+        collection.delete_many.assert_called_once()
+
+    def test_only_rollup_event_types_decide_the_dates_in_a_mixed_batch(self):
+        docs = [
+            dict(SAMPLE_DOC, event_id="e1", event_type="TAB_Click",
+                 createdAt=datetime(2026, 9, 24, 3, 0, tzinfo=timezone.utc)),
+            dict(SAMPLE_DOC, event_id="e2", event_type="buy_now",
+                 createdAt=datetime(2026, 9, 25, 3, 0, tzinfo=timezone.utc)),
+        ]
+        *_, affected, _, _, _ = _sync(docs, explicit_window=False)
         self.assertEqual(affected, {"2026-09-25"})
 
 

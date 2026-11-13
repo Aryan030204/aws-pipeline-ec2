@@ -357,6 +357,7 @@ from pipeline.mongo_events import (
     _upsert_overall_summary_event_totals,
 )
 from pipeline.mongo_events_sql import (
+    cached_candidate_rows,
     update_overall_summary_event_columns_sql,
     sync_checkout_initiated_ci_events_sql,
     sync_buy_now_events_sql,

@@ -306,6 +306,7 @@ class RawEventsPhaseTests(unittest.TestCase):
         )
         for fn_name in self._SQL_FN_NAMES:
             setattr(fake, fn_name, mock.Mock())
+        fake.cached_candidate_rows = mock.MagicMock()  # used as a context manager
         return fake
 
     def test_master_failure_does_not_stop_incremental_job_and_is_still_raised(self):
@@ -355,6 +356,27 @@ class RawEventsPhaseTests(unittest.TestCase):
             self.assertEqual(kwargs["end_date"], date(2026, 9, 26))
             self.assertEqual(kwargs["brand_index"], 1)
 
+    def test_rollups_share_one_cached_read_of_the_affected_window(self):
+        from unittest import mock
+
+        fake = self._fake_aws_background([1], affected_dates={"2026-09-24", "2026-09-25"})
+        state = []
+        cm = fake.cached_candidate_rows.return_value
+        cm.__enter__.side_effect = lambda: state.append("in")
+        cm.__exit__.side_effect = lambda *a: state.append("out") or False
+        ran_inside = []
+        for fn_name in self._SQL_FN_NAMES:
+            getattr(fake, fn_name).side_effect = lambda **kw: ran_inside.append(list(state))
+        with mock.patch.dict(sys.modules, {"aws_background": fake}):
+            worker.run_incremental_events_job()
+
+        fake.cached_candidate_rows.assert_called_once()
+        args = fake.cached_candidate_rows.call_args.args
+        self.assertEqual(args[0], "cursor")
+        self.assertEqual((args[1], args[2]), (date(2026, 9, 24), date(2026, 9, 25)))
+        self.assertEqual(ran_inside, [["in"]] * len(self._SQL_FN_NAMES))  # every rollup ran inside it
+        self.assertEqual(state, ["in", "out"])
+
     def test_no_affected_dates_skips_the_sql_rollups_entirely(self):
         from unittest import mock
 
@@ -364,6 +386,7 @@ class RawEventsPhaseTests(unittest.TestCase):
 
         for fn_name in self._SQL_FN_NAMES:
             getattr(fake, fn_name).assert_not_called()
+        fake.cached_candidate_rows.assert_not_called()  # no relevant events -> not even the read
 
     def test_one_sql_rollup_function_failing_does_not_stop_the_others(self):
         from unittest import mock

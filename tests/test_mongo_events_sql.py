@@ -331,3 +331,160 @@ class StreamedFetchTests(unittest.TestCase):
             _ChunkedCursor(rows), date(2026, 8, 17), date(2026, 8, 17), IST
         )
         self.assertEqual(sorted(e["event_column"] for e in got), ["buy_now_count", "login_count"])
+
+
+class _TypeFilteringCursor:
+    """Behaves like the real table for the one query shape used here: returns only rows whose
+    event_type matches the event_type = %s / IN (...) parameters, and counts every execute()."""
+
+    def __init__(self, rows, fail_first=False):
+        self._all = rows
+        self._result = []
+        self.queries = []
+        self._fail_first = fail_first
+
+    def execute(self, sql, params=None):
+        self.queries.append((sql, params))
+        if self._fail_first:
+            self._fail_first = False
+            raise RuntimeError("db hiccup")
+        types = set(params[2:]) if params and len(params) > 2 else None
+        self._result = [r for r in self._all if types is None or r[0] in types]
+
+    def fetchmany(self, size):
+        chunk, self._result = self._result[:size], self._result[size:]
+        return chunk
+
+    def fetchall(self):
+        result, self._result = self._result, []
+        return result
+
+
+def _rollup_inputs():
+    """A busy day: repeats inside/outside the 30-minute window, singles, several variants, and
+    event types the rollups must not see (login, TAB_Click)."""
+    base = datetime(2026, 8, 17, 4, 0)  # UTC; 09:30 IST
+    rows = []
+    for i in range(40):
+        t = base + timedelta(minutes=7 * i)
+        rows.append(("checkout_initiated", f"s{i % 9}", f"c{i % 7}", f"{100 + i % 4}", t))
+        if i % 3 == 0:
+            rows.append(("buy_now", f"s{i % 5}", f"c{i % 4}", f"{200 + i % 3}", t))
+        if i % 4 == 0:
+            rows.append(("login", f"s{i % 9}", f"c{i % 7}", None, t))
+        if i % 5 == 0:
+            rows.append(("TAB_Click", f"s{i}", f"c{i}", None, t))
+    return rows
+
+
+def _run_all_rollup_reads(cursor):
+    """The same six reads the five rollups make per cycle (events_summary_worker order)."""
+    d = date(2026, 8, 17)
+    return {
+        "ci_hourly": mes._fetch_event_hourly_counts_from_sql(cursor, d, d, "checkout_initiated", "ci_events", IST),
+        "ci_variant": mes._fetch_event_variant_counts_from_sql(cursor, d, d, "checkout_initiated", "n", IST),
+        "bn_hourly": mes._fetch_event_hourly_counts_from_sql(cursor, d, d, "buy_now", "buy_now_events", IST),
+        "bn_variant": mes._fetch_event_variant_counts_from_sql(cursor, d, d, "buy_now", "n", IST),
+        "ci_total": mes._fetch_daily_unique_pair_event_counts_from_sql(cursor, d, d, "checkout_initiated", IST),
+        "bn_total": mes._fetch_daily_unique_pair_event_counts_from_sql(cursor, d, d, "buy_now", IST),
+    }
+
+
+class CandidateRowCacheTests(unittest.TestCase):
+    D = date(2026, 8, 17)
+
+    def test_without_the_cache_every_rollup_read_is_its_own_query(self):
+        cursor = _TypeFilteringCursor(_rollup_inputs())
+        _run_all_rollup_reads(cursor)
+        self.assertEqual(len(cursor.queries), 6)
+
+    def test_with_the_cache_the_window_is_read_once_for_all_rollups(self):
+        cursor = _TypeFilteringCursor(_rollup_inputs())
+        with mes.cached_candidate_rows(cursor, self.D, self.D, IST):
+            _run_all_rollup_reads(cursor)
+
+        self.assertEqual(len(cursor.queries), 1)
+        sql, params = cursor.queries[0]
+        self.assertIn("FROM raw_mongo_events", sql)
+        self.assertIn("event_type IN (%s, %s)", sql)
+        self.assertEqual(tuple(params[2:]), ("checkout_initiated", "buy_now"))
+
+    def test_cached_results_are_identical_to_the_uncached_sql_path(self):
+        rows = _rollup_inputs()
+        plain = _run_all_rollup_reads(_TypeFilteringCursor(rows))
+        with mes.cached_candidate_rows(_TypeFilteringCursor(rows), self.D, self.D, IST):
+            cached = _run_all_rollup_reads(_TypeFilteringCursor(rows))  # reads must not hit this cursor
+
+        self.assertEqual(cached, plain)
+        self.assertTrue(any(plain.values()))  # the fixture really exercises the algorithms
+
+    def test_cache_only_holds_rollup_event_types(self):
+        cursor = _TypeFilteringCursor(_rollup_inputs())
+        with mes.cached_candidate_rows(cursor, self.D, self.D, IST) as cache:
+            self.assertEqual(
+                {t for t in ("checkout_initiated", "buy_now") if cache.rows(t)},
+                {"checkout_initiated", "buy_now"},
+            )
+            with self.assertRaises(KeyError):
+                cache.rows("login")
+
+    def test_other_event_types_and_other_windows_still_query_sql(self):
+        cursor = _TypeFilteringCursor(_rollup_inputs())
+        with mes.cached_candidate_rows(cursor, self.D, self.D, IST):
+            logins = mes._fetch_candidate_rows(cursor, self.D, self.D, IST, event_type="login")
+            other_day = mes._fetch_candidate_rows(
+                cursor, self.D, self.D + timedelta(days=1), IST, event_type="buy_now"
+            )
+            all_types = mes._fetch_candidate_rows(cursor, self.D, self.D, IST, event_type=None)
+
+        self.assertTrue(logins and all(r["event_type"] == "login" for r in logins))
+        self.assertTrue(other_day)
+        self.assertTrue(any(r["event_type"] == "TAB_Click" for r in all_types))
+        self.assertEqual(len(cursor.queries), 1 + 3)  # the cache load + three fall-throughs
+
+    def test_cache_is_gone_after_the_block_and_restored_when_nested(self):
+        cursor = _TypeFilteringCursor(_rollup_inputs())
+        with mes.cached_candidate_rows(cursor, self.D, self.D, IST) as outer:
+            with mes.cached_candidate_rows(cursor, self.D, self.D, IST) as inner:
+                self.assertIsNot(outer, inner)
+            self.assertIs(mes._active_cache(), outer)
+        self.assertIsNone(mes._active_cache())
+
+        before = len(cursor.queries)
+        mes._fetch_candidate_rows(cursor, self.D, self.D, IST, event_type="buy_now")
+        self.assertEqual(len(cursor.queries), before + 1)
+
+    def test_over_the_row_cap_nothing_is_cached_and_rollups_stream_individually(self):
+        cursor = _TypeFilteringCursor(_rollup_inputs())
+        with mock.patch.object(mes, "CANDIDATE_CACHE_MAX_ROWS", 5):
+            with mes.cached_candidate_rows(cursor, self.D, self.D, IST) as cache:
+                self.assertIsNone(cache)
+                results = _run_all_rollup_reads(cursor)
+
+        self.assertEqual(len(cursor.queries), 1 + 6)  # the aborted load + six normal reads
+        self.assertEqual(results, _run_all_rollup_reads(_TypeFilteringCursor(_rollup_inputs())))
+
+    def test_a_failing_load_falls_back_to_normal_queries_instead_of_raising(self):
+        cursor = _TypeFilteringCursor(_rollup_inputs(), fail_first=True)
+        with mes.cached_candidate_rows(cursor, self.D, self.D, IST) as cache:
+            self.assertIsNone(cache)
+            results = _run_all_rollup_reads(cursor)
+        self.assertEqual(results, _run_all_rollup_reads(_TypeFilteringCursor(_rollup_inputs())))
+
+    def test_dict_cursor_rows_are_cached_too(self):
+        rows = [
+            {"event_type": "buy_now", "session_id": "s1", "cart_token": "c1",
+             "variantId": "9", "created_at_utc": datetime(2026, 8, 17, 4, 0)},
+        ]
+
+        class _DictCursor(_TypeFilteringCursor):
+            def execute(self, sql, params=None):
+                self.queries.append((sql, params))
+                self._result = list(rows)
+
+        cursor = _DictCursor([])
+        with mes.cached_candidate_rows(cursor, self.D, self.D, IST):
+            got = mes._fetch_candidate_rows(cursor, self.D, self.D, IST, event_type="buy_now")
+        self.assertEqual(got[0]["session_id"], "s1")
+        self.assertEqual(got[0]["variantId"], "9")
+        self.assertEqual(len(cursor.queries), 1)

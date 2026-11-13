@@ -513,19 +513,23 @@ def run_incremental_events_job() -> None:
                     brand_name, start_date, end_date, len(affected_dates),
                 )
 
-                for fn_name in _CI_BUY_NOW_SYNC_FN_NAMES:
-                    try:
-                        getattr(aws_background, fn_name)(
-                            brand_index=brand_index,
-                            brand_name=brand_name,
-                            start_date=start_date,
-                            end_date=end_date,
-                            brand_key=brand_key,
-                            cursor=cursor,
-                            connection=connection,
-                        )
-                    except Exception as e:
-                        logger.error("Error running %s for %s: %s", fn_name, brand_name, e)
+                # The five rollups below all read the same checkout_initiated / buy_now rows of the
+                # same window; load them once instead of six separate scans of the day.
+                tz = aws_background.get_brand_timezone(brand_index)
+                with aws_background.cached_candidate_rows(cursor, start_date, end_date, tz):
+                    for fn_name in _CI_BUY_NOW_SYNC_FN_NAMES:
+                        try:
+                            getattr(aws_background, fn_name)(
+                                brand_index=brand_index,
+                                brand_name=brand_name,
+                                start_date=start_date,
+                                end_date=end_date,
+                                brand_key=brand_key,
+                                cursor=cursor,
+                                connection=connection,
+                            )
+                        except Exception as e:
+                            logger.error("Error running %s for %s: %s", fn_name, brand_name, e)
         except Exception as e:
             logger.error("Error in incremental events job for %s: %s", brand_name, e)
 

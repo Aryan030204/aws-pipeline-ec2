@@ -39,6 +39,11 @@ def _normalize_brand_token(value: Optional[str]) -> str:
     return re.sub(r"[^a-z0-9]+", "", (value or "").strip().lower())
 
 
+# The only event types the CI / buy-now rollups (pipeline/mongo_events_sql.py) consume. Ingest keeps
+# every event type, but only these decide which dates need their rollups recomputed, and they are the
+# only rows the rollups read.
+ROLLUP_EVENT_TYPES = ("checkout_initiated", "buy_now")
+
 CI_EVENTS_BRANDS = {
     "ajmal",
     "tmc",

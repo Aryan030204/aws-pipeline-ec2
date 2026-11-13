@@ -53,6 +53,7 @@ from pipeline.db import (
     EXECUTEMANY_CHUNK_SIZE,
 )
 from pipeline.mongo_events import (
+    ROLLUP_EVENT_TYPES,
     _ist_date_range_to_utc_bounds,
     _resolve_mongo_sessions_collection,
     get_ci_events_mongo_shop_name,
@@ -91,12 +92,19 @@ MONGO_EVENTS_DELETE_INGESTED_DOCS = (
     os.environ.get("MONGO_EVENTS_DELETE_INGESTED_DOCS", "true").strip().lower() == "true"
 )
 
-# Legacy history copy (mongo_events_summary -> raw_mongo_events).
+# Legacy history copy (mongo_events_summary -> raw_mongo_events). OFF by default: the rollup tables
+# already hold every past day, the copy is a heavy sustained write load (millions of wide rows with
+# several indexes each), and old dates can still be recomputed from the untouched legacy table if ever
+# needed. Set MONGO_EVENTS_LEGACY_COPY=true to (re)start it; it resumes where it stopped.
 LEGACY_COPY_ENABLED = (
-    os.environ.get("MONGO_EVENTS_LEGACY_COPY", "true").strip().lower() == "true"
+    os.environ.get("MONGO_EVENTS_LEGACY_COPY", "false").strip().lower() == "true"
 )
-LEGACY_COPY_CHUNK_HOURS = int(os.environ.get("MONGO_EVENTS_LEGACY_COPY_CHUNK_HOURS", "6"))
+LEGACY_COPY_CHUNK_HOURS = int(os.environ.get("MONGO_EVENTS_LEGACY_COPY_CHUNK_HOURS", "2"))
 LEGACY_COPY_CHUNKS_PER_RUN = int(os.environ.get("MONGO_EVENTS_LEGACY_COPY_CHUNKS_PER_RUN", "12"))
+# Wall-clock budget per brand per run. The copy runs AFTER live ingestion and
+# stops starting new chunks once this is spent, so it can never push a
+# 15-minute cycle past its interval (history just takes more cycles).
+LEGACY_COPY_MAX_SECONDS = float(os.environ.get("MONGO_EVENTS_LEGACY_COPY_MAX_SECONDS", "45"))
 LEGACY_COPY_PROGRESS_KEY = "raw_mongo_events_legacy_copy_oldest_utc"
 LEGACY_COPY_DONE_KEY = "raw_mongo_events_legacy_copy_done_at"
 _LEGACY_COPY_COLUMNS = [
@@ -314,6 +322,11 @@ class _ColumnCatalog:
 
 
 def _ensure_raw_events_table(cursor, connection) -> None:
+    # Indexes are deliberately minimal - every secondary index is another write per ingested event:
+    # (event_type, created_at_utc) serves the rollups' "this type in this window" reads and covers the
+    # event_type-only lookups; created_at_utc serves the all-types window scan. Nothing in the pipeline
+    # queries by session_id / cart_token alone. Tables created earlier keep their old indexes until
+    # migrations/008_raw_mongo_events_indexes.sql is applied.
     fixed = ",\n            ".join(f"{_quote(n)} {t}" for n, t in _FIXED_COLUMNS.items())
     cursor.execute(
         f"""
@@ -321,9 +334,7 @@ def _ensure_raw_events_table(cursor, connection) -> None:
             {fixed},
             `ingested_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (`event_id`),
-            KEY `idx_event_type` (`event_type`),
-            KEY `idx_session_id` (`session_id`),
-            KEY `idx_cart_token` (`cart_token`),
+            KEY `idx_type_created` (`event_type`, `created_at_utc`),
             KEY `idx_created_at_utc` (`created_at_utc`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC
         """
@@ -449,8 +460,9 @@ def _floor_hour(value: datetime) -> datetime:
 def _copy_legacy_history(cursor, connection, log_prefix: str) -> int:
     """Copy the legacy mongo_events_summary rows into raw_mongo_events, newest
     first, LEGACY_COPY_CHUNK_HOURS at a time, at most LEGACY_COPY_CHUNKS_PER_RUN
-    chunks per call (so one 15-minute cycle never gets long). Newest-first means
-    the days the rollups recompute are complete first. Progress is stored in
+    chunks and LEGACY_COPY_MAX_SECONDS per call (so one 15-minute cycle never
+    gets long). Newest-first means the days the rollups recompute are complete
+    first. Progress is stored in
     pipeline_metadata, so it resumes across runs; INSERT IGNORE means rows
     already ingested live (which are authoritative) are never overwritten.
     Returns the number of rows copied this call."""
@@ -495,7 +507,12 @@ def _copy_legacy_history(cursor, connection, log_prefix: str) -> int:
 
     copied = 0
     chunks = 0
+    copy_started = time.monotonic()
     while boundary > floor_lo and chunks < LEGACY_COPY_CHUNKS_PER_RUN:
+        # always do at least one chunk (so progress is guaranteed), then stop
+        # once the time budget is spent
+        if chunks > 0 and time.monotonic() - copy_started >= LEGACY_COPY_MAX_SECONDS:
+            break
         start = max(boundary - chunk, floor_lo)
         cursor.execute(sql, (start, boundary))
         copied += max(getattr(cursor, "rowcount", 0) or 0, 0)
@@ -589,13 +606,6 @@ def sync_mongo_events_raw_for_brand(
         _ensure_raw_events_table(c, conn)
         catalog = _ColumnCatalog(c, conn)
 
-        # Automatic migration of the legacy table's history. A failure here
-        # must not stop live ingestion; it just retries next run.
-        try:
-            _copy_legacy_history(c, conn, log_prefix)
-        except Exception as e:
-            logger.error(f"{log_prefix}: legacy history copy failed (will retry next run): {e}")
-
         if explicit_window:
             lower_bound = query_lower_bound
             logger.info(
@@ -642,8 +652,10 @@ def sync_mongo_events_raw_for_brand(
             flushed = _flush_batch(c, conn, catalog, current_batch, warned, log_prefix)
             upserted += flushed
             for r in current_batch:
+                # Only checkout_initiated / buy_now events change what the rollups compute, so only
+                # their dates are reported back (every event type is still ingested above).
                 ist_dt = r.get("created_at_ist")
-                if ist_dt is not None:
+                if ist_dt is not None and r.get("event_type") in ROLLUP_EVENT_TYPES:
                     affected_dates.add(ist_dt.date().isoformat())
             if MONGO_EVENTS_DELETE_INGESTED_DOCS:
                 try:
@@ -698,6 +710,14 @@ def sync_mongo_events_raw_for_brand(
             f"into {RAW_EVENTS_TABLE}, deleted {deleted} ingested document(s) from Mongo, "
             f"in {time.monotonic() - started_at:.1f}s"
         )
+
+        # Automatic migration of the legacy table's history - AFTER live
+        # ingestion, within a time budget, so it never delays fresh events or
+        # their rollups. A failure here just retries next run.
+        try:
+            _copy_legacy_history(c, conn, log_prefix)
+        except Exception as e:
+            logger.error(f"{log_prefix}: legacy history copy failed (will retry next run): {e}")
 
     client = None
     try:

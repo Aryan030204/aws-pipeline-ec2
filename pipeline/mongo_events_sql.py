@@ -21,6 +21,9 @@ variant-wise-events-summary table helpers) are imported unchanged from
 pipeline.mongo_events, not duplicated.
 """
 
+import os
+import threading
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
@@ -28,6 +31,7 @@ from zoneinfo import ZoneInfo
 from pipeline.state import IST, logger
 from pipeline.db import get_db_cursor
 from pipeline.mongo_events import (
+    ROLLUP_EVENT_TYPES,
     is_ci_events_brand,
     get_ci_events_mongo_shop_name,
     _normalize_variant_ids,
@@ -50,6 +54,99 @@ MONGO_EVENTS_SUMMARY_TABLE = "raw_mongo_events"
 # is not copied into Python in full (one list of raw rows + one list of mapped dicts) at once.
 CANDIDATE_FETCH_CHUNK = 5000
 
+# One incremental cycle runs five rollups that each used to re-read the same day's checkout_initiated
+# and buy_now rows (six scans, each needing a clustered-index lookup per row). cached_candidate_rows()
+# reads them ONCE and serves all five. Rows are held as compact tuples; above this many rows the cache
+# is not used and every rollup streams from SQL exactly as before (bounds worker memory).
+CANDIDATE_CACHE_MAX_ROWS = int(os.environ.get("MONGO_EVENTS_ROW_CACHE_MAX_ROWS", "300000"))
+
+_cache_state = threading.local()
+
+
+class _CandidateRowCache:
+    """The (event_type, session_id, cart_token, variantId, created_at_utc) rows of one window."""
+
+    def __init__(self, start_date: date, end_date: date, tz: ZoneInfo, rows_by_type: Dict[str, List[tuple]]):
+        self.start_date = start_date
+        self.end_date = end_date
+        self.tz = tz
+        self._rows_by_type = rows_by_type
+
+    def covers(self, start_date: date, end_date: date, tz: ZoneInfo, event_type: Optional[str]) -> bool:
+        return (
+            event_type in self._rows_by_type
+            and start_date == self.start_date
+            and end_date == self.end_date
+            and tz == self.tz
+        )
+
+    def rows(self, event_type: str) -> List[tuple]:
+        return self._rows_by_type[event_type]
+
+    def __len__(self) -> int:
+        return sum(len(rows) for rows in self._rows_by_type.values())
+
+
+def _active_cache() -> Optional[_CandidateRowCache]:
+    return getattr(_cache_state, "cache", None)
+
+
+def _row_to_tuple(row) -> tuple:
+    if isinstance(row, dict):
+        return (
+            row.get("event_type"), row.get("session_id"), row.get("cart_token"),
+            row.get("variantId"), row.get("created_at_utc"),
+        )
+    return tuple(row)
+
+
+def _load_candidate_cache(
+    cursor, start_date: date, end_date: date, tz: ZoneInfo, event_types: Tuple[str, ...]
+) -> Optional[_CandidateRowCache]:
+    """One query for all the given event types over the window. Returns None (caller streams per rollup
+    instead) if it would exceed CANDIDATE_CACHE_MAX_ROWS."""
+    rows_by_type: Dict[str, List[tuple]] = {event_type: [] for event_type in event_types}
+    total = 0
+    for row in _stream_cursor_rows(cursor, start_date, end_date, tz, event_type=None, event_types=event_types):
+        as_tuple = _row_to_tuple(row)
+        bucket = rows_by_type.get(as_tuple[0])
+        if bucket is None:
+            continue
+        bucket.append(as_tuple)
+        total += 1
+        if total > CANDIDATE_CACHE_MAX_ROWS:
+            logger.warning(
+                f"candidate-row cache skipped: more than {CANDIDATE_CACHE_MAX_ROWS} rows for "
+                f"{start_date}..{end_date}; rollups will stream from SQL individually"
+            )
+            return None
+    return _CandidateRowCache(start_date, end_date, tz, rows_by_type)
+
+
+@contextmanager
+def cached_candidate_rows(
+    cursor,
+    start_date: date,
+    end_date: date,
+    tz: ZoneInfo,
+    event_types: Tuple[str, ...] = ROLLUP_EVENT_TYPES,
+):
+    """Read the checkout_initiated / buy_now rows of [start_date, end_date] once and serve every
+    _fetch_candidate_rows call for that exact window and event type from memory while the block runs.
+    Results are identical to the per-call SQL (same rows, same mapping). If loading fails or the window
+    is too large, nothing is cached and every call falls back to its own SQL query."""
+    cache = None
+    try:
+        cache = _load_candidate_cache(cursor, start_date, end_date, tz, tuple(event_types))
+    except Exception as e:
+        logger.warning(f"candidate-row cache unavailable ({e}); rollups will query SQL individually")
+    previous = _active_cache()
+    _cache_state.cache = cache
+    try:
+        yield cache
+    finally:
+        _cache_state.cache = previous
+
 
 def _iter_candidate_rows(
     cursor,
@@ -60,7 +157,11 @@ def _iter_candidate_rows(
 ) -> Iterator[Dict[str, Any]]:
     """Streaming version of _fetch_candidate_rows: yields one mapped row at a time.
     The query must be fully consumed before the cursor is reused."""
-    rows = _stream_cursor_rows(cursor, start_date, end_date, tz, event_type)
+    cache = _active_cache()
+    if cache is not None and cache.covers(start_date, end_date, tz, event_type):
+        rows = cache.rows(event_type)
+    else:
+        rows = _stream_cursor_rows(cursor, start_date, end_date, tz, event_type)
     for row in rows:
         mapped = _map_candidate_row(row)
         if mapped is not None:
@@ -90,13 +191,23 @@ def _fetch_candidate_rows(
     return rows if stream else list(rows)
 
 
-def _stream_cursor_rows(cursor, start_date: date, end_date: date, tz: ZoneInfo, event_type: Optional[str]):
+def _stream_cursor_rows(
+    cursor,
+    start_date: date,
+    end_date: date,
+    tz: ZoneInfo,
+    event_type: Optional[str],
+    event_types: Optional[Tuple[str, ...]] = None,
+):
     start_utc, end_utc = _ist_date_range_to_utc_bounds(start_date, end_date, tz)
     where = ["created_at_utc >= %s", "created_at_utc < %s"]
     params: List[Any] = [start_utc.replace(tzinfo=None), end_utc.replace(tzinfo=None)]
     if event_type is not None:
         where.append("event_type = %s")
         params.append(event_type)
+    elif event_types:
+        where.append(f"event_type IN ({', '.join(['%s'] * len(event_types))})")
+        params.extend(event_types)
 
     cursor.execute(
         f"""
