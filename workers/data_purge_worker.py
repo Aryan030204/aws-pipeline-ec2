@@ -153,10 +153,29 @@ def _run_purge(current_dt: Optional[datetime], brand_key: Optional[str]) -> None
     logger.info("Data purge worker complete.")
 
 
+def _purge_test_enabled() -> bool:
+    """True only for an explicit PURGE_TEST=true (same strict parsing as the config; anything else is False here
+    and is rejected by the config when a run is attempted)."""
+    return os.environ.get("PURGE_TEST", "").strip().lower() == "true"
+
+
+def _run_startup_test_pass() -> None:
+    """PURGE_TEST=true: one run right after every container (re)start, so an export test does not have to wait for
+    the 1st of the month. It can never delete (PURGE_TEST caps the mode at archive-only) and it still needs
+    DATA_PURGE_ENABLED=true and a bucket. Any failure is logged and swallowed: the container must stay up (it is
+    restart: always, so an exception here would otherwise re-run the export on every crash-restart)."""
+    logger.info("PURGE_TEST=true: running one export-only pass now (startup); the monthly schedule stays active")
+    try:
+        run_worker()
+    except Exception as exc:
+        logger.error("PURGE_TEST startup pass failed (the monthly schedule is still started): %s", exc)
+
+
 def _run_scheduled() -> None:
     """
     Long-running mode for the standalone container: runs run_worker on the 1st of every month at 03:23 IST.
-    Nothing runs at startup, so a restart can never trigger a purge. misfire_grace_time is a full day: if the
+    Nothing runs at startup - EXCEPT when PURGE_TEST=true, which runs one export-only pass (never a delete) right
+    away on every container (re)start, before the scheduler starts. misfire_grace_time is a full day: if the
     container was down at the trigger instant the (coalesced) run still happens after it starts - the cutoff
     depends only on the month, so a late run is identical. Set DATA_PURGE_WORKER_SELF_RUN=false to run once and
     exit instead (what `python -m workers.run data-purge` does).
@@ -177,6 +196,8 @@ def _run_scheduled() -> None:
         misfire_grace_time=24 * 3600,
     )
     logger.info("Data purge worker scheduler started (1st of every month at 03:23 IST)")
+    if _purge_test_enabled():
+        _run_startup_test_pass()
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):

@@ -271,13 +271,13 @@ The CSV has a header and **every column** of the table (read from `information_s
 | true | false | true (default) | **ARCHIVE_ONLY**: archive + verify + manifest, never delete |
 | true | false | false | **FULL**: archive, verify, then delete - only tables in `DATA_PURGE_DELETE_TABLES` |
 
-`PURGE_TEST=true` is the safe way to test the export end to end: the CSV and manifest are written and verified, no `DELETE` is ever issued, and the summary says so. Archive keys are deterministic per month, so a second test run in the same month reuses the verified archive instead of exporting again - to re-test an export, remove that month's objects from S3 or run with a different `--as-of` month. Turning `PURGE_TEST` off later in the same month reuses the archive and (if mode and allowlist permit) deletes.
+`PURGE_TEST=true` is the safe way to test the export end to end (it also triggers one run right after each container restart/rebuild, so just redeploy to test): the CSV and manifest are written and verified, no `DELETE` is ever issued, and the summary says so. Archive keys are deterministic per month, so a second test run in the same month reuses the verified archive instead of exporting again - to re-test an export, remove that month's objects from S3 or run with a different `--as-of` month. Turning `PURGE_TEST` off later in the same month reuses the archive and (if mode and allowlist permit) deletes.
 
 Booleans accept only `true`/`false`; anything else (or an invalid number, an unknown table, a missing bucket, `ARCHIVE_ONLY=false` without a delete allowlist) makes the worker **refuse to run**.
 
 ### Schedule
 
-The 1st of every month at **03:23 IST** (`Asia/Kolkata`, like the other workers; the purge month is the IST month). `coalesce`, `max_instances=1`, a 24 h misfire grace so a container that was down at the trigger still runs once after it starts. Nothing runs at startup.
+The 1st of every month at **03:23 IST** (`Asia/Kolkata`, like the other workers; the purge month is the IST month). `coalesce`, `max_instances=1`, a 24 h misfire grace so a container that was down at the trigger still runs once after it starts. Nothing runs at startup - **except with `PURGE_TEST=true`**, which runs one export-only pass immediately on every container (re)start/rebuild (before the scheduler starts; it can never delete, still needs `DATA_PURGE_ENABLED=true` and a bucket, and a failure is logged without stopping the container). The monthly schedule stays active either way.
 
 ### Dry run and manual execution
 

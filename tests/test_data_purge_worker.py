@@ -135,6 +135,63 @@ class SafeDefaultsTests(unittest.TestCase):
         self.assertEqual((run.cfg.mode, run.store, run.cutoff), (dp.Mode.DRY_RUN, None, dp.compute_cutoff(datetime(2026, 10, 1, tzinfo=IST))))
 
 
+class StartupPassTests(unittest.TestCase):
+    """PURGE_TEST=true runs one export-only pass at container start; nothing else runs at startup."""
+
+    def _schedule(self, env, run_worker_error=None):
+        sched = mock.Mock()
+        order = []
+        sched.start.side_effect = lambda: order.append("scheduler.start")
+
+        def fake_run_worker(*args, **kwargs):
+            order.append("run_worker")
+            if run_worker_error:
+                raise run_worker_error
+
+        with purge_env(**env),              mock.patch("apscheduler.schedulers.blocking.BlockingScheduler", return_value=sched),              mock.patch.object(worker, "run_worker", side_effect=fake_run_worker) as run_worker:
+            worker._run_scheduled()
+        return sched, run_worker, order
+
+    def test_no_startup_run_by_default(self):
+        sched, run_worker, order = self._schedule({})
+        run_worker.assert_not_called()
+        self.assertEqual(order, ["scheduler.start"])
+        sched.add_job.assert_called_once()
+
+    def test_purge_test_false_or_garbage_does_not_run_at_startup(self):
+        for value in ("false", "", "yes", "1", "ture"):
+            with self.subTest(value=value):
+                _, run_worker, _ = self._schedule({"PURGE_TEST": value})
+                run_worker.assert_not_called()
+
+    def test_purge_test_true_runs_once_before_the_scheduler_starts_and_keeps_the_monthly_job(self):
+        sched, run_worker, order = self._schedule({"PURGE_TEST": "true"})
+        run_worker.assert_called_once_with()
+        self.assertEqual(order, ["run_worker", "scheduler.start"])  # immediately, then the schedule
+        kwargs = sched.add_job.call_args.kwargs
+        self.assertEqual((kwargs["day"], kwargs["hour"], kwargs["minute"]), (1, 3, 23))  # schedule unchanged
+
+    def test_a_failing_startup_pass_does_not_stop_the_container_or_the_schedule(self):
+        sched, run_worker, order = self._schedule({"PURGE_TEST": "true"}, run_worker_error=RuntimeError("boom"))
+        run_worker.assert_called_once()
+        self.assertEqual(order, ["run_worker", "scheduler.start"])  # no exception escaped; it still schedules
+
+    def test_startup_pass_is_still_gated_by_the_normal_config(self):
+        # PURGE_TEST without DATA_PURGE_ENABLED: the pass runs but does nothing
+        with purge_env(PURGE_TEST="true"), fake_brands() as (init, _),              mock.patch.object(worker.data_purge, "run_purge") as run_purge:
+            worker._run_startup_test_pass()
+        init.assert_not_called()
+        run_purge.assert_not_called()
+
+    def test_startup_pass_with_purge_test_never_deletes(self):
+        env = dict(DATA_PURGE_ENABLED="true", DATA_PURGE_S3_BUCKET="b", DATA_PURGE_ARCHIVE_ONLY="false",
+                   DATA_PURGE_DELETE_TABLES="raw_mongo_events", PURGE_TEST="true")
+        with purge_env(**env), fake_brands(),              mock.patch.object(worker.data_purge, "S3ArchiveStore"),              mock.patch.object(worker.data_purge, "run_purge", return_value=[]) as run_purge:
+            worker._run_startup_test_pass()
+        run = run_purge.call_args.args[1]
+        self.assertEqual((run.cfg.mode, run.cfg.purge_test), (dp.Mode.ARCHIVE_ONLY, True))
+
+
 class RunWiringTests(unittest.TestCase):
     def test_archive_only_builds_the_store_and_uses_the_run_month(self):
         env = dict(DATA_PURGE_ENABLED="true", DATA_PURGE_S3_BUCKET="my-bucket", DATA_PURGE_S3_PREFIX="archive")

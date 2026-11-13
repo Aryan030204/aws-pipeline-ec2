@@ -73,7 +73,10 @@ class MidnightScheduleTests(unittest.TestCase):
 
     def test_data_purge_runs_monthly_on_the_1st_at_0323_ist_and_not_at_startup(self):
         fake = mock.Mock()
-        with mock.patch("apscheduler.schedulers.blocking.BlockingScheduler", return_value=fake),              mock.patch.object(data_purge_worker, "run_worker") as run_worker:
+        env = {k: v for k, v in os.environ.items() if k != "PURGE_TEST"}  # a developer's .env must not leak in
+        with mock.patch("apscheduler.schedulers.blocking.BlockingScheduler", return_value=fake), \
+             mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(data_purge_worker, "run_worker") as run_worker:
             data_purge_worker._run_scheduled()
         kwargs = fake.add_job.call_args.kwargs
         self.assertEqual(kwargs["trigger"], "cron")
