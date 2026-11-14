@@ -316,10 +316,14 @@ PURGE_TABLES: Tuple[TableSpec, ...] = (
               "only backup of these events"),
     TableSpec("product_sessions_snapshot", "date", DateKind.LOCAL_DATE, _LOCAL_TYPES + ("datetime",), False,
               "no DDL/writer in repo; column inferred from reads"),
-    TableSpec("mv_product_sessions_by_path_daily", None, None, (), False,
-              "not referenced anywhere in the repo; may be a view - skipped until its schema is verified"),
-    TableSpec("mv_product_sessions_by_type_daily", None, None, (), False,
-              "not referenced anywhere in the repo; may be a view - skipped until its schema is verified"),
+    # Not referenced anywhere in the repo; the date column name and that it holds calendar dates was confirmed
+    # by looking at the live tables (columns: date, landing_page_path|landing_page_type, product_id, sessions, ...).
+    # Everything else (is it a BASE TABLE or a view? the column's real type, a date index, the plan) is still
+    # verified live per brand before anything happens; a view or a missing index is skipped with a reason.
+    TableSpec("mv_product_sessions_by_path_daily", "date", DateKind.LOCAL_DATE, _LOCAL_TYPES + ("datetime",), True,
+              "derived daily aggregate; date column confirmed from the live table; live checks still apply"),
+    TableSpec("mv_product_sessions_by_type_daily", "date", DateKind.LOCAL_DATE, _LOCAL_TYPES + ("datetime",), True,
+              "derived daily aggregate; date column confirmed from the live table; live checks still apply"),
 )
 SPECS_BY_NAME: Dict[str, TableSpec] = {spec.table: spec for spec in PURGE_TABLES}
 

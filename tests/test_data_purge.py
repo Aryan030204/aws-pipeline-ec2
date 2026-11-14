@@ -544,8 +544,8 @@ class TableConfigTests(unittest.TestCase):
             "shopify_orders": ("created_date", dp.DateKind.LOCAL_DATE, True),
             "raw_mongo_events": ("created_at_ist", dp.DateKind.LOCAL_DATETIME, True),
             "product_sessions_snapshot": ("date", dp.DateKind.LOCAL_DATE, False),
-            "mv_product_sessions_by_path_daily": (None, None, False),
-            "mv_product_sessions_by_type_daily": (None, None, False),
+            "mv_product_sessions_by_path_daily": ("date", dp.DateKind.LOCAL_DATE, True),
+            "mv_product_sessions_by_type_daily": ("date", dp.DateKind.LOCAL_DATE, True),
         })
 
     def test_queries_for_each_table_reference_its_own_date_column(self):
@@ -558,18 +558,69 @@ class TableConfigTests(unittest.TestCase):
             dp.count_eligible(FakeCursor(db), spec, "2026-04-01")
             self.assertTrue(any(f"`{col}` < %s" in sql for sql, _ in db.executed), table)
 
-    def test_mv_tables_are_ambiguous_and_never_touch_the_database(self):
+    def _mv_table(self, name, group_col, rows=None, **kw):
+        rows = rows if rows is not None else (
+            [{"date": f"2025-{m:02d}-01", group_col: f"/p{i}", "sessions": 10 * i} for m in (9, 10, 11) for i in range(1, 4)]
+            + [{"date": "2026-05-01", group_col: "/keep", "sessions": 1}, {"date": "2026-09-01", group_col: "/keep", "sessions": 2}]
+        )
+        kw.setdefault("types", {"date": "date", group_col: "varchar", "sessions": "bigint"})
+        kw.setdefault("nullable", {"date": False, group_col: False, "sessions": True})
+        kw.setdefault("indexes", [("PRIMARY", 0, ["date", group_col])])
+        return FakeTable(name, ["date", group_col, "sessions"], "date", rows, **kw)
+
+    def test_mv_tables_are_archived_by_their_date_column_like_any_other_table(self):
+        for table, col in (("mv_product_sessions_by_path_daily", "landing_page_path"),
+                           ("mv_product_sessions_by_type_daily", "landing_page_type")):
+            with self.subTest(table=table):
+                db = FakeDatabase([self._mv_table(table, col)])
+                store = FakeStore()
+                result, _ = run_table(db, store, ARCHIVE, table=table)
+                self.assertEqual(result.status, dp.Status.ARCHIVED_ONLY, result.reason)
+                self.assertEqual((result.eligible, result.exported, result.deleted), (9, 9, 0))  # 2025 rows only
+                self.assertEqual(result.details["strategy"], "keyset")  # NOT NULL PK that leads with the date
+                csv = store.objects[f"data-purge/2026-10/pts/{table}.csv"]
+                self.assertEqual(csv_rows(csv)[0], ["date", col, "sessions"])
+                self.assertEqual(len(csv_rows(csv)) - 1, 9)
+                self.assertEqual(len(db.tables[table].rows), 11)  # nothing deleted
+
+    def test_a_row_on_the_cutoff_date_stays_in_the_mv_tables(self):
+        db = FakeDatabase([self._mv_table("mv_product_sessions_by_type_daily", "landing_page_type")])
+        result, _ = run_table(db, FakeStore(), full_env(tables="mv_product_sessions_by_type_daily",
+                                                        DATA_PURGE_TABLES="mv_product_sessions_by_type_daily"),
+                              table="mv_product_sessions_by_type_daily")
+        self.assertEqual(result.status, dp.Status.SUCCESS, result.reason)
+        left = sorted(r["date"] for r in db.tables["mv_product_sessions_by_type_daily"].rows)
+        self.assertEqual(left, ["2026-05-01", "2026-09-01"])  # 2026-05-01 == cutoff -> kept
+
+    def test_an_mv_table_that_is_really_a_view_is_never_purged(self):
+        view = self._mv_table("mv_product_sessions_by_path_daily", "landing_page_path", table_type="VIEW")
+        db = FakeDatabase([view])
+        store = FakeStore()
+        result, _ = run_table(db, store, full_env(tables="mv_product_sessions_by_path_daily"), table="mv_product_sessions_by_path_daily")
+        self.assertEqual(result.status, dp.Status.SKIPPED_VIEW)
+        self.assertEqual((store.upload_calls, db.deletes), ([], []))
+
+    def test_an_mv_table_without_a_date_index_is_skipped_with_a_reason(self):
+        t = self._mv_table("mv_product_sessions_by_type_daily", "landing_page_type",
+                           indexes=[("PRIMARY", 0, ["landing_page_type", "date"])])  # date does not lead
+        result, _ = run_table(FakeDatabase([t]), FakeStore(), ARCHIVE, table="mv_product_sessions_by_type_daily")
+        self.assertEqual(result.status, dp.Status.SKIPPED_NO_INDEX)
+
+    def test_a_table_with_no_configured_date_column_is_skipped_as_ambiguous_without_touching_the_db(self):
+        spec = dp.TableSpec("mystery", None, None, (), False, "unknown")
         db = FakeDatabase()
-        for table in ("mv_product_sessions_by_path_daily", "mv_product_sessions_by_type_daily"):
-            result, _ = run_table(db, FakeStore(), full_env(tables=table, DATA_PURGE_TABLES=table), table=table)
-            self.assertEqual(result.status, dp.Status.SKIPPED_AMBIGUOUS)
+        result = dp.process_table(make_run(ARCHIVE, FakeStore()), brand_for(db), spec)
+        self.assertEqual(result.status, dp.Status.SKIPPED_AMBIGUOUS)
         self.assertEqual(db.executed, [])
 
-    def test_dry_run_describes_mv_tables_read_only(self):
-        view = FakeTable("mv_product_sessions_by_path_daily", ["day", "sessions"], None, [],
+    def test_dry_run_describes_a_table_with_no_date_column_read_only(self):
+        spec = dp.TableSpec("mystery", None, None, (), False, "unknown")
+        view = FakeTable("mystery", ["day", "sessions"], None, [],
                          types={"day": "date", "sessions": "bigint"}, table_type="VIEW")
         db = FakeDatabase([view])
-        result, _ = run_table(db, None, {"DATA_PURGE_DRY_RUN": "true"}, table="mv_product_sessions_by_path_daily")
+        run = make_run({"DATA_PURGE_DRY_RUN": "true"}, None)
+        object.__setattr__(run.cfg, "tables", ("mystery",))
+        result = dp.process_table(run, brand_for(db), spec)
         self.assertEqual(result.status, dp.Status.SKIPPED_AMBIGUOUS)
         self.assertIn("VIEW", result.details["live_schema"])
         self.assertIn("day(date)", result.details["live_schema"])
@@ -1225,7 +1276,7 @@ class RunIsolationAndSummaryTests(unittest.TestCase):
         text = dp.format_summary(results, run, 12.3)
         for needle in ("DATA PURGE SUMMARY", "Cutoff: 2026-04-01", "s3://bkt/data-purge/2026-10/", "pts / raw_mongo_events",
                        "eligible: 30", "exported: 30", "archived: YES", "deleted: 30", "status: SUCCESS",
-                       "Total rows archived: 30", "Total rows deleted: 30", "Duration: 12.3s", "SKIPPED_AMBIGUOUS"):
+                       "Total rows archived: 30", "Total rows deleted: 30", "Duration: 12.3s", "SKIPPED_MISSING"):
             self.assertIn(needle, text)
 
     def test_row_values_never_appear_in_logs(self):

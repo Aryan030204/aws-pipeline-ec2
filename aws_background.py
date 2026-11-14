@@ -458,6 +458,12 @@ if BACKFILL_MODE:
             f"{BACKFILL_START_IST} → {BACKFILL_END_IST} "
             "(interpreted in each brand's store timezone)"
         )
+        if BACKFILL_END_IST.time() == datetime.min.time():
+            logger.warning(
+                f"BACKFILL_END_IST {BACKFILL_END_IST.date()} has no time of day, so it means "
+                f"{BACKFILL_END_IST.date()} 00:00:00: orders ON that date are NOT part of the window. "
+                f"To include the whole day use {BACKFILL_END_IST.date()}T23:59:59."
+            )
 
 # Backfill Filter
 BACKFILL_BRAND_INDICES_STR = os.environ.get("BACKFILL_BRAND_INDICES", "").strip()

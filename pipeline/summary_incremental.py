@@ -16,6 +16,7 @@ from pipeline.state import IST, logger, brand_id_from_config
 from pipeline.db import get_db_cursor, timed
 from pipeline.schema_migrations import ensure_summary_tables
 from pipeline.payment_mode import (
+    brand_uses_unmapped_bucket,
     breakdown_select_sql,
     count_distinct_orders,
     count_rows,
@@ -312,8 +313,10 @@ def update_order_summary_incremental(
         cursor.execute("CREATE TABLE order_summary_stage LIKE order_summary")
 
         # STEP 3: Populate staging table
-        pm = payment_predicates("payment_gateway_names")
-        hp = payment_predicates("h.payment_gateway_names")
+        # per-brand rule: blank gateway = COD for every brand except those on the "unmapped" rule
+        unmapped_bucket = brand_uses_unmapped_bucket(brand_name)
+        pm = payment_predicates("payment_gateway_names", unmapped_bucket)
+        hp = payment_predicates("h.payment_gateway_names", unmapped_bucket)
         sql = f"""
         INSERT INTO order_summary_stage (
             date, number_of_orders_created, number_of_orders_returned, actual_number_of_orders,
@@ -623,7 +626,7 @@ def update_hour_wise_sales_incremental(
         cursor.execute("CREATE TABLE hour_wise_sales_stage LIKE hour_wise_sales")
 
         # STEP 3: Populate staging table
-        pm = payment_predicates("payment_gateway_names")
+        pm = payment_predicates("payment_gateway_names", brand_uses_unmapped_bucket(brand_name))
         sql = f"""
         INSERT INTO hour_wise_sales_stage (
             date, hour, number_of_orders, total_sales, number_of_prepaid_orders,
@@ -692,9 +695,6 @@ def update_hour_wise_sales_incremental(
         )
 
 
-_PAYMENT_MODE_BREAKDOWN_CASE_SQL = breakdown_select_sql()
-
-
 def backfill_payment_mode_breakdown_columns(
     brand_index: int, brand_name: str, target_dates: Iterable[str]
 ) -> None:
@@ -718,12 +718,15 @@ def backfill_payment_mode_breakdown_columns(
         logger.debug(f"[{brand_name}] payment mode breakdown backfill: no dates to process")
         return
 
+    # per-brand rule (blank gateway = COD unless the brand is on the "unmapped" rule)
+    breakdown_sql = breakdown_select_sql(unmapped_bucket=brand_uses_unmapped_bucket(brand_name))
+
     with get_db_cursor(brand_index, dictionary=True) as (cursor, connection):
         hourly_sql = f"""
             SELECT
                 STR_TO_DATE(created_date, '%Y-%m-%d') AS date,
                 HOUR(created_time) AS hour,
-                {_PAYMENT_MODE_BREAKDOWN_CASE_SQL}
+                {breakdown_sql}
             FROM shopify_orders
             WHERE created_date IN ({placeholders})
                 AND created_time IS NOT NULL
@@ -775,7 +778,7 @@ def backfill_payment_mode_breakdown_columns(
         daily_sql = f"""
             SELECT
                 STR_TO_DATE(created_date, '%Y-%m-%d') AS date,
-                {_PAYMENT_MODE_BREAKDOWN_CASE_SQL}
+                {breakdown_sql}
             FROM shopify_orders
             WHERE created_date IN ({placeholders})
             GROUP BY date
@@ -833,7 +836,7 @@ def update_daily_citywise_summary_incremental(
         return
 
     city_expr = _normalized_city_sql_expr("shipping_city")
-    pm = payment_predicates("payment_gateway_names")
+    pm = payment_predicates("payment_gateway_names", brand_uses_unmapped_bucket(brand_name))
     with timed(
         f"[{brand_name}] daily_citywise_summary incremental ({len(params)} date(s))"
     ):
@@ -913,7 +916,7 @@ def update_hourly_citywise_summary_incremental(
         return
 
     city_expr = _normalized_city_sql_expr("shipping_city")
-    pm = payment_predicates("payment_gateway_names")
+    pm = payment_predicates("payment_gateway_names", brand_uses_unmapped_bucket(brand_name))
     with timed(
         f"[{brand_name}] hourly_citywise_summary incremental ({len(params)} date(s))"
     ):

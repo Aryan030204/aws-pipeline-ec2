@@ -79,10 +79,22 @@ Other important flags:
 | `BACKFILL_MODE` | `true` = process a specific historical date window instead of "since last run" |
 | `BACKFILL_BRAND_INDICES` | Restrict a backfill run to specific brands |
 | `ALERTS_WEBHOOK_URL` | Where QStash-forwarded sales/web-vitals alerts get delivered |
+| `UNMAPPED_PAYMENT_BRANDS` | Comma-separated brand names/tags that use the **unmapped** payment rule (default `editeveryday`): an order with no gateway name at all is reported in `unmapped_orders`/`unmapped_sales`, not as COD. **Every other brand keeps the original rule: a blank gateway name counts as COD** (so brands whose COD orders reach Shopify without a gateway name, such as BBB, still report COD). Names are compared ignoring case and punctuation; set it to an empty string to turn the unmapped rule off everywhere. Defined once in `pipeline/payment_mode.py`; applies to `order_summary`, `hour_wise_sales`, `overall_summary`, the city-wise tables and the discount dashboard's `payment_mode` |
 | `PIPELINE_METRICS_SHEET_SWITCH` | `true` (default) = log each run's per-brand metrics to Google Sheets (see below); `false` disables it entirely |
 | `PIPELINE_METRICS_SHEET_ID` | The destination spreadsheet's ID (the long id in its URL) |
 | `GOOGLE_SHEETS_SERVICE_ACCOUNT_FILE` | Path to a service-account JSON key file, mounted into the container. Use this **or** the next var, not both |
 | `GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON_B64` | The same service-account JSON key, base64-encoded, as an env var instead of a mounted file |
+
+### Backfill windows (`BACKFILL_MODE`)
+
+With `BACKFILL_MODE=true` the pipeline replaces `shopify_orders` / `shopify_orders_update` for the window `BACKFILL_START_IST` .. `BACKFILL_END_IST` (both **inclusive**, interpreted in each brand's store timezone):
+
+- Shopify is asked for orders whose `created_at` (new orders) / `updated_at` (updated orders) lies in that **exact time range**, and the same range - and only that range - is deleted before the re-fetched rows are inserted. Rows outside the range, even on the same date, are never touched.
+- The delete and the insert are **one transaction**: if the insert fails the window is left as it was, and the backfill aborts for that brand.
+- The Shopify fetch is **strict** in backfill mode: an HTTP error or exception mid-pagination aborts the brand's run instead of replacing the window with a partial list. (Normal 10-minute ticks keep the old tolerant behaviour.)
+- Nothing is deleted if the fetch returns no orders.
+- **A date without a time means midnight.** `BACKFILL_END_IST=2026-11-12` means `2026-11-12 00:00:00`, so orders *on* Nov 12 are not in the window (a startup warning says so). To include a whole day use `2026-11-12T23:59:59`. To backfill whole days use `START=<first day>` (or `T00:00:00`) and `END=<last day>T23:59:59`.
+- While the container stays in backfill mode every 10-minute tick repeats the same window; set `BACKFILL_MODE=false` again when the backfill is done.
 
 No secrets or real credentials are ever meant to live in source control — see `.env.local`/`.env` locally, and the deployment's own secret store in production.
 
@@ -227,9 +239,9 @@ Every table is processed per brand database. The date column is explicit configu
 | `shopify_orders` | `created_date` | `YYYY-MM-DD`, brand timezone | no PK in code; see the warning below |
 | `raw_mongo_events` | `created_at_ist` | IST wall-clock datetime | PK `event_id`; **needs an index leading with `created_at_ist` (`migrations/009`) - skipped until it exists**; the archive is the only backup of these events |
 | `product_sessions_snapshot` | `date` | date | no DDL/writer in repo -> **schema not confirmed**: skipped until confirmed |
-| `mv_product_sessions_by_path_daily`, `mv_product_sessions_by_type_daily` | none | - | not referenced in the repo (may be views): `SKIPPED_AMBIGUOUS` until their schema is verified |
+| `mv_product_sessions_by_path_daily`, `mv_product_sessions_by_type_daily` | `date` | date | derived daily aggregates; not defined anywhere in this repo - the `date` column was confirmed on the live tables. If one is really a view, or has no index leading with `date`, the live checks skip it (`SKIPPED_VIEW` / `SKIPPED_NO_INDEX`). They can hold more than 6 months of history, so check that no dashboard or refresh job depends on the older rows before allowing deletion |
 
-"Not confirmed" tables are validated and described in the dry run only; archive/delete stay skipped until their live schema (`SHOW CREATE TABLE`) is confirmed and `schema_confirmed` is flipped in `PURGE_TABLES`. Tables with a real, NOT NULL primary key are exported by keyset paging; tables without a unique key (e.g. `shopify_orders`) are exported one calendar-day window at a time (never pretending to be keyset).
+A table with **no** configured date column is never touched (`SKIPPED_AMBIGUOUS`). "Not confirmed" tables are validated and described in the dry run only; archive/delete stay skipped until their live schema (`SHOW CREATE TABLE`) is confirmed and `schema_confirmed` is flipped in `PURGE_TABLES`. Tables with a real, NOT NULL primary key are exported by keyset paging; tables without a unique key (e.g. `shopify_orders`) are exported one calendar-day window at a time (never pretending to be keyset).
 
 ### S3 archive structure
 

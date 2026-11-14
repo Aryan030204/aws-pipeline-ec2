@@ -462,8 +462,15 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None) -> Dict
                 end_date = convert_to_desired_format(datetime.now(tz), tz)
                 logger.info(f"Fetching orders after: {last_ts} (API start: {next_ts})")
 
+            # A backfill replaces its whole window, so it must never be fed a partial fetch: strict mode
+            # raises (and this brand's run fails, nothing deleted) instead of returning what it managed to get.
             orders_list = fetch_orders(
-                api_base_url, access_token, start_date, end_date, process["date_field"]
+                api_base_url,
+                access_token,
+                start_date,
+                end_date,
+                process["date_field"],
+                strict=aws_background.is_backfill_active_for(brand_index),
             )
 
             if not orders_list:

@@ -14,7 +14,7 @@ import re
 import time
 import traceback
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
@@ -22,7 +22,7 @@ import aiohttp
 import numpy as np
 import pandas as pd
 import requests
-from sqlalchemy import Column, DateTime, Float, Integer, MetaData, String, Table, Text, text
+from sqlalchemy import Column, DateTime, Float, Integer, MetaData, String, Table, Text, bindparam, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from pipeline.state import (
@@ -33,7 +33,7 @@ from pipeline.state import (
     sqlalchemy_engines,
 )
 from pipeline.db import get_db_cursor, executemany_chunked, timed
-from pipeline.payment_mode import classify_payment_mode
+from pipeline.payment_mode import brand_uses_unmapped_bucket, classify_payment_mode
 from pipeline.landing_path import pick_landing_path
 from pipeline.shopifyql_sessions import _format_shopifyql_table, _make_shopifyql_session
 
@@ -50,13 +50,22 @@ from pipeline.shopifyql_sessions import _format_shopifyql_table, _make_shopifyql
 import aws_background
 
 
+class OrderFetchIncomplete(RuntimeError):
+    """A strict Shopify order fetch ended before the last page (HTTP error or exception). Raised only when the
+    caller asked for strict=True (backfill windows), so a partial result is never mistaken for a complete one."""
+
+
 async def fetch_orders_async(
     api_base_url: str,
     access_token: str,
     start_date: str,
     end_date: str,
     date_filter_field: str,
+    strict: bool = False,
 ) -> List[Dict]:
+    """strict=False (the normal incremental tick): any failure ends the fetch and the orders collected so far are
+    returned (long-standing behaviour). strict=True (backfill windows): any failure raises OrderFetchIncomplete, because
+    a backfill replaces the whole window and must not replace it with a partial list."""
     headers = {"X-Shopify-Access-Token": access_token}
     order_list: List[Dict] = []
 
@@ -101,6 +110,10 @@ async def fetch_orders_async(
 
                     if response.status != 200:
                         logger.error(f"Failed to fetch data: {response.status}")
+                        if strict:
+                            raise OrderFetchIncomplete(
+                                f"Shopify returned HTTP {response.status} after {len(order_list)} order(s)"
+                            )
                         break
 
                     data = await response.json()
@@ -120,8 +133,14 @@ async def fetch_orders_async(
                                 break
 
                     await asyncio.sleep(0.5)
+            except OrderFetchIncomplete:
+                raise
             except Exception as e:
                 logger.error(f"Error fetching orders: {e}")
+                if strict:
+                    raise OrderFetchIncomplete(
+                        f"order fetch failed after {len(order_list)} order(s): {e}"
+                    ) from e
                 break
 
     return order_list
@@ -133,6 +152,7 @@ def fetch_orders(
     start_date: str,
     end_date: str,
     date_filter_field: str,
+    strict: bool = False,
 ) -> List[Dict]:
     with timed(f"Shopify fetch ({date_filter_field} window)"):
         loop = asyncio.new_event_loop()
@@ -140,7 +160,7 @@ def fetch_orders(
         try:
             return loop.run_until_complete(
                 fetch_orders_async(
-                    api_base_url, access_token, start_date, end_date, date_filter_field
+                    api_base_url, access_token, start_date, end_date, date_filter_field, strict=strict
                 )
             )
         finally:
@@ -763,10 +783,11 @@ def upsert_returns_fact_from_orders(
 # ---------------------------
 # Discount dashboard fact helpers
 # ---------------------------
-def _classify_payment_mode(payment_gateway_names: Optional[str]) -> str:
-    # prepaid / cod / partially_paid / unmapped (no gateway name); the same
-    # rule the summary SQL uses, defined once in pipeline/payment_mode.py.
-    return classify_payment_mode(payment_gateway_names)
+def _classify_payment_mode(payment_gateway_names: Optional[str], unmapped_bucket: bool = False) -> str:
+    # prepaid / cod / partially_paid (+ unmapped for the brands on that rule); the same
+    # rule the summary SQL uses, defined once in pipeline/payment_mode.py. Default = legacy
+    # rule (a blank gateway name means COD).
+    return classify_payment_mode(payment_gateway_names, unmapped_bucket)
 
 
 def _normalize_city_name(raw_city: Optional[str]) -> str:
@@ -808,6 +829,7 @@ def _parse_iso_to_store_date_hour(
 def _normalize_discount_code_rows_from_orders(
     orders_list: List[Dict],
     tz: ZoneInfo,
+    unmapped_bucket: bool = False,
 ) -> List[Tuple[Any, ...]]:
     rows: List[Tuple[Any, ...]] = []
     seen: Set[Tuple[str, str]] = set()
@@ -828,7 +850,7 @@ def _normalize_discount_code_rows_from_orders(
         payment_gateway_names = (
             ", ".join(order.get("payment_gateway_names") or []) or None
         )
-        payment_mode = _classify_payment_mode(payment_gateway_names)
+        payment_mode = _classify_payment_mode(payment_gateway_names, unmapped_bucket)
 
         try:
             total_price = float(order.get("total_price") or 0)
@@ -873,7 +895,9 @@ def _normalize_discount_code_rows_from_orders(
 def upsert_dashboard_order_discount_fact_from_orders(
     orders_list: List[Dict], cursor, connection, brand_name: str, tz: ZoneInfo
 ) -> Set[str]:
-    rows = _normalize_discount_code_rows_from_orders(orders_list, tz)
+    rows = _normalize_discount_code_rows_from_orders(
+        orders_list, tz, unmapped_bucket=brand_uses_unmapped_bucket(brand_name)
+    )
     if not rows:
         logger.info(f"✔️ [{brand_name}] No discount-code orders to upsert")
         return set()
@@ -909,6 +933,7 @@ def upsert_dashboard_order_discount_fact_from_orders(
 def backfill_dashboard_order_discount_fact_from_shopify_orders(
     cursor, connection, brand_name: str, batch_size: int = 5000
 ) -> Set[str]:
+    unmapped_bucket = brand_uses_unmapped_bucket(brand_name)
     where_clauses = ["discount_codes IS NOT NULL", "discount_codes != ''"]
     params: List[Any] = []
 
@@ -976,7 +1001,7 @@ def backfill_dashboard_order_discount_fact_from_shopify_orders(
                 continue
 
             payment_gateway_names = row.get("payment_gateway_names")
-            payment_mode = _classify_payment_mode(payment_gateway_names)
+            payment_mode = _classify_payment_mode(payment_gateway_names, unmapped_bucket)
 
             try:
                 total_price = float(row.get("total_price") or 0)
@@ -1573,6 +1598,46 @@ def get_affected_dates_updates(
     return dates
 
 
+class BackfillReplaceWindow(NamedTuple):
+    """The EXACT range a backfill re-fetches from Shopify, as store wall-clock datetimes (inclusive both ends),
+    and the column that range is matched against."""
+
+    column: str
+    start: datetime
+    end: datetime
+
+
+def backfill_replace_window(brand_index: int, table_name: str) -> Optional[BackfillReplaceWindow]:
+    """The range to replace for this table while a backfill is active, else None.
+
+    The fetch (pipeline/orchestration.py) asks Shopify for orders whose created_at (shopify_orders) / updated_at
+    (shopify_orders_update) lies between BACKFILL_START_IST and BACKFILL_END_IST, TIME OF DAY INCLUDED. The delete
+    must remove exactly those rows and no others: deleting whole calendar dates (the old behaviour) wiped the rest
+    of the first/last date, which the fetch never brought back.
+    created_at / updated_at hold the store wall-clock time, the same assumption the incremental watermark makes."""
+    if not (
+        aws_background.is_backfill_active_for(brand_index)
+        and aws_background.BACKFILL_START_IST
+        and aws_background.BACKFILL_END_IST
+        and table_name in ("shopify_orders", "shopify_orders_update")
+    ):
+        return None
+    start_dt, end_dt = aws_background.get_backfill_window_for_brand(brand_index)
+    if not start_dt or not end_dt:
+        return None
+    column = "created_at" if table_name == "shopify_orders" else "updated_at"
+    return BackfillReplaceWindow(column, start_dt.replace(tzinfo=None), end_dt.replace(tzinfo=None))
+
+
+def delete_backfill_window(conn, table_name: str, window: BackfillReplaceWindow) -> int:
+    """DELETE the rows inside the re-fetched range, on an open connection/transaction. Returns the rows removed."""
+    statement = text(
+        f"DELETE FROM {table_name} WHERE {window.column} >= :window_start AND {window.column} <= :window_end"
+    ).bindparams(bindparam("window_start", type_=DateTime), bindparam("window_end", type_=DateTime))
+    result = conn.execute(statement, {"window_start": window.start, "window_end": window.end})
+    return int(result.rowcount or 0)
+
+
 def load_data_to_sql_optimized(
     df: pd.DataFrame,
     brand_index: int,
@@ -1667,56 +1732,26 @@ def load_data_to_sql_optimized(
         logger.error(f"❌ Error creating table '{table_name}': {e}")
         return
 
-    def _replace_backfill_window_if_needed() -> None:
-        if not (
-            aws_background.is_backfill_active_for(brand_index)
-            and aws_background.BACKFILL_START_IST
-            and aws_background.BACKFILL_END_IST
-            and table_name in ("shopify_orders", "shopify_orders_update")
-        ):
-            return
+    window = backfill_replace_window(brand_index, table_name)
 
-        window_start_dt, window_end_dt = aws_background.get_backfill_window_for_brand(brand_index)
-        if not window_start_dt or not window_end_dt:
-            return
-        window_start = window_start_dt.date().isoformat()
-        window_end = window_end_dt.date().isoformat()
-        date_column = "created_date" if table_name == "shopify_orders" else "updated_date"
-
-        with engine.begin() as conn:
-            conn.execute(
-                text(
-                    f"""
-                    DELETE FROM {table_name}
-                    WHERE {date_column} >= :window_start
-                      AND {date_column} <= :window_end
-                    """
-                ),
-                {"window_start": window_start, "window_end": window_end},
-            )
-
-        logger.info(
-            f"🔁 [{brand_name}] Backfill replace-mode cleared {table_name} "
-            f"for {date_column} window {window_start}..{window_end}"
-        )
-
-    try:
-        _replace_backfill_window_if_needed()
-    except Exception as e:
-        logger.error(
-            f"❌ Error clearing backfill window in '{table_name}' for {brand_name}: {e}"
-        )
-        traceback.print_exc()
-        return
-
+    # Nothing to insert = nothing is deleted either: a window is only ever replaced by rows that are in hand.
     if df.empty:
-        logger.info(f"DataFrame empty for {table_name}; nothing to load.")
+        logger.info(f"DataFrame empty for {table_name}; nothing to load (no rows deleted).")
         return
 
     try:
         optimal_batch = max(500, min(batch_size, 2000))
         with timed(f"Insert {len(df)} rows into {table_name} (batch={optimal_batch})"):
+            # ONE transaction: the window delete and the insert commit together or not at all, so a failed
+            # insert can never leave the window emptied.
             with engine.begin() as conn:
+                if window is not None:
+                    deleted = delete_backfill_window(conn, table_name, window)
+                    logger.info(
+                        f"🔁 [{brand_name}] Backfill replace-mode removed {deleted} row(s) from {table_name} "
+                        f"where {window.column} is between {window.start} and {window.end} "
+                        "(exactly the range that was re-fetched)"
+                    )
                 df.to_sql(
                     name=table_name,
                     con=conn,  # ✅ use the held connection (NOT the engine)
@@ -1730,3 +1765,6 @@ def load_data_to_sql_optimized(
     except Exception as e:
         logger.error(f"❌ Error loading data to '{table_name}': {e}")
         traceback.print_exc()
+        if window is not None:
+            # The transaction rolled back (the window is untouched). A backfill must not carry on as if it loaded.
+            raise
