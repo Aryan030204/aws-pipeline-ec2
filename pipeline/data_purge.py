@@ -41,6 +41,8 @@ from enum import Enum
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
+from pipeline.session_utils import autocommit_session
+
 logger = logging.getLogger("data_purge")
 
 RETENTION_MONTHS = 6
@@ -101,6 +103,7 @@ class PurgeConfig:
     export_batch_size: int
     sleep_between_batches_s: float
     max_window_rows: int
+    export_sleep_s: float  # pause between export pages / day windows (throttles read I/O); 0 = none
     sse: Optional[str]
     kms_key_id: Optional[str]
 
@@ -226,6 +229,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> PurgeConfig:
         export_batch_size=_parse_int(env, "DATA_PURGE_EXPORT_BATCH_SIZE", 2000, 1, 100_000),
         sleep_between_batches_s=_parse_float(env, "DATA_PURGE_SLEEP_BETWEEN_BATCHES_S", 1.0, 0.0, 60.0),
         max_window_rows=_parse_int(env, "DATA_PURGE_MAX_WINDOW_ROWS", 200_000, 1000, 5_000_000),
+        export_sleep_s=_parse_float(env, "DATA_PURGE_EXPORT_SLEEP_S", 0.1, 0.0, 60.0),
         sse=sse,
         kms_key_id=kms_key_id,
     )
@@ -726,7 +730,8 @@ class _GeneratorReader:
         return True
 
 
-def _iter_keyset_rows(cursor, spec, v: TableValidation, cutoff_value, batch) -> Iterator[Tuple[Any, ...]]:
+def _iter_keyset_rows(cursor, spec, v: TableValidation, cutoff_value, batch,
+                      sleep_s: float = 0.0) -> Iterator[Tuple[Any, ...]]:
     order = [spec.date_column] + [k for k in v.primary_key if k != spec.date_column]
     last = None
     while True:
@@ -741,6 +746,8 @@ def _iter_keyset_rows(cursor, spec, v: TableValidation, cutoff_value, batch) -> 
         last = tuple(last_values[v.columns.index(c)] for c in order)
         if len(rows) < batch:
             return
+        if sleep_s > 0:
+            time.sleep(sleep_s)
 
 
 def _iter_window_rows(cursor, spec, v: TableValidation, tz, cutoff: date, cutoff_value, cfg) -> Iterator[Tuple[Any, ...]]:
@@ -774,12 +781,14 @@ def _iter_window_rows(cursor, spec, v: TableValidation, tz, cutoff: date, cutoff
                     break
                 for row in rows:
                     yield _row_values(row, v.columns)
+            if cfg.export_sleep_s > 0:
+                time.sleep(cfg.export_sleep_s)  # only after a window that actually read rows
         day += timedelta(days=1)
 
 
 def iter_export_rows(cursor, spec, v, tz, cutoff, cutoff_value, cfg) -> Iterator[Tuple[Any, ...]]:
     if v.strategy == "keyset":
-        return _iter_keyset_rows(cursor, spec, v, cutoff_value, cfg.export_batch_size)
+        return _iter_keyset_rows(cursor, spec, v, cutoff_value, cfg.export_batch_size, cfg.export_sleep_s)
     return _iter_window_rows(cursor, spec, v, tz, cutoff, cutoff_value, cfg)
 
 
@@ -917,8 +926,9 @@ def build_manifest(run: "RunContext", brand: "BrandContext", spec: TableSpec, v:
 
 
 def validate_manifest(manifest: Mapping[str, Any], run: "RunContext", brand: "BrandContext", spec: TableSpec,
-                      v: TableValidation, csv_key: str) -> None:
-    """Raises ArchiveInvalid unless the manifest describes exactly this operation."""
+                      v: Optional[TableValidation], csv_key: str) -> None:
+    """Raises ArchiveInvalid unless the manifest describes exactly this operation. ``v=None`` (the S3-only
+    fast path, which never touches the database) skips the live-column comparison."""
     expected = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "table": spec.table,
@@ -937,7 +947,7 @@ def validate_manifest(manifest: Mapping[str, Any], run: "RunContext", brand: "Br
         raise ArchiveInvalid("manifest row_count/csv_bytes are not positive integers")
     if not isinstance(digest, str) or len(digest) != 64:
         raise ArchiveInvalid("manifest sha256 is missing or malformed")
-    if list(manifest.get("columns") or []) != list(v.columns):
+    if v is not None and list(manifest.get("columns") or []) != list(v.columns):
         raise ArchiveInvalid("the table's columns changed since the archive was written (new data would be lost)")
 
 
@@ -1045,7 +1055,13 @@ def _process_table(run: RunContext, brand: BrandContext, spec: TableSpec, result
     if spec.table not in cfg.tables:
         result.status, result.reason = Status.SKIPPED, "not in DATA_PURGE_TABLES"
         return
-    with brand.cursor_ctx() as (cursor, connection):
+    if _archive_already_complete(run, brand, spec, result):
+        return
+    with brand.cursor_ctx() as (cursor, connection), autocommit_session(cursor):
+        # autocommit: nothing here needs a multi-statement transaction (deletes are per-batch and idempotent,
+        # the lock is session-scoped). Without it every read below (validation, COUNT, the whole export) kept
+        # ONE InnoDB read view open for the entire run: undo history growth and purge lag on a busy server.
+        # It also lets the post-export recount see current data instead of the export's own snapshot.
         db = _scalar(cursor, "SELECT DATABASE() AS db")
         lock = _lock_name(db, spec.table)
         if _scalar(cursor, "SELECT GET_LOCK(%s, 0) AS got", (lock,)) != 1:
@@ -1059,6 +1075,35 @@ def _process_table(run: RunContext, brand: BrandContext, spec: TableSpec, result
                 cursor.fetchall()
             except Exception:
                 pass
+
+
+def _archive_already_complete(run: RunContext, brand: BrandContext, spec: TableSpec, result: TableResult) -> bool:
+    """S3-only fast path: when this run cannot delete the table anyway and a valid manifest + CSV already exist,
+    there is nothing to do, so no DB connection is opened. Without this every container start (a deploy, or
+    PURGE_TEST) re-validated every table and re-counted millions of rows just to rediscover "already archived".
+    Returns True when the table was fully handled here."""
+    cfg = run.cfg
+    if cfg.mode not in (Mode.ARCHIVE_ONLY, Mode.FULL) or run.store is None or not spec.schema_confirmed:
+        return False
+    if cfg.mode is Mode.FULL and not cfg.purge_test and spec.table in cfg.delete_tables:
+        return False  # may need to delete: the DB path must run (eligible rows, conflicts, caps)
+    csv_key, manifest_key, _complete_key = archive_keys(cfg, run.month, brand.name, spec.table)
+    manifest = run.store.get_json(manifest_key)
+    if manifest is None:
+        return False
+    validate_manifest(manifest, run, brand, spec, None, csv_key)
+    _verify_csv_object(run.store, csv_key, manifest["csv_bytes"], manifest["sha256"])
+    result.s3_key = csv_key
+    result.archived = True
+    result.exported = manifest["row_count"]
+    result.csv_bytes = manifest["csv_bytes"]
+    result.eligible_kind = "not queried"
+    result.status = Status.ARCHIVED_ONLY
+    result.reason = "archive already in S3 (manifest and CSV verified); database not touched" + (
+        " - PURGE_TEST=true, nothing deleted" if cfg.purge_test else " - table is not deletable in this run"
+    )
+    logger.info("archive_reused_fast brand=%s table=%s rows=%s", brand.name, spec.table, manifest["row_count"])
+    return True
 
 
 def _describe_ambiguous(brand: BrandContext, spec: TableSpec, result: TableResult) -> None:
@@ -1406,7 +1451,7 @@ def format_summary(results: Sequence[TableResult], run: RunContext, duration_s: 
             suffix = "" if r.eligible_kind == "exact" else f" ({r.eligible_kind})"
             lines.append(f"  eligible: {r.eligible:,}{suffix}")
         else:
-            lines.append(f"  eligible: n/a ({r.eligible_kind})")
+            lines.append("  eligible: n/a" if r.eligible_kind == "exact" else f"  eligible: n/a ({r.eligible_kind})")
         if r.status != Status.DRY_RUN:
             lines.append(f"  exported: {r.exported:,}")
             lines.append(f"  archived: {'YES' if r.archived else 'NO'}")

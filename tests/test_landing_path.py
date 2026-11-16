@@ -193,7 +193,7 @@ class SchemaTests(unittest.TestCase):
             ensure_overall_summary_payment_sales_columns=mock.DEFAULT, ensure_utm_names_column=mock.DEFAULT,
             ensure_payment_unmapped_columns=mock.DEFAULT, ensure_payment_mode_unmapped_enum=mock.DEFAULT,
         ) as mocks:
-            sm.run_brand_preflight_schema_migrations(7)
+            sm.run_brand_preflight_schema_migrations(7, force=True)
         called = [c.args for c in mocks["ensure_landing_page_columns"].call_args_list]
         self.assertEqual(called, [(7, "shopify_orders"), (7, "shopify_orders_update")])
 

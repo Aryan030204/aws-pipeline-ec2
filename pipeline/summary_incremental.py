@@ -13,7 +13,7 @@ from typing import Iterable, Optional
 from zoneinfo import ZoneInfo
 
 from pipeline.state import IST, logger, brand_id_from_config
-from pipeline.db import get_db_cursor, timed
+from pipeline.db import autocommit_session, get_db_cursor, timed
 from pipeline.schema_migrations import ensure_summary_tables
 from pipeline.payment_mode import (
     brand_uses_unmapped_bucket,
@@ -1730,12 +1730,14 @@ def execute_summary_queries_incremental(
         range_label = "0 dates"
 
     try:
-        with get_db_cursor(brand_index, dictionary=False) as (cursor, connection):
-            cursor.execute("SET SESSION autocommit=1")
+        # autocommit_session resets autocommit=0 on exit: the connection goes back to the pool, and a leaked
+        # autocommit=1 makes every later user of it pay a redo fsync per statement.
+        with get_db_cursor(brand_index, dictionary=False) as (cursor, connection), \
+                autocommit_session(cursor):
             logger.info(f"📊 Updating summaries for {brand_name}: {range_label}")
 
-            # Ensure all tables exist
-            ensure_summary_tables(cursor, connection)
+            # Ensure all tables exist (once per brand per process)
+            ensure_summary_tables(cursor, connection, brand_index=brand_index)
 
             # Update each summary incrementally
             if dates_set:
@@ -1813,7 +1815,7 @@ def execute_discount_dashboard_backfill_only(brand_index: int, brand_name: str):
     logger.info(f"🔁 Starting DISCOUNT-ONLY dashboard backfill for {brand_name}")
     try:
         with get_db_cursor(brand_index, dictionary=True) as (cursor, connection):
-            ensure_summary_tables(cursor, connection)
+            ensure_summary_tables(cursor, connection, brand_index=brand_index)
             affected_dates = backfill_dashboard_order_discount_fact_from_shopify_orders(
                 cursor, connection, brand_name
             )

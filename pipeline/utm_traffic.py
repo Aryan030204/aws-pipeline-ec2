@@ -358,7 +358,7 @@ def refresh_product_traffic_split_for_window(
     max_date: str,
 ):
     with get_db_cursor(brand_index) as (cursor, connection):
-        ensure_summary_tables(cursor, connection)
+        ensure_summary_tables(cursor, connection, brand_index=brand_index)
         cursor.execute(
             """
             SELECT DISTINCT `date`

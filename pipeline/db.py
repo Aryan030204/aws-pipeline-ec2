@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import mysql.connector
 import requests
 
+from pipeline.session_utils import autocommit_session  # noqa: F401  (re-exported)
+
 from pipeline.state import (
     IST,
     logger,

@@ -482,7 +482,7 @@ def rebuild_daily_web_vitals_summary_for_window(
                 connection=inner_connection,
             )
 
-    ensure_summary_tables(cursor, connection)
+    ensure_summary_tables(cursor, connection, brand_index=brand_index)
     cursor.execute(
         "DELETE FROM daily_web_vitals_summary WHERE `date` BETWEEN %s AND %s",
         (start_date, end_date),
@@ -636,7 +636,7 @@ def sync_web_vitals_summary(
             )
 
     ensure_pipeline_metadata_table(cursor, connection)
-    ensure_summary_tables(cursor, connection)
+    ensure_summary_tables(cursor, connection, brand_index=brand_index)
 
     created_after = None
     if use_watermark and start_dt is None and end_dt is None:

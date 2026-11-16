@@ -161,6 +161,9 @@ class FakeCursor:
                 for name, non_unique, cols in sorted(t.indexes):
                     for seq, col in enumerate(cols, 1):
                         self._result.append({"index_name": name, "non_unique": non_unique, "seq_in_index": seq, "column_name": col})
+        elif s.startswith("SET SESSION autocommit="):
+            db.autocommit = s.rsplit("=", 1)[1]
+            db.events.append(("autocommit", db.autocommit))
         elif s == "SELECT DATABASE() AS db":
             self._result = [{"db": "brand_db"}]
         elif s == "SELECT DATABASE() AS db, CONNECTION_ID() AS id":
@@ -307,7 +310,7 @@ class FakeStore:
         return True
 
 
-ARCHIVE = {"DATA_PURGE_ENABLED": "true", "DATA_PURGE_S3_BUCKET": "bkt"}
+ARCHIVE = {"DATA_PURGE_ENABLED": "true", "DATA_PURGE_S3_BUCKET": "bkt", "DATA_PURGE_EXPORT_SLEEP_S": "0"}
 
 
 def full_env(tables="raw_mongo_events,shopify_orders", **extra):
@@ -1287,6 +1290,117 @@ class RunIsolationAndSummaryTests(unittest.TestCase):
         with self.assertLogs("data_purge", level="DEBUG") as logs:
             run_table(db, FakeStore(events), full_env())
         self.assertNotIn("SECRET-PAYLOAD-XYZ", "\n".join(logs.output))
+
+
+class LightweightRunTests(unittest.TestCase):
+    """The purge must not hammer the database when it has nothing to do (EBS burst balance) and must not hold
+    long snapshots: S3-first fast path, autocommit session, throttled export."""
+
+    def setUp(self):
+        self.events = []
+        self.db = FakeDatabase([events_table(event_rows(n_old=40, n_new=5))], self.events)
+        self.store = FakeStore(self.events)
+
+    def _autocommit_sets(self):
+        return [sql for sql, _p in self.db.executed if sql.startswith("SET SESSION autocommit")]
+
+    def test_the_db_work_runs_in_an_autocommit_session_that_is_reset_afterwards(self):
+        run_table(self.db, self.store, ARCHIVE)
+        self.assertEqual(self._autocommit_sets(), ["SET SESSION autocommit=1", "SET SESSION autocommit=0"])
+        self.assertEqual(self.db.executed[0][0], "SET SESSION autocommit=1")  # before the first read
+        self.assertEqual(self.db.executed[-1][0], "SET SESSION autocommit=0")  # last thing before the pool gets it back
+
+    def test_autocommit_is_reset_even_when_the_table_fails(self):
+        self.store.fail_upload = True
+        result, _ = run_table(self.db, self.store, ARCHIVE)
+        self.assertEqual(result.status, dp.Status.FAILED)
+        self.assertEqual(self._autocommit_sets(), ["SET SESSION autocommit=1", "SET SESSION autocommit=0"])
+
+    def test_an_existing_valid_archive_is_recognised_from_s3_without_touching_the_database(self):
+        run_table(self.db, self.store, ARCHIVE)
+        db_calls, uploads = len(self.db.executed), len(self.store.upload_calls)
+        for env in (ARCHIVE, dict(ARCHIVE, PURGE_TEST="true"), full_env(PURGE_TEST="true"),
+                    full_env(tables="shopify_orders")):  # table not on the delete allowlist
+            with self.subTest(env=sorted(env)):
+                result, _ = run_table(self.db, self.store, env)
+                self.assertEqual(result.status, dp.Status.ARCHIVED_ONLY, result.reason)
+                self.assertIn("database not touched", result.reason)
+                self.assertTrue(result.archived)
+                self.assertEqual((result.exported, result.deleted), (40, 0))
+                self.assertEqual(len(self.db.executed), db_calls)  # no statement at all, not even SET SESSION
+                self.assertEqual(len(self.store.upload_calls), uploads)
+
+    def test_a_deletable_table_still_takes_the_database_path(self):
+        run_table(self.db, self.store, ARCHIVE)
+        db_calls = len(self.db.executed)
+        result, _ = run_table(self.db, self.store, full_env())
+        self.assertEqual(result.status, dp.Status.SUCCESS, result.reason)
+        self.assertGreater(len(self.db.executed), db_calls)
+        self.assertEqual(self.db.tables["raw_mongo_events"].rows and len(self.db.tables["raw_mongo_events"].rows), 5)
+
+    def test_a_missing_manifest_takes_the_normal_path(self):
+        result, _ = run_table(self.db, self.store, ARCHIVE)
+        self.assertEqual(result.status, dp.Status.ARCHIVED_ONLY)
+        self.assertNotIn("database not touched", result.reason)
+        self.assertEqual(len(self.store.upload_calls), 1)
+
+    def test_a_broken_manifest_is_still_a_failure_on_the_fast_path(self):
+        run_table(self.db, self.store, ARCHIVE)
+        _csv, manifest_key, _ = dp.archive_keys(dp.load_config(ARCHIVE), "2026-10", "pts", "raw_mongo_events")
+        self.store.jsons[manifest_key]["cutoff"] = "2026-05-01"
+        result, _ = run_table(self.db, self.store, ARCHIVE)
+        self.assertEqual(result.status, dp.Status.FAILED)
+        self.assertEqual(self.db.deletes, [])
+
+    def test_a_truncated_csv_is_a_failure_on_the_fast_path(self):
+        run_table(self.db, self.store, ARCHIVE)
+        csv_key, _m, _ = dp.archive_keys(dp.load_config(ARCHIVE), "2026-10", "pts", "raw_mongo_events")
+        self.store.objects[csv_key] = self.store.objects[csv_key][:-10]
+        result, _ = run_table(self.db, self.store, ARCHIVE)
+        self.assertEqual(result.status, dp.Status.FAILED)
+
+    def test_dry_run_never_uses_the_fast_path(self):
+        run_table(self.db, self.store, ARCHIVE)
+        db_calls = len(self.db.executed)
+        result, _ = run_table(self.db, self.store, dict(ARCHIVE, DATA_PURGE_DRY_RUN="true"))
+        self.assertEqual(result.status, dp.Status.DRY_RUN)
+        self.assertGreater(len(self.db.executed), db_calls)
+
+    def test_export_sleep_default_and_validation(self):
+        self.assertEqual(dp.load_config({}).export_sleep_s, 0.1)
+        self.assertEqual(dp.load_config({"DATA_PURGE_EXPORT_SLEEP_S": "0"}).export_sleep_s, 0.0)
+        for bad in ("-1", "abc", "61"):
+            with self.subTest(value=bad), self.assertRaises(dp.ConfigError):
+                dp.load_config({"DATA_PURGE_EXPORT_SLEEP_S": bad})
+
+    def test_export_pauses_between_pages_but_not_after_the_last_one(self):
+        rows = event_rows(n_old=2500, n_new=3)  # 2 keyset pages at the default batch size of 2000
+        db = FakeDatabase([events_table(rows)], [])
+        with mock.patch.object(dp.time, "sleep") as sleep:
+            result, _ = run_table(db, self.store, dict(ARCHIVE, DATA_PURGE_EXPORT_SLEEP_S="0.25"))
+        self.assertEqual(result.status, dp.Status.ARCHIVED_ONLY, result.reason)
+        self.assertEqual(sleep.call_args_list, [mock.call(0.25)])
+
+    def test_export_sleep_zero_never_sleeps(self):
+        db = FakeDatabase([events_table(event_rows(n_old=2500, n_new=3))], [])
+        with mock.patch.object(dp.time, "sleep") as sleep:
+            run_table(db, self.store, ARCHIVE)
+        sleep.assert_not_called()
+
+    def test_window_export_pauses_after_each_day_that_had_rows(self):
+        db = FakeDatabase([orders_table(order_rows(n_old=30, n_new=3))], [])
+        with mock.patch.object(dp.time, "sleep") as sleep:
+            result, _ = run_table(db, self.store, dict(ARCHIVE, DATA_PURGE_EXPORT_SLEEP_S="0.2"), table="shopify_orders")
+        self.assertEqual(result.status, dp.Status.ARCHIVED_ONLY, result.reason)
+        self.assertGreaterEqual(sleep.call_count, 1)
+        self.assertTrue(all(c == mock.call(0.2) for c in sleep.call_args_list))
+
+    def test_summary_does_not_print_a_bogus_exact_label_for_tables_that_were_not_counted(self):
+        run = make_run(ARCHIVE, self.store)
+        result = dp.TableResult(brand="pts", table="shopify_orders", status=dp.Status.SKIPPED, reason="x")
+        text = dp.format_summary([result], run, 1.0)
+        self.assertIn("eligible: n/a", text)
+        self.assertNotIn("n/a (exact)", text)
 
 
 class S3StoreTests(unittest.TestCase):

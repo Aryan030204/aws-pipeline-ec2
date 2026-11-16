@@ -420,7 +420,7 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None) -> Dict
     ]
 
     with get_db_cursor(brand_index) as (cursor, connection):
-        ensure_summary_tables(cursor, connection)
+        ensure_summary_tables(cursor, connection, brand_index=brand_index)
 
         for process in process_types:
             logger.info(

@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import re
+import threading
 import time
 import traceback
 from datetime import date, datetime, timedelta
@@ -536,7 +537,26 @@ RETURN_EVENT_CANCEL_RTO = "CANCEL (RTO)"
 RETURN_EVENT_REFUND = "REFUND"
 
 
-def _ensure_returns_fact(cursor, connection):
+_RETURNS_FACT_READY = set()
+_RETURNS_FACT_LOCK = threading.Lock()
+
+
+def _ensure_returns_fact(cursor, connection, brand_index=None):
+    """CREATE/migrate returns_fact. With a brand_index it runs once per brand per process (success only): the
+    table never changes at runtime, and this used to cost a CREATE IF NOT EXISTS + 2 SHOW COLUMNS +
+    information_schema lookup on every pipeline run."""
+    if brand_index is not None:
+        with _RETURNS_FACT_LOCK:
+            if brand_index in _RETURNS_FACT_READY:
+                return
+        if _ensure_returns_fact_impl(cursor, connection):
+            with _RETURNS_FACT_LOCK:
+                _RETURNS_FACT_READY.add(brand_index)
+        return
+    _ensure_returns_fact_impl(cursor, connection)
+
+
+def _ensure_returns_fact_impl(cursor, connection) -> bool:
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS returns_fact (
           order_id     BIGINT        NOT NULL,
@@ -582,7 +602,10 @@ def _ensure_returns_fact(cursor, connection):
             """)
     except Exception as e:
         logger.warning(f"⚠️ returns_fact event_type migration check failed: {e}")
+        connection.commit()
+        return False
     connection.commit()
+    return True
 
 
 def _parse_iso_to_store_date(iso_ts: Optional[str], tz: ZoneInfo) -> Optional[str]:
@@ -613,7 +636,7 @@ def upsert_returns_fact_from_orders(
             )
 
     try:
-        _ensure_returns_fact(cursor, connection)
+        _ensure_returns_fact(cursor, connection, brand_index=brand_index)
         tz = aws_background.get_brand_timezone(brand_index)
 
         agg: Dict[Tuple[str, str, str], Tuple[float, Optional[str]]] = {}

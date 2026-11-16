@@ -6,12 +6,40 @@ SHOW COLUMNS and ALTERs in only what's missing via _ensure_columns).
 """
 
 import os
+import threading
 from typing import Optional
 
 import mysql.connector
 from sqlalchemy import text
 
 from pipeline.state import logger, sqlalchemy_engines
+
+
+# ---------------------------------------------------------------------------
+# Run-once-per-process bookkeeping. The schema never changes while the process
+# runs, yet every 10-minute tick used to re-run ~24 SHOW COLUMNS (preflight) and
+# ~21 CREATE TABLE IF NOT EXISTS + 5 SHOW COLUMNS + 3 failing ALTERs per brand
+# (ensure_summary_tables, called from several places). Each is now done once per
+# brand per process, and only remembered when it succeeded, so a failed attempt
+# is retried on the next tick. A restart/redeploy re-checks everything.
+# ---------------------------------------------------------------------------
+_schema_lock = threading.Lock()
+_preflight_done = set()
+_summary_tables_done = set()
+_ensure_failures = set()
+
+
+def _note_ensure_failure(brand_index) -> None:
+    with _schema_lock:
+        _ensure_failures.add(brand_index)
+
+
+def reset_schema_memo() -> None:
+    """Forget what was already verified (tests, or to force a re-check without a restart)."""
+    with _schema_lock:
+        _preflight_done.clear()
+        _summary_tables_done.clear()
+        _ensure_failures.clear()
 
 
 def _ensure_columns(brand_index: int, table_name: str, column_defs: dict) -> None:
@@ -52,10 +80,12 @@ def _ensure_columns(brand_index: int, table_name: str, column_defs: dict) -> Non
                     )
                 except Exception as e:
                     if "Duplicate column name" not in str(e):
+                        _note_ensure_failure(brand_index)
                         logger.warning(
                             f"⚠️ Failed to add column {table_name}.{col} for {brand_name}: {e}"
                         )
     except Exception as e:
+        _note_ensure_failure(brand_index)
         logger.warning(
             f"⚠️ Column-existence check failed for {table_name} ({brand_name}): {e}"
         )
@@ -275,7 +305,20 @@ def ensure_payment_mode_unmapped_enum(brand_index: int) -> None:
             )
 
 
-def run_brand_preflight_schema_migrations(brand_index: int) -> None:
+def run_brand_preflight_schema_migrations(brand_index: int, force: bool = False) -> None:
+    """Idempotent column checks for one brand. Runs once per brand per process (a restart re-checks); a pass that
+    hit a failed check/ALTER is not remembered, so it is retried on the next call. ``force=True`` always runs."""
+    with _schema_lock:
+        if not force and brand_index in _preflight_done:
+            return
+        _ensure_failures.discard(brand_index)
+    _run_brand_preflight_schema_migrations(brand_index)
+    with _schema_lock:
+        if brand_index not in _ensure_failures:
+            _preflight_done.add(brand_index)
+
+
+def _run_brand_preflight_schema_migrations(brand_index: int) -> None:
     brand_name = os.environ.get(f"BRAND_NAME_{brand_index}", f"Brand_{brand_index}")
     logger.info(f"🧱 Running preflight schema migrations for {brand_name}")
     ensure_user_agent_column(brand_index, "shopify_orders")
@@ -299,8 +342,42 @@ def run_brand_preflight_schema_migrations(brand_index: int) -> None:
     logger.info(f"✅ Preflight schema migrations complete for {brand_name}")
 
 
-def ensure_summary_tables(cursor, connection):
-    """Create all summary tables if they don't exist."""
+def ensure_summary_tables(cursor, connection, brand_index=None):
+    """Create all summary tables if they don't exist.
+
+    With a ``brand_index`` the work is done once per brand per process (only a fully successful pass is
+    remembered). Without one it always runs, as before."""
+    if brand_index is None:
+        _create_summary_tables(cursor, connection)
+        return
+    with _schema_lock:
+        if brand_index in _summary_tables_done:
+            return
+    _create_summary_tables(cursor, connection)
+    with _schema_lock:
+        _summary_tables_done.add(brand_index)
+
+
+def _ensure_overall_summary_columns(cursor):
+    """Add the overall_summary columns that older tables may lack, but only the missing ones.
+
+    Replaces three blind ``ALTER TABLE ... ADD COLUMN`` statements whose "duplicate column" errors were swallowed:
+    on an up-to-date table each one was a guaranteed failure that still took a metadata lock."""
+    wanted = {
+        "adjusted_total_sessions": "INT DEFAULT 0",
+        "ci_events": "INT DEFAULT 0",
+        "buy_now_events": "INT DEFAULT 0",
+    }
+    cursor.execute("SHOW COLUMNS FROM overall_summary")
+    existing = set()
+    for row in cursor.fetchall() or []:
+        existing.add(str(row.get("Field") if isinstance(row, dict) else row[0]).lower())
+    for column, definition in wanted.items():
+        if column not in existing:
+            cursor.execute(f"ALTER TABLE overall_summary ADD COLUMN {column} {definition}")
+
+
+def _create_summary_tables(cursor, connection):
     # Keep summary schema setup silent (no console timing log).
     if True:
         cursor.execute("""
@@ -714,31 +791,8 @@ def ensure_summary_tables(cursor, connection):
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
 
-        # Ensure adjusted_total_sessions exists even if table was created earlier
-        try:
-            cursor.execute("""
-                ALTER TABLE overall_summary
-                ADD COLUMN adjusted_total_sessions INT DEFAULT 0
-            """)
-        except mysql.connector.Error:
-            # Column may already exist; ignore error
-            pass
-
-        try:
-            cursor.execute("""
-                ALTER TABLE overall_summary
-                ADD COLUMN ci_events INT DEFAULT 0
-            """)
-        except mysql.connector.Error:
-            pass
-
-        try:
-            cursor.execute("""
-                ALTER TABLE overall_summary
-                ADD COLUMN buy_now_events INT DEFAULT 0
-            """)
-        except mysql.connector.Error:
-            pass
+        # Older overall_summary tables may lack these columns; add only what is missing.
+        _ensure_overall_summary_columns(cursor)
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS daily_ci_events_summary (

@@ -271,6 +271,7 @@ The CSV has a header and **every column** of the table (read from `information_s
 | `DATA_PURGE_BATCH_SIZE` | `1000` | rows per delete batch (**conservative, untuned** - tune from the per-batch logs) |
 | `DATA_PURGE_EXPORT_BATCH_SIZE` | `2000` | rows per export read |
 | `DATA_PURGE_SLEEP_BETWEEN_BATCHES_S` | `1.0` | pause after each delete batch (throttle for EBS/replicas) |
+| `DATA_PURGE_EXPORT_SLEEP_S` | `0.1` | pause between export pages / day windows (throttles the read I/O of the export; `0` = none) |
 | `DATA_PURGE_MAX_WINDOW_ROWS` | `200000` | per-day window cap for tables without a unique key (over -> the table fails, nothing deleted) |
 | `DATA_PURGE_S3_SSE`, `DATA_PURGE_S3_KMS_KEY_ID` | unset | optional explicit encryption |
 | `DATA_PURGE_WORKER_SELF_RUN` | `true` | `false` = run once and exit |
@@ -283,7 +284,9 @@ The CSV has a header and **every column** of the table (read from `information_s
 | true | false | true (default) | **ARCHIVE_ONLY**: archive + verify + manifest, never delete |
 | true | false | false | **FULL**: archive, verify, then delete - only tables in `DATA_PURGE_DELETE_TABLES` |
 
-`PURGE_TEST=true` is the safe way to test the export end to end (it also triggers one run right after each container restart/rebuild, so just redeploy to test): the CSV and manifest are written and verified, no `DELETE` is ever issued, and the summary says so. Archive keys are deterministic per month, so a second test run in the same month reuses the verified archive instead of exporting again - to re-test an export, remove that month's objects from S3 or run with a different `--as-of` month. Turning `PURGE_TEST` off later in the same month reuses the archive and (if mode and allowlist permit) deletes.
+**Database load.** The purge runs each table in an autocommit session (no long-lived InnoDB read snapshot while a multi-GB export streams, and the post-export recount sees current data), resets autocommit when it returns the connection to the pool, and throttles the export with `DATA_PURGE_EXPORT_SLEEP_S`. If EBS balance is a concern, leave `DATA_PURGE_ENABLED=false` between planned runs.
+
+`PURGE_TEST=true` is the safe way to test the export end to end (it also triggers one run right after each container restart/rebuild, so just redeploy to test): the CSV and manifest are written and verified, no `DELETE` is ever issued, and the summary says so. Archive keys are deterministic per month, so a second test run in the same month reuses the verified archive instead of exporting again (and, when the run cannot delete the table anyway, without opening a database connection at all: the manifest and CSV size are verified in S3 only, so a redeploy with `PURGE_TEST=true` costs almost no database I/O after the first pass) - to re-test an export, remove that month's objects from S3 or run with a different `--as-of` month. Turning `PURGE_TEST` off later in the same month reuses the archive and (if mode and allowlist permit) deletes.
 
 Booleans accept only `true`/`false`; anything else (or an invalid number, an unknown table, a missing bucket, `ARCHIVE_ONLY=false` without a delete allowlist) makes the worker **refuse to run**.
 
@@ -365,3 +368,9 @@ Covers brand-activation filtering, bundle rollup logic, UTM source mapping, and 
 | Payment mode breakdown | `backfill_payment_mode_breakdown_columns.py` — cod/prepaid/ppcod order counts and sales amounts only, on `hour_wise_sales` and `overall_summary` |
 
 Each script is run directly with Python and reads the same brand configuration as the main pipeline.
+
+## Once-per-process schema checks
+
+The ETL's idempotent schema work (the per-brand preflight column checks, `ensure_summary_tables`, the `returns_fact` check) used to re-run on every 10-minute tick: ~24 `SHOW COLUMNS`, ~21 `CREATE TABLE IF NOT EXISTS`, several more `SHOW COLUMNS` and three `ALTER TABLE overall_summary ADD COLUMN` statements that always failed on an up-to-date table, per brand per tick. They now run once per brand per process and are remembered only when they succeeded (a failed check is retried next tick). A restart/redeploy re-checks everything, so new migrations still apply on deploy. `overall_summary` columns are added only when `SHOW COLUMNS` says they are missing.
+
+`SET SESSION autocommit=1` in the incremental summary run is now scoped by `autocommit_session` and reset to `0` before the pooled connection is returned (it used to leak into every later user of the connection).

@@ -415,7 +415,7 @@ class SchemaMigrationTests(unittest.TestCase):
             ensure_overall_summary_payment_sales_columns=mock.DEFAULT, ensure_utm_names_column=mock.DEFAULT,
             ensure_payment_unmapped_columns=mock.DEFAULT, ensure_payment_mode_unmapped_enum=mock.DEFAULT,
         ) as mocks:
-            sm.run_brand_preflight_schema_migrations(7)
+            sm.run_brand_preflight_schema_migrations(7, force=True)
         mocks["ensure_payment_unmapped_columns"].assert_called_once_with(7)
         mocks["ensure_payment_mode_unmapped_enum"].assert_called_once_with(7)
 
