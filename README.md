@@ -74,9 +74,9 @@ Other important flags:
 
 | Variable | Purpose |
 |---|---|
-| `SELF_RUN` | `true` = auto-run on schedule (every 10 minutes, or per `BRANDS_CRON_MAP` below); `false` = manual trigger only |
+| `SELF_RUN` | `true` = auto-run on schedule (every 10 minutes, or per `BRANDS_CRON_MAP` below; with `BACKFILL_MODE=true` one run at startup instead, see below); `false` = manual trigger only (even in backfill mode) |
 | `BRANDS_CRON_MAP` | Optional per-brand cron override, JSON `{"<brand_index>": "<minute-list>"}`, e.g. `{"3":"15,45","4":"15,45","1":"0,30","2":"0,30"}` runs brands 3/4 at :15/:45 past the hour and 1/2 at :00/:30. Any active brand **not** a key here (including every brand, if this is unset/empty) keeps running on the legacy every-10-min schedule - opt-in per brand. Read once at startup; changing it needs a restart. |
-| `BACKFILL_MODE` | `true` = process a specific historical date window instead of "since last run" |
+| `BACKFILL_MODE` | `true` = process a specific historical date window instead of "since last run". **Runs once, immediately, whenever the container starts (restart/rebuild)** and then stays idle until restarted or triggered; no recurring ticks (needs `SELF_RUN=true`) |
 | `BACKFILL_BRAND_INDICES` | Restrict a backfill run to specific brands |
 | `ALERTS_WEBHOOK_URL` | Where QStash-forwarded sales/web-vitals alerts get delivered |
 | `UNMAPPED_PAYMENT_BRANDS` | Comma-separated brand names/tags that use the **unmapped** payment rule (default `editeveryday`): an order with no gateway name at all is reported in `unmapped_orders`/`unmapped_sales`, not as COD. **Every other brand keeps the original rule: a blank gateway name counts as COD** (so brands whose COD orders reach Shopify without a gateway name, such as BBB, still report COD). Names are compared ignoring case and punctuation; set it to an empty string to turn the unmapped rule off everywhere. Defined once in `pipeline/payment_mode.py`; applies to `order_summary`, `hour_wise_sales`, `overall_summary`, the city-wise tables and the discount dashboard's `payment_mode` |
@@ -94,7 +94,7 @@ With `BACKFILL_MODE=true` the pipeline replaces `shopify_orders` / `shopify_orde
 - The Shopify fetch is **strict** in backfill mode: an HTTP error or exception mid-pagination aborts the brand's run instead of replacing the window with a partial list. (Normal 10-minute ticks keep the old tolerant behaviour.)
 - Nothing is deleted if the fetch returns no orders.
 - **A date without a time means midnight.** `BACKFILL_END_IST=2026-11-12` means `2026-11-12 00:00:00`, so orders *on* Nov 12 are not in the window (a startup warning says so). To include a whole day use `2026-11-12T23:59:59`. To backfill whole days use `START=<first day>` (or `T00:00:00`) and `END=<last day>T23:59:59`.
-- While the container stays in backfill mode every 10-minute tick repeats the same window; set `BACKFILL_MODE=false` again when the backfill is done.
+- **Backfill mode is a single run.** The pipeline starts the backfill immediately every time the container starts (restart or rebuild), instead of waiting for the next `:00/:10/...` tick, and registers no recurring ticks (they would only repeat the same window and ingest nothing new). `BACKFILL_BRAND_INDICES` still selects the brands. With `SELF_RUN=false` nothing starts by itself (use `POST /trigger`). When the backfill has finished set `BACKFILL_MODE=false` and restart to resume the regular 10-minute schedule - until then no new orders are ingested, and **every restart re-runs the backfill**.
 
 No secrets or real credentials are ever meant to live in source control — see `.env.local`/`.env` locally, and the deployment's own secret store in production.
 

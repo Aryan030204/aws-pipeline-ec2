@@ -390,6 +390,7 @@ from pipeline.orchestration import (
     _parse_brands_cron_map,
     _group_brands_by_cron,
     _run_brand_group,
+    _execute_pipeline_run,
     manual_trigger,
     health_check,
 )
@@ -1240,6 +1241,72 @@ def initialize_brand_configs():
     log_db_connection_metrics("DB_CONNECTION_METRICS_STARTUP")
 
 
+BACKFILL_STARTUP_JOB_ID = "backfill_startup_run"
+
+
+def register_pipeline_schedule(sched, self_run: bool, backfill_mode: bool, brand_cron_groups: dict) -> str:
+    """Registers what the pipeline runs on its own, and returns which mode that is:
+
+      "manual"        SELF_RUN=false: nothing automatic (POST /trigger only), even when BACKFILL_MODE is on.
+      "backfill_once" BACKFILL_MODE=true: ONE run, immediately at startup (a container restart/rebuild starts the
+                      backfill right away instead of waiting for the next :00/:10/... tick), using the BACKFILL_*
+                      window, and NO recurring ticks. In backfill mode the ticks would only re-run the identical
+                      window every 10 minutes (and ingest nothing new, because the fetch is the window, not "since
+                      the last order"), so the backfill is a single run; set BACKFILL_MODE=false and restart to
+                      resume the regular schedule.
+      "regular"       the usual cron jobs: the per-brand BRANDS_CRON_MAP groups plus the 10-minute fallback job.
+    """
+    if not self_run:
+        return "manual"
+
+    if backfill_mode:
+        # A dedicated one-off job, same pattern as the /trigger endpoint. BACKFILL_BRAND_INDICES filtering happens
+        # inside _execute_pipeline_run, so every active brand is passed and the filter picks the backfill brands.
+        sched.add_job(
+            _execute_pipeline_run,
+            trigger=None,
+            next_run_time=datetime.now(IST),
+            args=[list(active_brand_indices)],
+            kwargs={"run_id": None},
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=3600,
+            replace_existing=True,
+            id=BACKFILL_STARTUP_JOB_ID,
+        )
+        return "backfill_once"
+
+    for cron_value, group_indices in brand_cron_groups.items():
+        sanitized = "".join(ch if ch.isalnum() else "_" for ch in cron_value)
+        sched.add_job(
+            _run_brand_group(group_indices),
+            "cron",
+            minute=cron_value,
+            second=0,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=120,
+            replace_existing=True,
+            id=f"pipeline_job_group_{sanitized}",
+        )
+
+    # Always registered, even when every active brand happens to be
+    # mapped today - cheap no-op otherwise, and a brand added later with
+    # no map entry still runs somewhere without a redeploy.
+    sched.add_job(
+        run_data_pipeline,
+        "cron",
+        minute="0,10,20,30,40,50",
+        second=0,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=120,
+        replace_existing=True,
+        id="pipeline_job",
+    )
+    return "regular"
+
+
 # ---------------------------
 # Main
 # ---------------------------
@@ -1254,50 +1321,30 @@ if __name__ == "__main__":
     brands_cron_map = _parse_brands_cron_map()
     brand_cron_groups = _group_brands_by_cron(brands_cron_map)
 
-    if SELF_RUN:
-        for cron_value, group_indices in brand_cron_groups.items():
-            sanitized = "".join(ch if ch.isalnum() else "_" for ch in cron_value)
-            scheduler.add_job(
-                _run_brand_group(group_indices),
-                "cron",
-                minute=cron_value,
-                second=0,
-                coalesce=True,
-                max_instances=1,
-                misfire_grace_time=120,
-                replace_existing=True,
-                id=f"pipeline_job_group_{sanitized}",
-            )
-
-        # Always registered, even when every active brand happens to be
-        # mapped today - cheap no-op otherwise, and a brand added later with
-        # no map entry still runs somewhere without a redeploy.
-        scheduler.add_job(
-            run_data_pipeline,
-            "cron",
-            minute="0,10,20,30,40,50",
-            second=0,
-            coalesce=True,
-            max_instances=1,
-            misfire_grace_time=120,
-            replace_existing=True,
-            id="pipeline_job",
-        )
-    # else (SELF_RUN=false): no automatic jobs at all - manual /trigger no
-    # longer reuses a pre-registered job id, it schedules its own one-off job
-    # per call (see pipeline/orchestration.py's manual_trigger), so there's
-    # nothing to pre-register here for the manual-only case.
+    # SELF_RUN=false: no automatic jobs at all - manual /trigger schedules its own one-off job per call
+    # (see pipeline/orchestration.py's manual_trigger). BACKFILL_MODE=true: one immediate run, no recurring ticks.
+    schedule_mode = register_pipeline_schedule(scheduler, SELF_RUN, BACKFILL_MODE, brand_cron_groups)
 
     scheduler.start()
 
     logger.info("✅ Optimized Shopify ETL worker started (WITH MANUAL TRIGGER API)")
 
-    if SELF_RUN:
+    if schedule_mode == "backfill_once":
+        logger.info(
+            "   - Schedule: BACKFILL - ONE run starting now (no recurring ticks); "
+            "set BACKFILL_MODE=false and restart to resume the regular schedule"
+        )
+    elif schedule_mode == "regular":
         for cron_value, group_indices in brand_cron_groups.items():
             logger.info(f"   - Schedule: brands {group_indices} at minute {cron_value} every hour")
         logger.info("   - Schedule: all other active brands every 10 mins (:00,:10,:20,:30,:40,:50)")
     else:
         logger.info("   - Schedule: MANUAL ONLY (SELF_RUN=false)")
+        if BACKFILL_MODE:
+            logger.warning(
+                "BACKFILL_MODE is on but SELF_RUN=false, so the backfill will NOT start by itself; "
+                "POST /trigger to run it (or set SELF_RUN=true)"
+            )
 
     if DISCOUNT_DASHBOARD_ONLY_MODE:
         logger.info("   - Mode: DISCOUNT DASHBOARD BACKFILL ONLY")
