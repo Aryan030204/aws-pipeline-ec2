@@ -1,7 +1,8 @@
 """
-Standalone worker: monthly data purge. For every active brand database it archives rows older than the
-6-calendar-month cutoff to S3 (CSV + manifest per brand/table), verifies the archive, and - only when
-explicitly allowed - deletes the archived rows in batches.
+Standalone worker: data purge, run on the 1st and 16th of every month. For every active brand database (or only
+those listed in PURGE_BRAND_IDS) it archives rows older than the retention cutoff (run date - 200 days) to S3
+(CSV + manifest per brand/table), verifies the archive, and - only when explicitly allowed - deletes the archived
+rows in batches. Each run is also logged to a Google Sheet tab (pipeline/purge_sheet_log.py).
 
 All logic (cutoff, config modes, live schema validation, streaming export, S3 manifest protocol, batched
 capped deletes) lives in pipeline/data_purge.py; this file is the scheduling/orchestration wrapper in the
@@ -20,7 +21,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 from dotenv import load_dotenv
 
@@ -39,7 +40,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
 import aws_background
-from pipeline import data_purge
+from pipeline import data_purge, purge_sheet_log
 
 LOCK_PATH = os.environ.get(
     "DATA_PURGE_LOCK_PATH",
@@ -80,7 +81,7 @@ def _single_instance_lock(path: Optional[str] = None):
 
 
 def run_worker(current_dt: Optional[datetime] = None, brand_key: Optional[str] = None) -> None:
-    """current_dt: pretend to run at this time (selects the purge month/cutoff). brand_key: restrict to one
+    """current_dt: pretend to run at this time (selects the purge date/cutoff). brand_key: restrict to one
     brand (matches the brand index, BRAND_TAG, BRAND_NAME or BRAND_ID, case-insensitive)."""
     with _single_instance_lock() as acquired:
         if not acquired:
@@ -89,11 +90,23 @@ def run_worker(current_dt: Optional[datetime] = None, brand_key: Optional[str] =
         _run_purge(current_dt, brand_key)
 
 
-def _select_brands(brand_key: Optional[str]) -> List[data_purge.BrandContext]:
+def _select_brands(
+    brand_key: Optional[str], allowed_indices: Optional[Sequence[int]] = None
+) -> List[data_purge.BrandContext]:
+    """Active brands, narrowed by PURGE_BRAND_IDS (`allowed_indices`, None = no restriction) and then by the
+    optional `brand_key` (a manual run can only narrow further). A configured restriction that matches nothing
+    yields NO brands - it never falls back to all brands."""
     aws_background.initialize_brand_configs()
     brands: List[data_purge.BrandContext] = []
     wanted = brand_key.strip().upper() if brand_key else None
+    allowed = set(allowed_indices) if allowed_indices else None
+    if allowed:
+        unknown = sorted(allowed - set(aws_background.active_brand_indices))
+        if unknown:
+            logger.warning("PURGE_BRAND_IDS lists brand indices that are not active/configured: %s", unknown)
     for index in aws_background.active_brand_indices:
+        if allowed is not None and index not in allowed:
+            continue
         name = os.environ.get(f"BRAND_NAME_{index}", f"Brand_{index}")
         tag = os.environ.get(f"BRAND_TAG_{index}") or ""
         brand_id = os.environ.get(f"BRAND_ID_{index}") or ""
@@ -111,10 +124,13 @@ def _select_brands(brand_key: Optional[str]) -> List[data_purge.BrandContext]:
 
 
 def _run_purge(current_dt: Optional[datetime], brand_key: Optional[str]) -> None:
+    run_dt = current_dt or datetime.now(data_purge.SCHEDULER_TZ)
+    started = time.monotonic()
     try:
         cfg = data_purge.load_config()
     except data_purge.ConfigError as exc:
         logger.error("Data purge refused to run - unsafe or invalid configuration: %s", exc)
+        purge_sheet_log.log_purge_failure(str(exc), run_dt, time.monotonic() - started, None, "invalid configuration")
         raise
 
     if cfg.mode is data_purge.Mode.DISABLED:
@@ -124,29 +140,44 @@ def _run_purge(current_dt: Optional[datetime], brand_key: Optional[str]) -> None
         )
         return
 
-    run_dt = current_dt or datetime.now(data_purge.SCHEDULER_TZ)
-    cutoff = data_purge.compute_cutoff(run_dt)
-    store = None
-    if cfg.mode in (data_purge.Mode.ARCHIVE_ONLY, data_purge.Mode.FULL):
-        store = data_purge.S3ArchiveStore(cfg.bucket, sse=cfg.sse, kms_key_id=cfg.kms_key_id)
+    try:
+        cutoff = data_purge.compute_cutoff(run_dt, cfg.retention_days)
+        store = None
+        if cfg.mode in (data_purge.Mode.ARCHIVE_ONLY, data_purge.Mode.FULL):
+            store = data_purge.S3ArchiveStore(cfg.bucket, sse=cfg.sse, kms_key_id=cfg.kms_key_id)
+        brands = _select_brands(brand_key, cfg.purge_brand_indices)
+    except Exception as exc:
+        logger.error("Data purge could not start: %s", exc)
+        purge_sheet_log.log_purge_failure(
+            data_purge._safe_error(exc), run_dt, time.monotonic() - started, cfg, "run did not start"
+        )
+        raise
 
-    brands = _select_brands(brand_key)
     if not brands:
-        logger.warning("No active brands%s. Nothing to do.", f" matching '{brand_key}'" if brand_key else "")
+        logger.warning(
+            "No active brands%s%s. Nothing to do.",
+            f" in PURGE_BRAND_IDS={','.join(map(str, cfg.purge_brand_indices))}" if cfg.purge_brand_indices else "",
+            f" matching '{brand_key}'" if brand_key else "",
+        )
+        purge_sheet_log.log_purge_failure(
+            "no active brand matched the PURGE_BRAND_IDS / brand filter", run_dt, time.monotonic() - started, cfg,
+            "nothing to do",
+        )
         return
 
     run = data_purge.RunContext(
         cfg=cfg,
         run_dt=run_dt,
         cutoff=cutoff,
-        month=data_purge.archive_month_label(run_dt),
+        run_label=data_purge.archive_run_label(run_dt),
         store=store,
         env=os.environ,
     )
-    started = time.monotonic()
     results = data_purge.run_purge(brands, run)
-    summary = data_purge.format_summary(results, run, time.monotonic() - started)
+    total_s = time.monotonic() - started
+    summary = data_purge.format_summary(results, run, total_s)
     logger.info("\n%s", summary)
+    purge_sheet_log.log_purge_run(results, run, total_s)  # best effort: never raises, never affects the outcome
 
     if data_purge.any_failure(results):
         raise RuntimeError("Data purge finished with failures; see the summary above (nothing is deleted without a verified archive).")
@@ -161,23 +192,23 @@ def _purge_test_enabled() -> bool:
 
 def _run_startup_test_pass() -> None:
     """PURGE_TEST=true: one run right after every container (re)start, so an export test does not have to wait for
-    the 1st of the month. It can never delete (PURGE_TEST caps the mode at archive-only) and it still needs
+    the next scheduled day. It can never delete (PURGE_TEST caps the mode at archive-only) and it still needs
     DATA_PURGE_ENABLED=true and a bucket. Any failure is logged and swallowed: the container must stay up (it is
     restart: always, so an exception here would otherwise re-run the export on every crash-restart)."""
-    logger.info("PURGE_TEST=true: running one export-only pass now (startup); the monthly schedule stays active")
+    logger.info("PURGE_TEST=true: running one export-only pass now (startup); the 1st/16th schedule stays active")
     try:
         run_worker()
     except Exception as exc:
-        logger.error("PURGE_TEST startup pass failed (the monthly schedule is still started): %s", exc)
+        logger.error("PURGE_TEST startup pass failed (the 1st/16th schedule is still started): %s", exc)
 
 
 def _run_scheduled() -> None:
     """
-    Long-running mode for the standalone container: runs run_worker on the 1st of every month at 03:23 IST.
+    Long-running mode for the standalone container: runs run_worker on the 1st and 16th of every month at 03:23 IST.
     Nothing runs at startup - EXCEPT when PURGE_TEST=true, which runs one export-only pass (never a delete) right
     away on every container (re)start, before the scheduler starts. misfire_grace_time is a full day: if the
-    container was down at the trigger instant the (coalesced) run still happens after it starts - the cutoff
-    depends only on the month, so a late run is identical. Set DATA_PURGE_WORKER_SELF_RUN=false to run once and
+    container was down at the trigger instant the (coalesced) run still happens after it starts; the cutoff is the
+    run date minus the retention days, so a run delayed past midnight IST simply uses the new date. Set DATA_PURGE_WORKER_SELF_RUN=false to run once and
     exit instead (what `python -m workers.run data-purge` does).
     """
     from apscheduler.schedulers.blocking import BlockingScheduler
@@ -186,7 +217,7 @@ def _run_scheduled() -> None:
     scheduler.add_job(
         run_worker,
         trigger="cron",
-        day=1,
+        day="1,16",
         hour=3,
         minute=23,
         timezone="Asia/Kolkata",
@@ -195,7 +226,7 @@ def _run_scheduled() -> None:
         max_instances=1,
         misfire_grace_time=24 * 3600,
     )
-    logger.info("Data purge worker scheduler started (1st of every month at 03:23 IST)")
+    logger.info("Data purge worker scheduler started (1st and 16th of every month at 03:23 IST)")
     if _purge_test_enabled():
         _run_startup_test_pass()
     try:

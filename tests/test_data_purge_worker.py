@@ -26,10 +26,12 @@ def _read(name):
 def purge_env(**values):
     """os.environ with every DATA_PURGE_* variable and PURGE_TEST removed (the worker loads .env on import, so a
     developer's local settings must not leak into these tests), then `values` applied."""
-    clean = {k: v for k, v in os.environ.items() if not k.startswith("DATA_PURGE_") and k != "PURGE_TEST"}
+    clean = {k: v for k, v in os.environ.items()
+             if not k.startswith(("DATA_PURGE_", "PURGE_LOG_")) and k not in ("PURGE_TEST", "PURGE_BRAND_IDS")}
+    clean["PURGE_LOG_SHEET_SWITCH"] = "false"  # never reach Google Sheets from a unit test
     clean.update(values)
-    with mock.patch.dict(os.environ, clean, clear=True):
-        yield
+    with mock.patch.dict(os.environ, clean, clear=True),          mock.patch.object(worker.purge_sheet_log, "write_rows", return_value=False) as sheet_write:
+        yield sheet_write
 
 
 @contextmanager
@@ -164,12 +166,12 @@ class StartupPassTests(unittest.TestCase):
                 _, run_worker, _ = self._schedule({"PURGE_TEST": value})
                 run_worker.assert_not_called()
 
-    def test_purge_test_true_runs_once_before_the_scheduler_starts_and_keeps_the_monthly_job(self):
+    def test_purge_test_true_runs_once_before_the_scheduler_starts_and_keeps_the_1st_16th_job(self):
         sched, run_worker, order = self._schedule({"PURGE_TEST": "true"})
         run_worker.assert_called_once_with()
         self.assertEqual(order, ["run_worker", "scheduler.start"])  # immediately, then the schedule
         kwargs = sched.add_job.call_args.kwargs
-        self.assertEqual((kwargs["day"], kwargs["hour"], kwargs["minute"]), (1, 3, 23))  # schedule unchanged
+        self.assertEqual((kwargs["day"], kwargs["hour"], kwargs["minute"]), ("1,16", 3, 23))  # 1st and 16th, 03:23 IST
 
     def test_a_failing_startup_pass_does_not_stop_the_container_or_the_schedule(self):
         sched, run_worker, order = self._schedule({"PURGE_TEST": "true"}, run_worker_error=RuntimeError("boom"))
@@ -193,7 +195,7 @@ class StartupPassTests(unittest.TestCase):
 
 
 class RunWiringTests(unittest.TestCase):
-    def test_archive_only_builds_the_store_and_uses_the_run_month(self):
+    def test_archive_only_builds_the_store_and_uses_the_run_date_and_200_day_cutoff(self):
         env = dict(DATA_PURGE_ENABLED="true", DATA_PURGE_S3_BUCKET="my-bucket", DATA_PURGE_S3_PREFIX="archive")
         with purge_env(**env), fake_brands(), \
              mock.patch.object(worker.data_purge, "S3ArchiveStore") as store_cls, \
@@ -201,7 +203,7 @@ class RunWiringTests(unittest.TestCase):
             worker._run_purge(datetime(2026, 11, 1, 3, 23, tzinfo=IST), None)
         store_cls.assert_called_once_with("my-bucket", sse=None, kms_key_id=None)
         run = run_purge.call_args.args[1]
-        self.assertEqual((run.month, str(run.cutoff), run.cfg.mode, run.store), ("2026-11", "2026-05-01", dp.Mode.ARCHIVE_ONLY, store_cls.return_value))
+        self.assertEqual((run.run_label, str(run.cutoff), run.cfg.mode, run.store), ("2026-11-01", "2026-04-15", dp.Mode.ARCHIVE_ONLY, store_cls.return_value))
         self.assertEqual(run.cfg.prefix, "archive")
 
     def test_brands_are_run_in_order_with_stable_names_and_their_own_cursor(self):
@@ -270,6 +272,87 @@ class RunWiringTests(unittest.TestCase):
         with mock.patch.object(worker, "_single_instance_lock", free), mock.patch.object(worker, "_run_purge") as run:
             worker.run_worker(current_dt=when, brand_key="pts")
         run.assert_called_once_with(when, "pts")
+
+
+class BrandFilterWiringTests(unittest.TestCase):
+    def _selected(self, purge_ids, brand_key=None, indices=(1, 2, 3, 5)):
+        values = {"PURGE_BRAND_IDS": purge_ids} if purge_ids is not None else {}
+        with purge_env(DATA_PURGE_DRY_RUN="true", **values), fake_brands(indices),              mock.patch.object(worker.data_purge, "run_purge", return_value=[]) as run_purge:
+            worker._run_purge(None, brand_key)
+        return [b.index for b in run_purge.call_args.args[0]] if run_purge.called else None
+
+    def test_unset_runs_every_active_brand(self):
+        self.assertEqual(self._selected(None), [1, 2, 3, 5])
+        self.assertEqual(self._selected(""), [1, 2, 3, 5])
+
+    def test_the_listed_brands_only_in_active_order(self):
+        self.assertEqual(self._selected("5,2"), [2, 5])
+        self.assertEqual(self._selected("3"), [3])
+
+    def test_inactive_indices_are_warned_about_and_ignored(self):
+        with self.assertLogs(worker.logger, level="WARNING") as logs:
+            self.assertEqual(self._selected("2,9"), [2])
+        self.assertIn("[9]", " ".join(logs.output))
+
+    def test_a_filter_that_matches_nothing_runs_nothing_and_never_falls_back_to_all_brands(self):
+        self.assertIsNone(self._selected("9,10"))
+
+    def test_the_manual_brand_key_can_only_narrow_further(self):
+        self.assertEqual(self._selected("1,2", brand_key="2"), [2])
+        self.assertIsNone(self._selected("1,2", brand_key="3"))  # 3 is active but not in PURGE_BRAND_IDS
+
+    def test_an_invalid_value_refuses_to_run(self):
+        with purge_env(DATA_PURGE_DRY_RUN="true", PURGE_BRAND_IDS="1,x"), fake_brands(),              mock.patch.object(worker.data_purge, "run_purge") as run_purge:
+            with self.assertRaises(dp.ConfigError):
+                worker._run_purge(None, None)
+        run_purge.assert_not_called()
+
+
+class SheetHookTests(unittest.TestCase):
+    def test_a_finished_run_is_logged_after_the_summary(self):
+        results = [dp.TableResult(brand="b", table="t", status=dp.Status.ARCHIVED_ONLY)]
+        with purge_env(DATA_PURGE_DRY_RUN="true"), fake_brands(),              mock.patch.object(worker.data_purge, "run_purge", return_value=results),              mock.patch.object(worker.purge_sheet_log, "log_purge_run") as log_run:
+            worker._run_purge(None, None)
+        log_run.assert_called_once()
+        self.assertIs(log_run.call_args.args[0], results)
+        self.assertIsInstance(log_run.call_args.args[1], dp.RunContext)
+
+    def test_failures_are_logged_and_still_fail_the_run(self):
+        failed = [dp.TableResult(brand="b", table="t", status=dp.Status.FAILED, reason="boom")]
+        with purge_env(DATA_PURGE_DRY_RUN="true"), fake_brands(),              mock.patch.object(worker.data_purge, "run_purge", return_value=failed),              mock.patch.object(worker.purge_sheet_log, "log_purge_run") as log_run:
+            with self.assertRaises(RuntimeError):
+                worker._run_purge(None, None)
+        log_run.assert_called_once()
+
+    def test_an_invalid_config_writes_an_error_row_and_raises(self):
+        with purge_env(DATA_PURGE_ENABLED="true", DATA_PURGE_S3_BUCKET="b", DATA_PURGE_BATCH_SIZE="zero"), fake_brands(),              mock.patch.object(worker.purge_sheet_log, "log_purge_failure") as log_failure:
+            with self.assertRaises(dp.ConfigError):
+                worker._run_purge(None, None)
+        log_failure.assert_called_once()
+        self.assertIn("DATA_PURGE_BATCH_SIZE", log_failure.call_args.args[0])
+
+    def test_no_matching_brand_writes_an_error_row_without_running(self):
+        with purge_env(DATA_PURGE_DRY_RUN="true", PURGE_BRAND_IDS="9"), fake_brands(),              mock.patch.object(worker.data_purge, "run_purge") as run_purge,              mock.patch.object(worker.purge_sheet_log, "log_purge_failure") as log_failure:
+            worker._run_purge(None, None)
+        run_purge.assert_not_called()
+        log_failure.assert_called_once()
+
+    def test_a_disabled_worker_logs_nothing(self):
+        with purge_env(), fake_brands(),              mock.patch.object(worker.purge_sheet_log, "log_purge_run") as log_run,              mock.patch.object(worker.purge_sheet_log, "log_purge_failure") as log_failure:
+            worker._run_purge(None, None)
+        log_run.assert_not_called()
+        log_failure.assert_not_called()
+
+    def test_a_store_that_cannot_be_built_writes_an_error_row_and_raises(self):
+        with purge_env(DATA_PURGE_ENABLED="true", DATA_PURGE_S3_BUCKET="b"), fake_brands(),              mock.patch.object(worker.data_purge, "S3ArchiveStore", side_effect=RuntimeError("no boto3")),              mock.patch.object(worker.purge_sheet_log, "log_purge_failure") as log_failure:
+            with self.assertRaises(RuntimeError):
+                worker._run_purge(None, None)
+        log_failure.assert_called_once()
+
+    def test_the_purge_outcome_does_not_depend_on_the_sheet(self):
+        ok = [dp.TableResult(brand="b", table="t", status=dp.Status.ARCHIVED_ONLY)]
+        with purge_env(DATA_PURGE_DRY_RUN="true"), fake_brands(),              mock.patch.object(worker.data_purge, "run_purge", return_value=ok):
+            worker._run_purge(None, None)  # write_rows is patched to return False (sheet unavailable): no raise
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from pipeline import data_purge as dp
 
 IST = ZoneInfo("Asia/Kolkata")
-RUN_DT = datetime(2026, 10, 1, 3, 23, tzinfo=IST)  # cutoff 2026-04-01, archive month 2026-10
+RUN_DT = datetime(2026, 10, 18, 3, 23, tzinfo=IST)  # cutoff 2026-04-01 (200 days earlier), archive folder 2026-10-18
 
 
 # --------------------------------------------------------------------------------------
@@ -161,6 +161,8 @@ class FakeCursor:
                 for name, non_unique, cols in sorted(t.indexes):
                     for seq, col in enumerate(cols, 1):
                         self._result.append({"index_name": name, "non_unique": non_unique, "seq_in_index": seq, "column_name": col})
+        elif s.startswith("SET SESSION information_schema_stats_expiry="):
+            db.events.append(("stats_expiry", s.rsplit("=", 1)[1]))
         elif s.startswith("SET SESSION autocommit="):
             db.autocommit = s.rsplit("=", 1)[1]
             db.events.append(("autocommit", db.autocommit))
@@ -323,7 +325,7 @@ def full_env(tables="raw_mongo_events,shopify_orders", **extra):
 def make_run(env, store=None, run_dt=RUN_DT, proc_env=None):
     cfg = dp.load_config(env)
     return dp.RunContext(
-        cfg=cfg, run_dt=run_dt, cutoff=dp.compute_cutoff(run_dt), month=dp.archive_month_label(run_dt),
+        cfg=cfg, run_dt=run_dt, cutoff=dp.compute_cutoff(run_dt, cfg.retention_days), run_label=dp.archive_run_label(run_dt),
         store=store, env=proc_env if proc_env is not None else {},
     )
 
@@ -344,29 +346,46 @@ def csv_rows(data: bytes):
 # Cutoff and boundaries
 # --------------------------------------------------------------------------------------
 class CutoffTests(unittest.TestCase):
-    def test_examples_from_the_spec(self):
-        self.assertEqual(dp.compute_cutoff(datetime(2026, 10, 1, tzinfo=IST)), date(2026, 4, 1))
-        self.assertEqual(dp.compute_cutoff(datetime(2026, 11, 1, tzinfo=IST)), date(2026, 5, 1))
-        self.assertEqual(dp.compute_cutoff(datetime(2026, 1, 1, tzinfo=IST)), date(2025, 7, 1))
+    def test_examples_are_run_date_minus_200_days(self):
+        self.assertEqual(dp.compute_cutoff(datetime(2026, 11, 16, tzinfo=IST)), date(2026, 4, 30))
+        self.assertEqual(dp.compute_cutoff(datetime(2026, 10, 18, tzinfo=IST)), date(2026, 4, 1))
+        self.assertEqual(dp.compute_cutoff(datetime(2026, 1, 1, tzinfo=IST)), date(2025, 6, 15))
 
-    def test_calendar_months_not_180_days(self):
-        # 180 days before 2026-10-01 is 2026-04-04; the calendar cutoff is 2026-04-01
-        self.assertEqual(dp.compute_cutoff(datetime(2026, 10, 1, tzinfo=IST)), date(2026, 4, 1))
-        # months of different length still land on the 1st
-        self.assertEqual(dp.compute_cutoff(datetime(2026, 8, 31, tzinfo=IST)), date(2026, 2, 1))
-        self.assertEqual(dp.compute_cutoff(datetime(2026, 12, 15, tzinfo=IST)), date(2026, 6, 1))
-        self.assertEqual(dp.compute_cutoff(datetime(2026, 6, 15, tzinfo=IST)), date(2025, 12, 1))
+    def test_days_not_calendar_months(self):
+        # the old rule gave 2026-05-01 for any day of November; the 200-day rule moves with the run date
+        self.assertEqual(dp.compute_cutoff(datetime(2026, 11, 1, tzinfo=IST)), date(2026, 4, 15))
+        self.assertEqual(dp.compute_cutoff(datetime(2026, 11, 16, tzinfo=IST)), date(2026, 4, 30))
+        self.assertEqual(dp.compute_cutoff(datetime(2026, 11, 16, tzinfo=IST), days=30), date(2026, 10, 17))
 
-    def test_any_day_of_the_month_gives_the_same_cutoff(self):
-        cutoffs = {dp.compute_cutoff(datetime(2026, 10, d, 12, 0, tzinfo=IST)) for d in (1, 2, 15, 31)}
-        self.assertEqual(cutoffs, {date(2026, 4, 1)})
+    def test_leap_year_and_year_boundaries(self):
+        self.assertEqual(dp.compute_cutoff(datetime(2028, 3, 1, tzinfo=IST)), date(2027, 8, 14))
+        self.assertEqual(dp.compute_cutoff(datetime(2027, 3, 1, tzinfo=IST)), date(2026, 8, 13))
 
-    def test_month_is_the_ist_month_even_for_a_utc_run_time(self):
-        # 2026-09-30 22:00 UTC is already 2026-10-01 03:30 IST
-        self.assertEqual(dp.compute_cutoff(datetime(2026, 9, 30, 22, 0, tzinfo=timezone.utc)), date(2026, 4, 1))
-        self.assertEqual(dp.archive_month_label(datetime(2026, 9, 30, 22, 0, tzinfo=timezone.utc)), "2026-10")
+    def test_any_time_of_the_same_ist_day_gives_the_same_cutoff(self):
+        cutoffs = {dp.compute_cutoff(datetime(2026, 11, 16, h, 0, tzinfo=IST)) for h in (0, 3, 12, 23)}
+        self.assertEqual(cutoffs, {date(2026, 4, 30)})
+
+    def test_the_date_is_the_ist_date_even_for_a_utc_run_time(self):
+        # 2026-11-15 22:00 UTC is already 2026-11-16 03:30 IST
+        moment = datetime(2026, 11, 15, 22, 0, tzinfo=timezone.utc)
+        self.assertEqual(dp.compute_cutoff(moment), date(2026, 4, 30))
+        self.assertEqual(dp.archive_run_label(moment), "2026-11-16")
         # naive datetimes are read as IST
-        self.assertEqual(dp.compute_cutoff(datetime(2026, 10, 1, 0, 0)), date(2026, 4, 1))
+        self.assertEqual(dp.compute_cutoff(datetime(2026, 11, 16, 0, 0)), date(2026, 4, 30))
+
+    def test_retention_days_is_configurable_with_a_200_day_default(self):
+        self.assertEqual(dp.load_config({}).retention_days, 200)
+        self.assertEqual(dp.load_config({"DATA_PURGE_RETENTION_DAYS": "365"}).retention_days, 365)
+        for bad in ("0", "-5", "abc", "3651", "1.5", ""):
+            if bad == "":
+                continue
+            with self.subTest(value=bad), self.assertRaises(dp.ConfigError):
+                dp.load_config({"DATA_PURGE_RETENTION_DAYS": bad})
+
+    def test_runs_two_weeks_apart_in_one_month_have_different_folders_and_cutoffs(self):
+        first, second = datetime(2026, 11, 1, 3, 23, tzinfo=IST), datetime(2026, 11, 16, 3, 23, tzinfo=IST)
+        self.assertNotEqual(dp.archive_run_label(first), dp.archive_run_label(second))
+        self.assertEqual(dp.compute_cutoff(second) - dp.compute_cutoff(first), timedelta(days=15))
 
 
 class BoundaryTests(unittest.TestCase):
@@ -581,7 +600,7 @@ class TableConfigTests(unittest.TestCase):
                 self.assertEqual(result.status, dp.Status.ARCHIVED_ONLY, result.reason)
                 self.assertEqual((result.eligible, result.exported, result.deleted), (9, 9, 0))  # 2025 rows only
                 self.assertEqual(result.details["strategy"], "keyset")  # NOT NULL PK that leads with the date
-                csv = store.objects[f"data-purge/2026-10/pts/{table}.csv"]
+                csv = store.objects[f"data-purge/2026-10-18/pts/{table}.csv"]
                 self.assertEqual(csv_rows(csv)[0], ["date", col, "sessions"])
                 self.assertEqual(len(csv_rows(csv)) - 1, 9)
                 self.assertEqual(len(db.tables[table].rows), 11)  # nothing deleted
@@ -804,7 +823,7 @@ class ArchiveTests(unittest.TestCase):
         self.store = FakeStore(self.events)
 
     def keys(self, table="raw_mongo_events"):
-        return dp.archive_keys(dp.load_config(ARCHIVE), "2026-10", "pts", table)
+        return dp.archive_keys(dp.load_config(ARCHIVE), "2026-10-18", "pts", table)
 
     def test_archive_only_archives_verifies_and_never_deletes(self):
         result, _ = run_table(self.db, self.store, ARCHIVE)
@@ -819,12 +838,12 @@ class ArchiveTests(unittest.TestCase):
 
     def test_s3_path_is_deterministic_and_per_month_per_brand(self):
         self.assertEqual(self.keys(), (
-            "data-purge/2026-10/pts/raw_mongo_events.csv",
-            "data-purge/2026-10/pts/raw_mongo_events.manifest.json",
-            "data-purge/2026-10/pts/raw_mongo_events.purge-complete.json",
+            "data-purge/2026-10-18/pts/raw_mongo_events.csv",
+            "data-purge/2026-10-18/pts/raw_mongo_events.manifest.json",
+            "data-purge/2026-10-18/pts/raw_mongo_events.purge-complete.json",
         ))
         result, _ = run_table(self.db, self.store, dict(ARCHIVE, DATA_PURGE_S3_PREFIX="/custom/root/"))
-        self.assertTrue(result.s3_key.startswith("custom/root/2026-10/pts/"))
+        self.assertTrue(result.s3_key.startswith("custom/root/2026-10-18/pts/"))
         self.assertTrue(dp.archive_keys(dp.load_config(ARCHIVE), "2026-11", "pts", "x")[0].startswith("data-purge/2026-11/"))
 
     def test_manifest_records_the_archive_and_is_written_after_the_upload(self):
@@ -832,7 +851,7 @@ class ArchiveTests(unittest.TestCase):
         csv_key, manifest_key, _ = self.keys()
         m = self.store.jsons[manifest_key]
         data = self.store.objects[csv_key]
-        self.assertEqual((m["table"], m["brand"], m["run_month"], m["cutoff"]), ("raw_mongo_events", "pts", "2026-10", "2026-04-01"))
+        self.assertEqual((m["table"], m["brand"], m["run_date"], m["cutoff"]), ("raw_mongo_events", "pts", "2026-10-18", "2026-04-01"))
         self.assertEqual((m["row_count"], m["csv_bytes"], m["sha256"]), (30, len(data), hashlib.sha256(data).hexdigest()))
         self.assertEqual(m["columns"], ["event_id", "created_at_utc", "created_at_ist", "event_type"])
         self.assertEqual(m["date_column"], "created_at_ist")
@@ -925,7 +944,7 @@ class DeleteTests(unittest.TestCase):
 
     def test_purge_test_exports_to_s3_but_never_deletes_even_in_a_full_config(self):
         result, run = run_table(self.db, self.store, full_env(PURGE_TEST="true"))
-        csv_key, manifest_key, _ = dp.archive_keys(run.cfg, "2026-10", "pts", "raw_mongo_events")
+        csv_key, manifest_key, _ = dp.archive_keys(run.cfg, "2026-10-18", "pts", "raw_mongo_events")
         self.assertEqual(result.status, dp.Status.ARCHIVED_ONLY, result.reason)
         self.assertEqual((result.archived, result.exported, result.deleted), (True, 2500, 0))
         self.assertIn(csv_key, self.store.objects)  # the CSV is in S3...
@@ -1019,7 +1038,7 @@ class ExistingArchiveTests(unittest.TestCase):
         self.db = FakeDatabase([events_table(event_rows(n_old=40, n_new=5))], self.events)
         self.store = FakeStore(self.events)
         run_table(self.db, self.store, ARCHIVE)  # a complete archive + manifest
-        self.csv_key, self.manifest_key, _ = dp.archive_keys(dp.load_config(ARCHIVE), "2026-10", "pts", "raw_mongo_events")
+        self.csv_key, self.manifest_key, _ = dp.archive_keys(dp.load_config(ARCHIVE), "2026-10-18", "pts", "raw_mongo_events")
         self.uploads = len(self.store.upload_calls)
 
     def _rerun(self, env=None):
@@ -1038,7 +1057,7 @@ class ExistingArchiveTests(unittest.TestCase):
     def test_mismatched_manifests_are_rejected_and_never_overwritten(self):
         original = json.dumps(self.store.jsons[self.manifest_key], sort_keys=True)
         for field, value in (("table", "shopify_orders"), ("cutoff", "2026-05-01"), ("brand", "other"),
-                             ("run_month", "2026-11"), ("date_column", "created_date"), ("schema_version", 99),
+                             ("run_date", "2026-11-18"), ("date_column", "created_date"), ("schema_version", 99),
                              ("sha256", "short"), ("row_count", 0), ("csv_bytes", -1),
                              ("columns", ["event_id"]), ("csv_key", "elsewhere.csv")):
             with self.subTest(field=field):
@@ -1070,7 +1089,7 @@ class ExistingArchiveTests(unittest.TestCase):
     def test_a_manifest_that_appears_concurrently_is_validated_not_overwritten(self):
         db = FakeDatabase([events_table(event_rows(n_old=10, n_new=2))], [])
         store = FakeStore()
-        csv_key, manifest_key, _ = dp.archive_keys(dp.load_config(ARCHIVE), "2026-10", "pts", "raw_mongo_events")
+        csv_key, manifest_key, _ = dp.archive_keys(dp.load_config(ARCHIVE), "2026-10-18", "pts", "raw_mongo_events")
 
         def other_process_writes_a_bad_manifest():
             store.jsons[manifest_key] = {"table": "x"}
@@ -1090,7 +1109,7 @@ class OrphanCsvTests(unittest.TestCase):
         self.db = FakeDatabase([events_table(event_rows(n_old=40, n_new=5))], self.events)
         self.store = FakeStore(self.events)
         run_table(self.db, self.store, ARCHIVE)
-        self.csv_key, self.manifest_key, _ = dp.archive_keys(dp.load_config(ARCHIVE), "2026-10", "pts", "raw_mongo_events")
+        self.csv_key, self.manifest_key, _ = dp.archive_keys(dp.load_config(ARCHIVE), "2026-10-18", "pts", "raw_mongo_events")
         del self.store.jsons[self.manifest_key]  # crash before the manifest
         self.uploads = len(self.store.upload_calls)
 
@@ -1277,7 +1296,7 @@ class RunIsolationAndSummaryTests(unittest.TestCase):
         run = make_run(full_env(), FakeStore(events))
         results = dp.run_purge([brand_for(db)], run)
         text = dp.format_summary(results, run, 12.3)
-        for needle in ("DATA PURGE SUMMARY", "Cutoff: 2026-04-01", "s3://bkt/data-purge/2026-10/", "pts / raw_mongo_events",
+        for needle in ("DATA PURGE SUMMARY", "Cutoff: 2026-04-01", "s3://bkt/data-purge/2026-10-18/", "pts / raw_mongo_events",
                        "eligible: 30", "exported: 30", "archived: YES", "deleted: 30", "status: SUCCESS",
                        "Total rows archived: 30", "Total rows deleted: 30", "Duration: 12.3s", "SKIPPED_MISSING"):
             self.assertIn(needle, text)
@@ -1346,7 +1365,7 @@ class LightweightRunTests(unittest.TestCase):
 
     def test_a_broken_manifest_is_still_a_failure_on_the_fast_path(self):
         run_table(self.db, self.store, ARCHIVE)
-        _csv, manifest_key, _ = dp.archive_keys(dp.load_config(ARCHIVE), "2026-10", "pts", "raw_mongo_events")
+        _csv, manifest_key, _ = dp.archive_keys(dp.load_config(ARCHIVE), "2026-10-18", "pts", "raw_mongo_events")
         self.store.jsons[manifest_key]["cutoff"] = "2026-05-01"
         result, _ = run_table(self.db, self.store, ARCHIVE)
         self.assertEqual(result.status, dp.Status.FAILED)
@@ -1354,7 +1373,7 @@ class LightweightRunTests(unittest.TestCase):
 
     def test_a_truncated_csv_is_a_failure_on_the_fast_path(self):
         run_table(self.db, self.store, ARCHIVE)
-        csv_key, _m, _ = dp.archive_keys(dp.load_config(ARCHIVE), "2026-10", "pts", "raw_mongo_events")
+        csv_key, _m, _ = dp.archive_keys(dp.load_config(ARCHIVE), "2026-10-18", "pts", "raw_mongo_events")
         self.store.objects[csv_key] = self.store.objects[csv_key][:-10]
         result, _ = run_table(self.db, self.store, ARCHIVE)
         self.assertEqual(result.status, dp.Status.FAILED)
@@ -1401,6 +1420,111 @@ class LightweightRunTests(unittest.TestCase):
         text = dp.format_summary([result], run, 1.0)
         self.assertIn("eligible: n/a", text)
         self.assertNotIn("n/a (exact)", text)
+
+
+class BrandFilterConfigTests(unittest.TestCase):
+    def test_unset_or_empty_means_all_brands(self):
+        for env in ({}, {"PURGE_BRAND_IDS": ""}, {"PURGE_BRAND_IDS": "   "}):
+            self.assertIsNone(dp.load_config(env).purge_brand_indices)
+
+    def test_parses_indices_tolerating_spaces_and_duplicates(self):
+        self.assertEqual(dp.load_config({"PURGE_BRAND_IDS": "1"}).purge_brand_indices, (1,))
+        self.assertEqual(dp.load_config({"PURGE_BRAND_IDS": " 2 , 1,2, ,5 "}).purge_brand_indices, (2, 1, 5))
+
+    def test_anything_else_is_rejected_so_a_typo_never_widens_the_purge(self):
+        for bad in ("a", "1,b", "0", "-1", "1.5", "tag1", ",", " , "):
+            with self.subTest(value=bad), self.assertRaises(dp.ConfigError):
+                dp.load_config({"PURGE_BRAND_IDS": bad})
+
+
+class RunDateKeyTests(unittest.TestCase):
+    def test_two_runs_in_the_same_month_do_not_collide_and_each_keeps_its_own_manifest(self):
+        events = []
+        db = FakeDatabase([events_table(event_rows(n_old=40, n_new=5))], events)
+        store = FakeStore(events)
+        first = datetime(2026, 10, 18, 3, 23, tzinfo=IST)
+        second = datetime(2026, 11, 2, 3, 23, tzinfo=IST)
+        r1, run1 = run_table(db, store, ARCHIVE, run_dt=first)
+        r2, run2 = run_table(db, store, ARCHIVE, run_dt=second)
+        self.assertEqual((r1.status, r2.status), (dp.Status.ARCHIVED_ONLY, dp.Status.ARCHIVED_ONLY), (r1.reason, r2.reason))
+        k1 = dp.archive_keys(run1.cfg, "2026-10-18", "pts", "raw_mongo_events")[1]
+        k2 = dp.archive_keys(run2.cfg, "2026-11-02", "pts", "raw_mongo_events")[1]
+        self.assertNotEqual(k1, k2)
+        self.assertEqual(store.jsons[k1]["run_date"], "2026-10-18")
+        self.assertEqual(store.jsons[k2]["run_date"], "2026-11-02")
+        self.assertEqual(store.jsons[k1]["cutoff"], "2026-04-01")
+        self.assertEqual(store.jsons[k2]["cutoff"], "2026-04-16")
+        self.assertEqual(store.jsons[k1]["schema_version"], 2)
+
+    def test_a_same_day_rerun_reuses_the_archive_without_touching_the_database(self):
+        db = FakeDatabase([events_table(event_rows(n_old=40, n_new=5))], [])
+        store = FakeStore()
+        run_table(db, store, ARCHIVE)
+        calls, uploads = len(db.executed), len(store.upload_calls)
+        later_same_day = RUN_DT.replace(hour=22, minute=5)
+        result, _ = run_table(db, store, ARCHIVE, run_dt=later_same_day)
+        self.assertIn("database not touched", result.reason)
+        self.assertEqual((len(db.executed), len(store.upload_calls)), (calls, uploads))
+
+
+class TableStatsTests(unittest.TestCase):
+    def setUp(self):
+        self.events = []
+        self.db = FakeDatabase([events_table(event_rows(n_old=40, n_new=5))], self.events)
+        self.store = FakeStore(self.events)
+
+    def test_size_and_rows_before_are_recorded_and_after_only_when_rows_were_deleted(self):
+        archived, _ = run_table(self.db, self.store, ARCHIVE)
+        self.assertEqual((archived.size_before_bytes, archived.rows_before), (1500, 45))
+        self.assertIsNone(archived.size_after_bytes)  # nothing deleted -> not re-read
+        self.db.tables["raw_mongo_events"].rows = list(self.db.tables["raw_mongo_events"].rows)
+        purged, _ = run_table(self.db, self.store, full_env())
+        self.assertEqual(purged.status, dp.Status.SUCCESS, purged.reason)
+        self.assertEqual((purged.rows_before, purged.rows_after), (45, 5))
+        self.assertEqual(purged.size_after_bytes, 1500)  # the fake keeps data_length constant, like InnoDB
+        self.assertGreater(purged.finished_at, purged.started_at)
+
+    def test_fast_path_tables_have_no_size_columns(self):
+        run_table(self.db, self.store, ARCHIVE)
+        again, _ = run_table(self.db, self.store, ARCHIVE)
+        self.assertIn("database not touched", again.reason)
+        self.assertIsNone(again.size_before_bytes)
+        self.assertIsNone(again.rows_before)
+
+    def test_stats_are_read_fresh_and_the_session_variable_is_restored_even_on_failure(self):
+        run_table(self.db, self.store, ARCHIVE)
+        expiry = [e for e in self.events if e[0] == "stats_expiry"]
+        self.assertEqual(expiry, [("stats_expiry", "0"), ("stats_expiry", "DEFAULT")])
+        self.assertEqual(self.db.executed[0][0], "SET SESSION autocommit=1")  # nested inside autocommit
+        self.assertEqual(self.db.executed[-1][0], "SET SESSION autocommit=0")
+        self.events.clear()
+        self.store.fail_upload = True
+        failed, _ = run_table(self.db, self.store, ARCHIVE, run_dt=RUN_DT.replace(day=19))
+        self.assertEqual(failed.status, dp.Status.FAILED)
+        self.assertEqual([e for e in self.events if e[0] == "stats_expiry"], [("stats_expiry", "0"), ("stats_expiry", "DEFAULT")])
+
+    def test_a_stats_read_failure_after_the_delete_does_not_fail_the_purge(self):
+        run_table(self.db, self.store, ARCHIVE)
+        with mock.patch.object(dp, "_read_table_stats", side_effect=RuntimeError("no privilege")):
+            purged, _ = run_table(self.db, self.store, full_env())
+        self.assertEqual(purged.status, dp.Status.SUCCESS, purged.reason)
+        self.assertIsNone(purged.size_after_bytes)
+
+
+class BrandTimingTests(unittest.TestCase):
+    def test_every_brand_is_timed_including_one_that_failed(self):
+        events = []
+        dbs = {"pts": FakeDatabase([events_table(event_rows(5, 3))], events),
+               "bbb": FakeDatabase([events_table(event_rows(5, 3))], events)}
+        store = FakeStore(events)
+        store.fail_keys_containing = "pts/"
+        run = make_run(ARCHIVE, store)
+        dp.run_purge([brand_for(dbs["pts"], "pts"), brand_for(dbs["bbb"], "bbb")], run)
+        self.assertEqual(set(run.brand_timings), {"pts", "bbb"})
+        for timing in run.brand_timings.values():
+            self.assertGreaterEqual(timing["duration_s"], 0)
+            self.assertGreaterEqual(timing["finished_at"], timing["started_at"])
+            self.assertEqual(timing["index"], 1)
 
 
 class S3StoreTests(unittest.TestCase):

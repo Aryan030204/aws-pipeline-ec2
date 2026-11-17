@@ -71,7 +71,7 @@ class MidnightScheduleTests(unittest.TestCase):
         kwargs = fake.add_job.call_args.kwargs
         self.assertEqual((kwargs["hour"], kwargs["minute"]), (0, 17))
 
-    def test_data_purge_runs_monthly_on_the_1st_at_0323_ist_and_not_at_startup(self):
+    def test_data_purge_runs_on_the_1st_and_16th_at_0323_ist_and_not_at_startup(self):
         fake = mock.Mock()
         env = {k: v for k, v in os.environ.items() if k != "PURGE_TEST"}  # a developer's .env must not leak in
         with mock.patch("apscheduler.schedulers.blocking.BlockingScheduler", return_value=fake), \
@@ -80,7 +80,7 @@ class MidnightScheduleTests(unittest.TestCase):
             data_purge_worker._run_scheduled()
         kwargs = fake.add_job.call_args.kwargs
         self.assertEqual(kwargs["trigger"], "cron")
-        self.assertEqual((kwargs["day"], kwargs["hour"], kwargs["minute"], kwargs["timezone"]), (1, 3, 23, "Asia/Kolkata"))
+        self.assertEqual((kwargs["day"], kwargs["hour"], kwargs["minute"], kwargs["timezone"]), ("1,16", 3, 23, "Asia/Kolkata"))
         self.assertTrue(kwargs["coalesce"])
         self.assertEqual(kwargs["max_instances"], 1)
         self.assertGreaterEqual(kwargs["misfire_grace_time"], 6 * 3600)

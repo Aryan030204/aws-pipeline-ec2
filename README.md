@@ -212,21 +212,21 @@ The trigger spawns `python -m workers.run <name>` as a child process of the pipe
 
 ## Data purge worker
 
-A monthly worker (`workers/data_purge_worker.py`, logic in `pipeline/data_purge.py`) that keeps the live databases from growing without bound: it **archives** rows older than the retention cutoff to S3 as CSV, **verifies** the archive, and only then (and only when explicitly allowed) **deletes** them in batches. The archive is the historical backup. **Deploying it does nothing destructive** - it ships disabled.
+A worker that runs on the 1st and 16th of every month (`workers/data_purge_worker.py`, logic in `pipeline/data_purge.py`) that keeps the live databases from growing without bound: it **archives** rows older than the retention cutoff to S3 as CSV, **verifies** the archive, and only then (and only when explicitly allowed) **deletes** them in batches. The archive is the historical backup. **Deploying it does nothing destructive** - it ships disabled.
 
 ### Retention rule and cutoff
 
-Keep the most recent 6 calendar months. `cutoff = first day of the run's month (IST) - 6 calendar months` (calendar-month arithmetic, never "180 days"); a row is eligible when `date_column < cutoff`, strictly.
+Keep the most recent **200 days** (`DATA_PURGE_RETENTION_DAYS`, default `200`). `cutoff = the run's date (IST) - 200 days`; a row is eligible when `date_column < cutoff`, strictly.
 
 ```text
-Run:     2026-10-01
-Cutoff:  2026-04-01
-Archive: s3://<bucket>/<prefix>/2026-10/<brand>/<table>.csv
-Purged:  all rows where the table's date column < 2026-04-01   (March 2026 and earlier)
-Kept:    2026-04-01 and later
+Run:     2026-11-16
+Cutoff:  2026-04-30
+Archive: s3://<bucket>/<prefix>/2026-11-16/<brand>/<table>.csv
+Purged:  all rows where the table's date column < 2026-04-30   (29 April 2026 and earlier)
+Kept:    2026-04-30 and later
 ```
 
-2026-11-01 -> 2026-05-01; 2026-01-01 -> 2025-07-01. Any day of the month gives the same cutoff, so a late or repeated run is identical. `raw_mongo_events` is purged by `created_at_ist` (a naive DATETIME that already holds IST wall-clock time), so its cutoff is simply `2026-04-01 00:00:00`. For columns stored in UTC (the legacy `mongo_events_summary`) the cutoff instant is 00:00 of the cutoff date **in the brand's timezone** converted to UTC (IST: `2026-03-31 18:30:00`).
+2026-11-01 -> 2026-04-15; 2026-10-18 -> 2026-04-01. Any time of the same IST day gives the same cutoff, so a late or repeated run on that day is identical. Brands are selected with `PURGE_BRAND_IDS` (below). `raw_mongo_events` is purged by `created_at_ist` (a naive DATETIME that already holds IST wall-clock time), so its cutoff is simply `<cutoff date> 00:00:00`. For columns stored in UTC (the legacy `mongo_events_summary`) the cutoff instant is 00:00 of the cutoff date **in the brand's timezone** converted to UTC (IST, cutoff 2026-04-30: `2026-04-29 18:30:00`).
 
 ### Tables and date columns
 
@@ -245,22 +245,27 @@ A table with **no** configured date column is never touched (`SKIPPED_AMBIGUOUS`
 
 ### S3 archive structure
 
-Deterministic keys, one isolated prefix per purge month, one folder per brand (every brand database has the same table names):
+Deterministic keys, one isolated prefix per **run date** (a run happens about every 15 days, so two runs can fall in the same month and have different cutoffs), one folder per brand (every brand database has the same table names):
 
 ```text
-<prefix>/2026-10/<brand>/shopify_orders.csv
-<prefix>/2026-10/<brand>/shopify_orders.manifest.json        <- written last; the only proof of a complete archive
-<prefix>/2026-10/<brand>/shopify_orders.purge-complete.json  <- written after the delete finished (reporting only)
+<prefix>/2026-11-16/<brand>/shopify_orders.csv
+<prefix>/2026-11-16/<brand>/shopify_orders.manifest.json        <- written last; the only proof of a complete archive
+<prefix>/2026-11-16/<brand>/shopify_orders.purge-complete.json  <- written after the delete finished (reporting only)
 ...
 ```
 
-The CSV has a header and **every column** of the table (read from `information_schema`, not hand-listed), UTF-8, streamed straight to S3 (multipart, no temp file, bounded memory). **NULL is written as `\N`**; an empty string stays empty; a literal string that starts with a backslash gets one extra backslash, so a field that is exactly `\N` is always NULL. The manifest records table, brand, month, cutoff, date column, row count, byte size, sha256, min/max date, column list and key. The sha256 is also stored as an S3 object tag. Encryption: the bucket's default encryption is used (optional `DATA_PURGE_S3_SSE` / `DATA_PURGE_S3_KMS_KEY_ID`); credentials come only from the default AWS chain (instance role) - none are in code.
+The CSV has a header and **every column** of the table (read from `information_schema`, not hand-listed), UTF-8, streamed straight to S3 (multipart, no temp file, bounded memory). **NULL is written as `\N`**; an empty string stays empty; a literal string that starts with a backslash gets one extra backslash, so a field that is exactly `\N` is always NULL. The manifest (schema v2) records table, brand, run date, cutoff, date column, row count, byte size, sha256, min/max date, column list and key. The sha256 is also stored as an S3 object tag. Encryption: the bucket's default encryption is used (optional `DATA_PURGE_S3_SSE` / `DATA_PURGE_S3_KMS_KEY_ID`); credentials come only from the default AWS chain (instance role) - none are in code.
 
 ### Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `DATA_PURGE_ENABLED` | `false` | `false` -> the worker does nothing destructive |
+| `DATA_PURGE_RETENTION_DAYS` | `200` | rows older than (run date - this many days) are eligible (1-3650) |
+| `PURGE_BRAND_IDS` | empty = all brands | comma-separated **brand index numbers** (e.g. `1,2,5`) the purge runs for. Anything that is not a positive integer makes the worker refuse to run; if the list matches no active brand nothing runs (it never falls back to all brands); `--brand-id` / the trigger endpoint can only narrow it further |
+| `PURGE_LOG_SHEET_SWITCH` | `true` | `false` disables the Google Sheet run log (below) |
+| `PURGE_LOG_SHEET_ID` | `PIPELINE_METRICS_SHEET_ID` | spreadsheet for the run log |
+| `PURGE_LOG_SHEET_TAB` | `Data Purge Logs` | tab name |
 | `DATA_PURGE_DRY_RUN` | `false` | `true` -> **read-only** report; takes precedence over everything; runs even when disabled; no S3 writes, no deletes |
 | `DATA_PURGE_ARCHIVE_ONLY` | `true` | destructive only when **explicitly** `false` |
 | `PURGE_TEST` | `false` | `true` = **export to S3 but never delete**: a hard override that caps any enabled run at archive-only, whatever `ARCHIVE_ONLY` / `DATA_PURGE_DELETE_TABLES` say. It does not enable a disabled worker (`DATA_PURGE_ENABLED=true` and a bucket are still needed) and does not change dry-run |
@@ -286,13 +291,25 @@ The CSV has a header and **every column** of the table (read from `information_s
 
 **Database load.** The purge runs each table in an autocommit session (no long-lived InnoDB read snapshot while a multi-GB export streams, and the post-export recount sees current data), resets autocommit when it returns the connection to the pool, and throttles the export with `DATA_PURGE_EXPORT_SLEEP_S`. If EBS balance is a concern, leave `DATA_PURGE_ENABLED=false` between planned runs.
 
-`PURGE_TEST=true` is the safe way to test the export end to end (it also triggers one run right after each container restart/rebuild, so just redeploy to test): the CSV and manifest are written and verified, no `DELETE` is ever issued, and the summary says so. Archive keys are deterministic per month, so a second test run in the same month reuses the verified archive instead of exporting again (and, when the run cannot delete the table anyway, without opening a database connection at all: the manifest and CSV size are verified in S3 only, so a redeploy with `PURGE_TEST=true` costs almost no database I/O after the first pass) - to re-test an export, remove that month's objects from S3 or run with a different `--as-of` month. Turning `PURGE_TEST` off later in the same month reuses the archive and (if mode and allowlist permit) deletes.
+`PURGE_TEST=true` is the safe way to test the export end to end (it also triggers one run right after each container restart/rebuild, so just redeploy to test): the CSV and manifest are written and verified, no `DELETE` is ever issued, and the summary says so. Archive keys are deterministic per run date, so a second test run on the same (IST) day reuses the verified archive instead of exporting again (and, when the run cannot delete the table anyway, without opening a database connection at all: the manifest and CSV size are verified in S3 only, so a redeploy with `PURGE_TEST=true` costs almost no database I/O after the first pass) - to re-test an export, remove that day's objects from S3 or run with a different `--as-of` date. Turning `PURGE_TEST` off later the same day reuses the archive and (if mode and allowlist permit) deletes. **Cost warning:** the folder (and the cutoff) change every day, so a `PURGE_TEST=true` startup pass on the first deploy of a new day exports again; and in archive-only / `PURGE_TEST` mode nothing is deleted, so every run re-exports *everything* older than its cutoff (duplicates across run-date folders and the same multi-GB read each time). Only `FULL` mode makes each run export just the ~15-day delta. Turn `PURGE_TEST` off after the export test.
 
 Booleans accept only `true`/`false`; anything else (or an invalid number, an unknown table, a missing bucket, `ARCHIVE_ONLY=false` without a delete allowlist) makes the worker **refuse to run**.
 
+### Google Sheet run log
+
+Every run (including dry runs and `PURGE_TEST` passes; not a disabled worker) appends rows to the tab `Data Purge Logs` of the spreadsheet in `PURGE_LOG_SHEET_ID` (default: the pipeline metrics sheet `PIPELINE_METRICS_SHEET_ID`; same `GOOGLE_SHEETS_SERVICE_ACCOUNT_*` credentials, which the purge container reads from the shared `.env`). The tab is created with a header on first use. One `row_type` column separates:
+
+- `TABLE` - one row per brand and table: status, reason, eligible / archived / deleted rows, CSV bytes, table size and approximate row count **before and after**, `data_free`, start/finish time, duration, error.
+- `BRAND` - one row per brand: per-brand duration, tables ok/failed/skipped, sums, `last_run_ist` (this run) and `previous_run_ist` (read from the tab's earlier rows; blank the first time).
+- `RUN` - one `ALL BRANDS` row: total duration, brands/tables, totals, overall success, the brand filter and mode in `reason`, and all errors in `error`.
+
+A run that cannot start (invalid configuration, S3 client failure, no brand matching `PURGE_BRAND_IDS`) writes a single failed `RUN` row. The write happens once at the end of the run and is best effort: a Sheets outage, bad credentials or a quota error is logged and never fails the purge. Only counts, sizes, statuses and the same sanitised error text as the logs are written - never row data.
+
+Size columns come from `information_schema` (approximate; the purge reads them fresh instead of MySQL's 24 h cache). **InnoDB does not shrink a table after `DELETE`**, so `size_after_mb` normally stays about equal to `size_before_mb`; `rows_after_approx` and `data_free_after_mb` are the signals that rows were removed. "After" is only re-read when the run deleted rows (otherwise it equals "before"). Tables served by the S3-only fast path never touch the database, so their size columns are blank.
+
 ### Schedule
 
-The 1st of every month at **03:23 IST** (`Asia/Kolkata`, like the other workers; the purge month is the IST month). `coalesce`, `max_instances=1`, a 24 h misfire grace so a container that was down at the trigger still runs once after it starts. Nothing runs at startup - **except with `PURGE_TEST=true`**, which runs one export-only pass immediately on every container (re)start/rebuild (before the scheduler starts; it can never delete, still needs `DATA_PURGE_ENABLED=true` and a bucket, and a failure is logged without stopping the container). The monthly schedule stays active either way.
+The **1st and 16th** of every month at **03:23 IST** (`Asia/Kolkata`, like the other workers; the run date is the IST date; gaps are 15-16 days, 13-14 around month end; calendar-anchored, so a redeploy does not shift it). `coalesce`, `max_instances=1`, a 24 h misfire grace so a container that was down at the trigger still runs once after it starts. Nothing runs at startup - **except with `PURGE_TEST=true`**, which runs one export-only pass immediately on every container (re)start/rebuild (before the scheduler starts; it can never delete, still needs `DATA_PURGE_ENABLED=true` and a bucket, and a failure is logged without stopping the container). The 1st/16th schedule stays active either way.
 
 ### Dry run and manual execution
 
@@ -317,7 +334,7 @@ Per table, in order: validate config -> validate table/schema/index/`EXPLAIN` ->
 
 - Export, upload, verification or manifest failure -> **nothing is deleted**; the table is `FAILED` and the next run retries.
 - Crash after the upload but before the manifest -> the CSV is reused only if it is positively confirmed complete (completion tags, size, row count, cutoff and header all match); otherwise it is deterministically replaced. A CSV without a manifest is never trusted for deletion.
-- A manifest that exists is authoritative and **never overwritten**; if it does not match this table/brand/month/cutoff/columns, the table fails for manual review.
+- A manifest that exists is authoritative and **never overwritten**; if it does not match this table/brand/run date/cutoff/columns, the table fails for manual review.
 - Crash or error mid-delete -> the archive stays; the next run finds the manifest, re-validates it and deletes the remainder. Deletes are capped at the archived row count, and refused if more rows are eligible than were archived.
 - It refuses to delete when that would empty the table (ingestion watermarks need a row).
 - Statuses: `SUCCESS`, `ARCHIVED_ONLY`, `FAILED`, `NO_DATA`, `DRY_RUN`, `SKIPPED_*` (with the reason). One table or brand failing never stops the others; the process exits non-zero if any table failed. Zero eligible rows -> no S3 objects, no `DELETE`.

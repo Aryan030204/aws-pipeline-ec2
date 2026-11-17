@@ -1,9 +1,9 @@
 """
 Monthly data purge: archive old rows to S3, verify the archive, and only then delete them.
 
-Retention rule: keep the most recent 6 calendar months. The cutoff is
-    first day of the run's month (IST)  -  6 calendar months
-(2026-10-01 -> 2026-04-01) and a row is eligible when `date_column < cutoff`, strictly.
+Retention rule: keep the most recent 200 days (DATA_PURGE_RETENTION_DAYS). The cutoff is
+    the run's date (IST)  -  200 days
+(2026-11-16 -> 2026-04-30) and a row is eligible when `date_column < cutoff`, strictly.
 
 SAFETY MODEL (the point of this module):
   * Nothing is deleted unless the mode allows it AND the table is in DATA_PURGE_DELETE_TABLES AND a
@@ -33,7 +33,7 @@ import logging
 import os
 import re
 import time
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from decimal import Decimal
@@ -45,10 +45,10 @@ from pipeline.session_utils import autocommit_session
 
 logger = logging.getLogger("data_purge")
 
-RETENTION_MONTHS = 6
+RETENTION_DAYS = 200
 SCHEDULER_TZ = ZoneInfo("Asia/Kolkata")
 WORKER_VERSION = "1"
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
 NULL_TOKEN = "\\N"  # a CSV field that is exactly \N means SQL NULL
 MIN_PLAUSIBLE_DATE = date(2000, 1, 1)
 CSV_CHUNK_BYTES = 256 * 1024
@@ -104,6 +104,8 @@ class PurgeConfig:
     sleep_between_batches_s: float
     max_window_rows: int
     export_sleep_s: float  # pause between export pages / day windows (throttles read I/O); 0 = none
+    retention_days: int  # rows older than (run date - retention_days) are eligible
+    purge_brand_indices: Optional[Tuple[int, ...]]  # PURGE_BRAND_IDS: brand indices to purge; None = all brands
     sse: Optional[str]
     kms_key_id: Optional[str]
 
@@ -144,6 +146,26 @@ def _parse_float(env: Mapping[str, str], name: str, default: float, low: float, 
     if not low <= value <= high:
         raise ConfigError(f"{name} must be between {low} and {high}, got {value}")
     return value
+
+
+def _parse_brand_indices(env: Mapping[str, str]) -> Optional[Tuple[int, ...]]:
+    """PURGE_BRAND_IDS: comma-separated brand index numbers. Unset/empty = every brand (None). Anything that is
+    not a positive integer is a ConfigError - a typo must never silently widen the purge to other brands."""
+    raw = (env.get("PURGE_BRAND_IDS") or "").strip()
+    if not raw:
+        return None
+    indices: List[int] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if not token.isdigit() or int(token) <= 0:
+            raise ConfigError(f"PURGE_BRAND_IDS must be comma-separated positive brand index numbers, got {token!r}")
+        if int(token) not in indices:
+            indices.append(int(token))
+    if not indices:
+        raise ConfigError("PURGE_BRAND_IDS is set but contains no brand index")
+    return tuple(indices)
 
 
 def _parse_tables(
@@ -230,13 +252,15 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> PurgeConfig:
         sleep_between_batches_s=_parse_float(env, "DATA_PURGE_SLEEP_BETWEEN_BATCHES_S", 1.0, 0.0, 60.0),
         max_window_rows=_parse_int(env, "DATA_PURGE_MAX_WINDOW_ROWS", 200_000, 1000, 5_000_000),
         export_sleep_s=_parse_float(env, "DATA_PURGE_EXPORT_SLEEP_S", 0.1, 0.0, 60.0),
+        retention_days=_parse_int(env, "DATA_PURGE_RETENTION_DAYS", RETENTION_DAYS, 1, 3650),
+        purge_brand_indices=_parse_brand_indices(env),
         sse=sse,
         kms_key_id=kms_key_id,
     )
 
 
 # --------------------------------------------------------------------------------------
-# Cutoff (calendar-month arithmetic)
+# Cutoff (run date minus N days)
 # --------------------------------------------------------------------------------------
 def _as_ist(run_dt: datetime) -> datetime:
     if run_dt.tzinfo is None:
@@ -244,16 +268,16 @@ def _as_ist(run_dt: datetime) -> datetime:
     return run_dt.astimezone(SCHEDULER_TZ)
 
 
-def compute_cutoff(run_dt: datetime, months: int = RETENTION_MONTHS) -> date:
-    """First day of the run's (IST) month minus `months` calendar months. Never '- 180 days'."""
-    local = _as_ist(run_dt)
-    month_index = local.year * 12 + (local.month - 1) - months
-    return date(month_index // 12, month_index % 12 + 1, 1)
+def compute_cutoff(run_dt: datetime, days: int = RETENTION_DAYS) -> date:
+    """The run's IST calendar date minus `days` days (2026-11-16 - 200 = 2026-04-30). Any time of the same IST
+    day gives the same cutoff, so a retry on the same day is idempotent."""
+    return _as_ist(run_dt).date() - timedelta(days=days)
 
 
-def archive_month_label(run_dt: datetime) -> str:
-    local = _as_ist(run_dt)
-    return f"{local.year:04d}-{local.month:02d}"
+def archive_run_label(run_dt: datetime) -> str:
+    """S3 folder for this run: the IST run date (YYYY-MM-DD). One folder per run, because with a ~15-day cadence
+    two runs fall in the same month and their cutoffs (and manifests, which are never overwritten) differ."""
+    return _as_ist(run_dt).date().isoformat()
 
 
 class DateKind(Enum):
@@ -898,8 +922,8 @@ def brand_slug(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "_", name.strip()).strip("_") or "brand"
 
 
-def archive_keys(cfg: PurgeConfig, month: str, brand: str, table: str) -> Tuple[str, str, str]:
-    base = f"{cfg.prefix}/{month}/{brand_slug(brand)}/{table}"
+def archive_keys(cfg: PurgeConfig, run_label: str, brand: str, table: str) -> Tuple[str, str, str]:
+    base = f"{cfg.prefix}/{run_label}/{brand_slug(brand)}/{table}"
     return f"{base}.csv", f"{base}.manifest.json", f"{base}.purge-complete.json"
 
 
@@ -909,7 +933,7 @@ def build_manifest(run: "RunContext", brand: "BrandContext", spec: TableSpec, v:
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "table": spec.table,
         "brand": brand.name,
-        "run_month": run.month,
+        "run_date": run.run_label,
         "cutoff": run.cutoff.isoformat(),
         "date_column": spec.date_column,
         "date_kind": spec.date_kind.value,
@@ -933,7 +957,7 @@ def validate_manifest(manifest: Mapping[str, Any], run: "RunContext", brand: "Br
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "table": spec.table,
         "brand": brand.name,
-        "run_month": run.month,
+        "run_date": run.run_label,
         "cutoff": run.cutoff.isoformat(),
         "date_column": spec.date_column,
         "date_kind": spec.date_kind.value,
@@ -992,9 +1016,11 @@ class RunContext:
     cfg: PurgeConfig
     run_dt: datetime
     cutoff: date
-    month: str
+    run_label: str  # archive folder = IST run date, YYYY-MM-DD
     store: Optional[Any]
     env: Mapping[str, str] = field(default_factory=dict)
+    # filled by run_purge: brand name -> {index, started_at, finished_at, duration_s}
+    brand_timings: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -1012,6 +1038,14 @@ class TableResult:
     s3_key: Optional[str] = None
     duration_s: float = 0.0
     error: bool = False
+    # table size/rows from information_schema (approximate); None = not read (e.g. S3-only fast path)
+    size_before_bytes: Optional[int] = None
+    size_after_bytes: Optional[int] = None
+    rows_before: Optional[int] = None
+    rows_after: Optional[int] = None
+    data_free_after: Optional[int] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
     details: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -1022,7 +1056,7 @@ def _lock_name(db: Any, table: str) -> str:
 def process_table(run: RunContext, brand: BrandContext, spec: TableSpec) -> TableResult:
     """Never raises: every failure becomes a TableResult so other tables/brands continue."""
     started = time.monotonic()
-    result = TableResult(brand=brand.name, table=spec.table)
+    result = TableResult(brand=brand.name, table=spec.table, started_at=datetime.now(SCHEDULER_TZ))
     logger.info("table_started brand=%s table=%s mode=%s cutoff=%s", brand.name, spec.table, run.cfg.mode.value, run.cutoff)
     try:
         _process_table(run, brand, spec, result)
@@ -1037,6 +1071,7 @@ def process_table(run: RunContext, brand: BrandContext, spec: TableSpec) -> Tabl
             result.status, result.reason = Status.FAILED, _safe_error(exc)
         logger.error("table_failed brand=%s table=%s status=%s reason=%s", brand.name, spec.table, result.status, result.reason)
     result.duration_s = time.monotonic() - started
+    result.finished_at = datetime.now(SCHEDULER_TZ)
     logger.info(
         "table_completed brand=%s table=%s status=%s eligible=%s exported=%s deleted=%s duration_s=%.1f reason=%s",
         brand.name, spec.table, result.status, result.eligible, result.exported, result.deleted,
@@ -1057,7 +1092,7 @@ def _process_table(run: RunContext, brand: BrandContext, spec: TableSpec, result
         return
     if _archive_already_complete(run, brand, spec, result):
         return
-    with brand.cursor_ctx() as (cursor, connection), autocommit_session(cursor):
+    with brand.cursor_ctx() as (cursor, connection), autocommit_session(cursor), _fresh_table_stats(cursor):
         # autocommit: nothing here needs a multi-statement transaction (deletes are per-batch and idempotent,
         # the lock is session-scoped). Without it every read below (validation, COUNT, the whole export) kept
         # ONE InnoDB read view open for the entire run: undo history growth and purge lag on a busy server.
@@ -1077,6 +1112,61 @@ def _process_table(run: RunContext, brand: BrandContext, spec: TableSpec, result
                 pass
 
 
+@contextmanager
+def _fresh_table_stats(cursor):
+    """MySQL 8 caches information_schema table statistics for 24 h (information_schema_stats_expiry), so the
+    size/row figures reported before and after a purge would be identical and stale. Read them fresh for this
+    session and put the session variable back before the connection returns to the pool."""
+    active = False
+    try:
+        cursor.execute("SET SESSION information_schema_stats_expiry=0")
+        active = True
+    except Exception as exc:
+        logger.warning("could not refresh information_schema stats (sizes may be up to 24h stale): %s", _safe_error(exc))
+    try:
+        yield
+    finally:
+        if active:
+            try:
+                cursor.execute("SET SESSION information_schema_stats_expiry=DEFAULT")
+            except Exception:
+                pass
+
+
+def _read_table_stats(cursor, table: str) -> Optional[Dict[str, Optional[int]]]:
+    cursor.execute(
+        "SELECT table_rows AS table_rows, data_length AS data_length, index_length AS index_length, "
+        "data_free AS data_free FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = %s",
+        (table,),
+    )
+    rows = _fetch_dicts(cursor)
+    if not rows:
+        return None
+    info = rows[0]
+
+    def num(key):
+        value = info.get(key)
+        return int(value) if value is not None else None
+
+    data, index = num("data_length"), num("index_length")
+    return {
+        "rows": num("table_rows"),
+        "size": (data or 0) + (index or 0) if data is not None or index is not None else None,
+        "data_free": num("data_free"),
+    }
+
+
+def _record_after_stats(cursor, spec: TableSpec, result: "TableResult") -> None:
+    """Best effort: a stats read failure must never turn a verified purge into a failure."""
+    try:
+        stats = _read_table_stats(cursor, spec.table)
+    except Exception as exc:
+        logger.warning("could not read post-purge table stats for %s: %s", spec.table, _safe_error(exc))
+        return
+    if stats:
+        result.rows_after, result.size_after_bytes, result.data_free_after = stats["rows"], stats["size"], stats["data_free"]
+
+
 def _archive_already_complete(run: RunContext, brand: BrandContext, spec: TableSpec, result: TableResult) -> bool:
     """S3-only fast path: when this run cannot delete the table anyway and a valid manifest + CSV already exist,
     there is nothing to do, so no DB connection is opened. Without this every container start (a deploy, or
@@ -1087,7 +1177,7 @@ def _archive_already_complete(run: RunContext, brand: BrandContext, spec: TableS
         return False
     if cfg.mode is Mode.FULL and not cfg.purge_test and spec.table in cfg.delete_tables:
         return False  # may need to delete: the DB path must run (eligible rows, conflicts, caps)
-    csv_key, manifest_key, _complete_key = archive_keys(cfg, run.month, brand.name, spec.table)
+    csv_key, manifest_key, _complete_key = archive_keys(cfg, run.run_label, brand.name, spec.table)
     manifest = run.store.get_json(manifest_key)
     if manifest is None:
         return False
@@ -1145,6 +1235,7 @@ def _process_locked(run, brand, spec, result, cursor, connection) -> None:
         export_plan=v.explain_export or None, delete_plan=v.explain_delete or None,
         table_rows_approx=v.table_rows, size_bytes=v.size_bytes,
     )
+    result.size_before_bytes, result.rows_before = v.size_bytes, v.table_rows
     if not v.ok:
         result.status, result.reason = v.status, v.reason
         result.details["archiveable"], result.details["archiveable_reason"] = False, v.reason
@@ -1167,7 +1258,7 @@ def _process_locked(run, brand, spec, result, cursor, connection) -> None:
 
     eligible = count_eligible(cursor, spec, cutoff_value)
     result.eligible = eligible
-    csv_key, manifest_key, complete_key = archive_keys(cfg, run.month, brand.name, spec.table)
+    csv_key, manifest_key, complete_key = archive_keys(cfg, run.run_label, brand.name, spec.table)
     result.s3_key = csv_key
     store = run.store
 
@@ -1343,6 +1434,8 @@ def _maybe_delete(run, brand, spec, result, cursor, connection, manifest, eligib
 
     deleted = delete_in_batches(cursor, connection, spec, cutoff_value, cap, cfg, brand.name)
     result.deleted = deleted
+    if deleted:
+        _record_after_stats(cursor, spec, result)
     remaining = _scalar(
         cursor, f"SELECT 1 AS n FROM {q(spec.table)} WHERE {q(spec.date_column)} < %s LIMIT 1", (cutoff_value,)
     )
@@ -1353,7 +1446,7 @@ def _maybe_delete(run, brand, spec, result, cursor, connection, manifest, eligib
     result.status, result.reason = Status.SUCCESS, "archived, verified and deleted"
     try:
         run.store.put_json_if_absent(complete_key, {
-            "table": spec.table, "brand": brand.name, "run_month": run.month, "cutoff": run.cutoff.isoformat(),
+            "table": spec.table, "brand": brand.name, "run_date": run.run_label, "cutoff": run.cutoff.isoformat(),
             "rows_deleted": deleted, "completed_at": datetime.now(timezone.utc).isoformat(),
         })
     except Exception as exc:
@@ -1409,13 +1502,20 @@ def run_purge(brands: Sequence[BrandContext], run: RunContext) -> List[TableResu
     """Brands and tables strictly sequentially; one failure never stops the others."""
     results: List[TableResult] = []
     logger.info(
-        "data_purge_started mode=%s purge_test=%s run=%s cutoff=%s archive_month=%s tz=%s tables=%s delete_tables=%s",
-        run.cfg.mode.value, run.cfg.purge_test, run.run_dt.isoformat(), run.cutoff, run.month, SCHEDULER_TZ.key,
+        "data_purge_started mode=%s purge_test=%s run=%s cutoff=%s archive_run=%s retention_days=%s brands=%s tz=%s tables=%s delete_tables=%s",
+        run.cfg.mode.value, run.cfg.purge_test, run.run_dt.isoformat(), run.cutoff, run.run_label,
+        run.cfg.retention_days, ",".join(str(i) for i in run.cfg.purge_brand_indices) if run.cfg.purge_brand_indices else "all",
+        SCHEDULER_TZ.key,
         ",".join(run.cfg.tables), ",".join(run.cfg.delete_tables) or "-",
     )
     for brand in brands:
+        brand_started, brand_clock = datetime.now(SCHEDULER_TZ), time.monotonic()
         for spec in PURGE_TABLES:
             results.append(process_table(run, brand, spec))
+        run.brand_timings[brand.name] = {
+            "index": brand.index, "started_at": brand_started, "finished_at": datetime.now(SCHEDULER_TZ),
+            "duration_s": time.monotonic() - brand_clock,
+        }
     return results
 
 
@@ -1434,13 +1534,13 @@ def _human_bytes(n: int) -> str:
 
 def format_summary(results: Sequence[TableResult], run: RunContext, duration_s: float) -> str:
     cfg = run.cfg
-    where = f"s3://{cfg.bucket}/{cfg.prefix}/{run.month}/" if cfg.bucket else "(no bucket - read-only)"
+    where = f"s3://{cfg.bucket}/{cfg.prefix}/{run.run_label}/" if cfg.bucket else "(no bucket - read-only)"
     lines = [
         "DATA PURGE SUMMARY",
         "",
         f"Mode: {cfg.mode.value}" + ("  (PURGE_TEST=true: export only, nothing is deleted)" if cfg.purge_test else ""),
         f"Run date: {_as_ist(run.run_dt).date()} (IST)",
-        f"Cutoff: {run.cutoff}  (rows with date < cutoff)",
+        f"Cutoff: {run.cutoff}  (rows with date < cutoff; retention {cfg.retention_days} days)",
         f"Archive: {where}",
     ]
     total_archived = total_deleted = total_bytes = 0
