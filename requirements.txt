@@ -16,4 +16,3 @@ python-dotenv
 pymongo
 gspread
 google-auth
-boto3>=1.35
