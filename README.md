@@ -299,7 +299,7 @@ Booleans accept only `true`/`false`; anything else (or an invalid number, an unk
 
 Every run (including dry runs and `PURGE_TEST` passes; not a disabled worker) appends rows to the tab `Data Purge Logs` of the spreadsheet in `PURGE_LOG_SHEET_ID` (default: the pipeline metrics sheet `PIPELINE_METRICS_SHEET_ID`; same `GOOGLE_SHEETS_SERVICE_ACCOUNT_*` credentials, which the purge container reads from the shared `.env`). The tab is created with a header on first use. One `row_type` column separates:
 
-- `TABLE` - one row per brand and table: status, reason, eligible / archived / deleted rows, CSV bytes, table size and approximate row count **before and after**, `data_free`, start/finish time, duration, error.
+- `TABLE` - one row per brand and table: status, a plain-English `reason` (at most 50 words, e.g. "Skipped: this table does not exist in the brand's database..." or "Archived 7,034 rows (3.8 MB) to S3 and verified it. Nothing deleted because PURGE_TEST=true."), eligible / archived / deleted rows, CSV bytes, table size and approximate row count **before and after**, `data_free`, start/finish time, duration, error.
 - `BRAND` - one row per brand: per-brand duration, tables ok/failed/skipped, sums, `last_run_ist` (this run) and `previous_run_ist` (read from the tab's earlier rows; blank the first time).
 - `RUN` - one `ALL BRANDS` row: total duration, brands/tables, totals, overall success, the brand filter and mode in `reason`, and all errors in `error`.
 

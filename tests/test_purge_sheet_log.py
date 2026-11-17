@@ -96,14 +96,17 @@ class BuildRowsTests(unittest.TestCase):
     def test_brand_rows_have_duration_counts_sums_and_last_and_previous_run(self):
         pts, bbb = self.by_type("BRAND")
         self.assertEqual((pts[COL["brand"]], pts[COL["status"]]), ("pts", "FAILED"))
-        self.assertEqual(pts[COL["reason"]], "tables=2 ok=1 failed=1 skipped=0")
+        self.assertIn("1 of 2 tables processed OK (archived 100 rows, deleted 100)", pts[COL["reason"]])
+        self.assertIn("1 FAILED: raw_mongo_events", pts[COL["reason"]])
         self.assertEqual(pts[COL["duration_s"]], 420.0)
         self.assertEqual((pts[COL["archived_rows"]], pts[COL["deleted_rows"]], pts[COL["csv_bytes"]]), (100, 100, 2_000_000))
         self.assertEqual((pts[COL["size_before_mb"]], pts[COL["size_after_mb"]]), (15.0, 15.0))
         self.assertEqual(pts[COL["last_run_ist"]], "2026-11-16 03:30:00")
         self.assertEqual(pts[COL["previous_run_ist"]], "2026-11-01 03:40:11")
         self.assertIn("raw_mongo_events: RuntimeError: S3 is down", pts[COL["error"]])
-        self.assertEqual((bbb[COL["status"]], bbb[COL["reason"]]), ("OK", "tables=2 ok=1 failed=0 skipped=1"))
+        self.assertEqual(bbb[COL["status"]], "OK")
+        self.assertIn("1 of 2 tables processed OK", bbb[COL["reason"]])
+        self.assertIn("1 skipped (1 not selected)", bbb[COL["reason"]])
         self.assertEqual(bbb[COL["previous_run_ist"]], "")  # first time this brand is logged
         self.assertEqual(bbb[COL["duration_s"]], 60.0)
 
@@ -113,7 +116,9 @@ class BuildRowsTests(unittest.TestCase):
         self.assertEqual(run_row[COL["status"]], "FAILED")
         self.assertEqual(run_row[COL["duration_s"]], 500.0)
         self.assertEqual((run_row[COL["archived_rows"]], run_row[COL["deleted_rows"]]), (107, 100))
-        self.assertIn("brands=2 tables=4 failed=1", run_row[COL["reason"]])
+        self.assertIn("Run FAILED", run_row[COL["reason"]])
+        self.assertIn("2 brand(s), 4 tables", run_row[COL["reason"]])
+        self.assertIn("1 failed", run_row[COL["reason"]])
         self.assertIn("all brands", run_row[COL["reason"]])
         self.assertIn("pts/raw_mongo_events: RuntimeError: S3 is down", run_row[COL["error"]])
         self.assertEqual(run_row[COL["mode"]], "ARCHIVE_ONLY")
@@ -133,7 +138,7 @@ class BuildRowsTests(unittest.TestCase):
         rows = psl.build_rows([long], self.run, 1.0)
         for row in rows:
             self.assertLessEqual(len(row[COL["error"]]), psl.ERROR_MAX_CHARS)
-            self.assertLessEqual(len(row[COL["reason"]]), psl.ERROR_MAX_CHARS + 60)
+            self.assertLessEqual(len(row[COL["reason"]]), psl.ERROR_MAX_CHARS)
 
     def test_no_database_values_can_reach_the_sheet(self):
         # only counts/sizes/statuses/sanitised errors are ever passed in; row payloads live in TableResult.details
@@ -147,7 +152,9 @@ class BuildRowsTests(unittest.TestCase):
     def test_error_row_for_a_run_that_never_started(self):
         row = psl.build_error_row("ConfigError: bad", RUN_DT, 0.4, None, "invalid configuration")
         self.assertEqual(len(row), len(psl.HEADER_ROW))
-        self.assertEqual((row[COL["row_type"]], row[COL["status"]], row[COL["reason"]]), ("RUN", "FAILED", "invalid configuration"))
+        self.assertEqual((row[COL["row_type"]], row[COL["status"]]), ("RUN", "FAILED"))
+        self.assertIn("did not start or complete (invalid configuration)", row[COL["reason"]])
+        self.assertIn("no table was archived or deleted", row[COL["reason"]])
         self.assertEqual(row[COL["error"]], "ConfigError: bad")
         self.assertEqual(row[COL["run_date"]], "2026-11-16")
 
@@ -155,6 +162,65 @@ class BuildRowsTests(unittest.TestCase):
         rows = psl.build_rows([], self.run, 1.0)
         self.assertEqual([r[COL["row_type"]] for r in rows], ["RUN"])
         self.assertEqual(rows[0][COL["status"]], "OK")
+
+
+class DetailedStatusTests(unittest.TestCase):
+    """The reason column must say, in plain English and in at most 50 words, what happened and why."""
+
+    def _desc(self, status, reason="", **kw):
+        return psl.describe_table(result("pts", "t", status, reason=reason, **kw))
+
+    def test_every_status_gets_a_sentence_of_at_most_50_words(self):
+        statuses = [v for k, v in vars(dp.Status).items() if k.isupper()]
+        for status in statuses:
+            for reason in ("", "some detail " * 80):
+                with self.subTest(status=status, long=bool(reason)):
+                    text = self._desc(status, reason, exported=1234, archived=True, csv_bytes=5_000_000)
+                    self.assertTrue(text)
+                    self.assertLessEqual(len(text.split()), 51)  # 50 words (+ the "..." marker when cut)
+                    self.assertNotEqual(text, status)  # never just the bare status code
+
+    def test_skips_say_why(self):
+        self.assertIn("does not exist", self._desc(dp.Status.SKIPPED_MISSING, "table does not exist in this database"))
+        self.assertIn("not been confirmed", self._desc(dp.Status.SKIPPED_UNCONFIRMED, "schema not yet confirmed"))
+        plan = self._desc(dp.Status.SKIPPED_BAD_PLAN, "export plan rejected: plan needs a filesort")
+        self.assertIn("query plan", plan)
+        self.assertIn("filesort", plan)  # the specific cause is appended
+        self.assertIn("DATA_PURGE_TABLES", self._desc(dp.Status.SKIPPED, "not in DATA_PURGE_TABLES"))
+        self.assertIn("view", self._desc(dp.Status.SKIPPED_VIEW))
+
+    def test_archive_only_outcomes_explain_why_nothing_was_deleted(self):
+        kw = dict(exported=7034, archived=True, csv_bytes=3_983_379)
+        test = self._desc(dp.Status.ARCHIVED_ONLY, "PURGE_TEST=true: archive verified, nothing deleted", **kw)
+        self.assertIn("7,034 rows (3.8 MB)", test)
+        self.assertIn("PURGE_TEST=true", test)
+        self.assertIn("archive-only mode", self._desc(dp.Status.ARCHIVED_ONLY, "archive-only mode: archive verified", **kw))
+        self.assertIn("DATA_PURGE_DELETE_TABLES", self._desc(dp.Status.ARCHIVED_ONLY, "archive verified; table is not in DATA_PURGE_DELETE_TABLES", **kw))
+        self.assertIn("database was not queried", self._desc(dp.Status.ARCHIVED_ONLY, "archive already in S3 (manifest and CSV verified); database not touched", **kw))
+        self.assertIn("delete step failed", self._desc(dp.Status.ARCHIVED_ONLY, "deadlock", error=True, **kw))
+
+    def test_success_failure_and_no_data(self):
+        self.assertIn("deleted 40 rows", self._desc(dp.Status.SUCCESS, exported=40, archived=True, deleted=40, csv_bytes=1000))
+        self.assertIn("Already purged", self._desc(dp.Status.SUCCESS, exported=40, archived=True))
+        self.assertIn("no rows are older", self._desc(dp.Status.NO_DATA))
+        failed = self._desc(dp.Status.FAILED, "RuntimeError: S3 is down", error=True)
+        self.assertIn("S3 is down", failed)
+        self.assertIn("nothing is deleted without a verified archive", failed)
+
+    def test_brand_and_run_rows_are_plain_english_and_short(self):
+        rows = psl.build_rows(sample_results(), make_run(), 5.0)
+        for row in rows:
+            self.assertLessEqual(len(row[COL["reason"]].split()), 51)
+        bbb = next(r for r in rows if r[COL["row_type"]] == "BRAND" and r[COL["brand"]] == "bbb")
+        self.assertIn("1 skipped (1 not selected)", bbb[COL["reason"]])
+
+    def test_the_neulife_style_brand_summary_lists_each_skip_reason(self):
+        rs = [result("n", "a", dp.Status.ARCHIVED_ONLY, exported=5, archived=True),
+              result("n", "b", dp.Status.SKIPPED_MISSING), result("n", "c", dp.Status.SKIPPED_MISSING),
+              result("n", "d", dp.Status.SKIPPED_UNCONFIRMED), result("n", "e", dp.Status.SKIPPED_BAD_PLAN)]
+        text = psl.describe_brand(rs, [], [r for r in rs if r.status.startswith("SKIPPED")])
+        self.assertIn("1 of 5 tables processed OK", text)
+        self.assertIn("4 skipped (2 table missing, 1 schema unconfirmed, 1 unsafe query plan)", text)
 
 
 class FakeWorksheet:

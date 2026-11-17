@@ -78,6 +78,114 @@ def run_id_for(run_dt: datetime) -> str:
     return run_dt.astimezone(IST).strftime("%Y%m%d-%H%M%S")
 
 
+MAX_WORDS = 50
+
+
+def _limit_words(text: str, limit: int = MAX_WORDS) -> str:
+    words = str(text or "").split()
+    out = " ".join(words) if len(words) <= limit else " ".join(words[:limit]) + " ..."
+    return out if len(out) <= ERROR_MAX_CHARS else out[: ERROR_MAX_CHARS - 3] + "..."
+
+
+def _size_label(num_bytes: Optional[int]) -> str:
+    if not num_bytes:
+        return "0 MB"
+    mb = num_bytes / 1048576
+    return f"{mb:.1f} MB" if mb >= 0.1 else f"{num_bytes / 1024:.0f} KB"
+
+
+_SKIP_EXPLANATIONS = {
+    dp.Status.SKIPPED_MISSING: "Skipped: this table does not exist in the brand's database (the feature that creates it is not used for this brand).",
+    dp.Status.SKIPPED_VIEW: "Skipped: this is a view, not a real table, so it cannot be archived or purged.",
+    dp.Status.SKIPPED_TYPE_MISMATCH: "Skipped: the date column is missing or has an unexpected type, so the cutoff cannot be applied safely.",
+    dp.Status.SKIPPED_NO_INDEX: "Skipped: no index starts with the date column, so reading old rows would scan the whole table.",
+    dp.Status.SKIPPED_BAD_PLAN: "Skipped: MySQL's query plan for the export or delete is unsafe (e.g. filesort or full scan).",
+    dp.Status.SKIPPED_UNCONFIRMED: "Skipped: this table's live schema has not been confirmed yet; run a dry run, check it, then enable it.",
+    dp.Status.SKIPPED_AMBIGUOUS: "Skipped: no purge date column is configured for this table, so it is never touched.",
+    dp.Status.SKIPPED_CONFLICT: "Skipped: a conflicting write, backfill or env flag was detected on this table; retry on the next run.",
+    dp.Status.SKIPPED_LOCKED: "Skipped: another purge process holds the lock for this table; it will be retried next run.",
+}
+
+
+def describe_table(r: dp.TableResult) -> str:
+    """One plain-English sentence (<= 50 words) saying what happened to this table and why."""
+    reason = (r.reason or "").strip()
+    rows, size = f"{r.exported:,}", _size_label(r.csv_bytes)
+    if r.status == dp.Status.SUCCESS:
+        if r.deleted:
+            text = f"Archived {rows} rows ({size}) to S3, verified the archive, then deleted {r.deleted:,} rows older than the cutoff."
+        else:
+            text = f"Already purged earlier: the archive of {rows} rows is verified in S3 and no old rows remain."
+    elif r.status == dp.Status.ARCHIVED_ONLY:
+        if r.error:
+            text = f"Archived {rows} rows ({size}) to S3 and verified it, but the delete step failed: {reason}"
+        elif "database not touched" in reason:
+            text = f"Archive of {rows} rows ({size}) already exists in S3 and was verified; the database was not queried and nothing was deleted."
+        elif "PURGE_TEST" in reason:
+            text = f"Archived {rows} rows ({size}) to S3 and verified it. Nothing deleted because PURGE_TEST=true."
+        elif "archive-only mode" in reason:
+            text = f"Archived {rows} rows ({size}) to S3 and verified it. Nothing deleted because the worker is in archive-only mode."
+        elif "DATA_PURGE_DELETE_TABLES" in reason:
+            text = f"Archived {rows} rows ({size}) to S3 and verified it. Not deleted because this table is not in DATA_PURGE_DELETE_TABLES."
+        elif "empty the table" in reason:
+            text = f"Archived {rows} rows ({size}) to S3, but not deleted: every row is older than the cutoff and the table must keep at least one row."
+        else:
+            text = f"Archived {rows} rows ({size}) to S3 and verified it. {reason}"
+    elif r.status == dp.Status.NO_DATA:
+        text = "Nothing to do: no rows are older than the cutoff, so nothing was archived or deleted."
+    elif r.status == dp.Status.DRY_RUN:
+        text = f"Dry run only: nothing was written to S3 or deleted. {reason}" if reason else "Dry run only: nothing written or deleted."
+    elif r.status == dp.Status.SKIPPED:
+        text = "Skipped: this table is not in DATA_PURGE_TABLES, so it is not purged." if "DATA_PURGE_TABLES" in reason else f"Skipped: {reason}"
+    elif r.status in _SKIP_EXPLANATIONS:
+        base = _SKIP_EXPLANATIONS[r.status]
+        text = f"{base} Detail: {reason}" if reason else base
+    elif r.status == dp.Status.FAILED:
+        text = f"Failed; nothing is deleted without a verified archive. Cause: {reason}"
+    else:
+        text = f"{r.status}: {reason}"
+    return _limit_words(text)
+
+
+_SKIP_LABELS = {
+    dp.Status.SKIPPED_MISSING: "table missing", dp.Status.SKIPPED_UNCONFIRMED: "schema unconfirmed",
+    dp.Status.SKIPPED_BAD_PLAN: "unsafe query plan", dp.Status.SKIPPED_NO_INDEX: "no date index",
+    dp.Status.SKIPPED_TYPE_MISMATCH: "date column problem", dp.Status.SKIPPED_VIEW: "view",
+    dp.Status.SKIPPED_CONFLICT: "conflicting write", dp.Status.SKIPPED_LOCKED: "locked",
+    dp.Status.SKIPPED_AMBIGUOUS: "no date column", dp.Status.SKIPPED: "not selected",
+}
+
+
+def _skip_breakdown(skipped: Sequence[dp.TableResult]) -> str:
+    counts: Dict[str, int] = {}
+    for r in skipped:
+        label = _SKIP_LABELS.get(r.status, r.status)
+        counts[label] = counts.get(label, 0) + 1
+    return ", ".join(f"{n} {label}" for label, n in counts.items())
+
+
+def describe_brand(rs: Sequence[dp.TableResult], failed: Sequence[dp.TableResult], skipped: Sequence[dp.TableResult]) -> str:
+    done = [r for r in rs if r.status in _OK_STATUSES]
+    archived, deleted = sum(r.exported for r in rs if r.archived), sum(r.deleted for r in rs)
+    parts = [f"{len(done)} of {len(rs)} tables processed OK (archived {archived:,} rows, deleted {deleted:,})"]
+    if skipped:
+        parts.append(f"{len(skipped)} skipped ({_skip_breakdown(skipped)})")
+    if failed:
+        parts.append(f"{len(failed)} FAILED: " + ", ".join(r.table for r in failed))
+    return _limit_words("; ".join(parts) + ".")
+
+
+def describe_run(results: Sequence[dp.TableResult], brands: int, failed: Sequence[dp.TableResult], cfg: dp.PurgeConfig,
+                 error: Optional[str]) -> str:
+    archived, deleted = sum(r.exported for r in results if r.archived), sum(r.deleted for r in results)
+    head = "Run FAILED" if (failed or error) else "Run completed OK"
+    text = (f"{head} ({_mode_label(cfg)}): {brands} brand(s), {len(results)} tables, archived {archived:,} rows, "
+            f"deleted {deleted:,}; {len(failed)} failed; scope: {_filter_label(cfg)}.")
+    if error:
+        text += f" {error}"
+    return _limit_words(text)
+
+
 def _blank_row() -> List[Any]:
     return [""] * len(HEADER_ROW)
 
@@ -119,7 +227,7 @@ def build_rows(
         row = base("TABLE", r.brand, r.table)
         size_after, rows_after = _after_values(r)
         row[_COL["status"]] = r.status
-        row[_COL["reason"]] = _clip(r.reason)
+        row[_COL["reason"]] = describe_table(r)
         row[_COL["eligible_rows"]] = _opt(r.eligible)
         row[_COL["archived_rows"]] = r.exported if r.archived else 0
         row[_COL["deleted_rows"]] = r.deleted
@@ -157,7 +265,7 @@ def build_rows(
         skipped = [r for r in rs if r.status.startswith("SKIPPED")]
         row = base("BRAND", brand, "")
         row[_COL["status"]] = "FAILED" if failed else "OK"
-        row[_COL["reason"]] = f"tables={len(rs)} ok={sum(1 for r in rs if r.status in _OK_STATUSES)} failed={len(failed)} skipped={len(skipped)}"
+        row[_COL["reason"]] = describe_brand(rs, failed, skipped)
         fill_totals(row, totals(rs))
         row[_COL["started_at_ist"]], row[_COL["finished_at_ist"]] = _ts(timing.get("started_at")), _ts(timing.get("finished_at"))
         row[_COL["duration_s"]] = round(timing.get("duration_s", sum(r.duration_s for r in rs)), 2)
@@ -169,7 +277,7 @@ def build_rows(
     all_failed = [r for r in results if _is_failed(r)]
     run_row = base("RUN", ALL_BRANDS_LABEL, "")
     run_row[_COL["status"]] = "FAILED" if (all_failed or error) else "OK"
-    run_row[_COL["reason"]] = f"brands={len(by_brand)} tables={len(results)} failed={len(all_failed)}; {_filter_label(cfg)}"
+    run_row[_COL["reason"]] = describe_run(results, len(by_brand), all_failed, cfg, error)
     fill_totals(run_row, totals(results))
     run_row[_COL["started_at_ist"]], run_row[_COL["finished_at_ist"]] = _ts(run.run_dt), _ts(now)
     run_row[_COL["duration_s"]] = round(total_s, 2)
@@ -187,7 +295,10 @@ def build_error_row(error: str, run_dt: datetime, total_s: float, cfg: Optional[
     row = _blank_row()
     row[_COL["timestamp_ist"]], row[_COL["run_date"]] = _ts(now), dp.archive_run_label(run_dt)
     row[_COL["run_id"]], row[_COL["row_type"]], row[_COL["brand"]] = run_id_for(run_dt), "RUN", ALL_BRANDS_LABEL
-    row[_COL["status"]], row[_COL["reason"]] = "FAILED", note or "run did not complete"
+    row[_COL["status"]] = "FAILED"
+    row[_COL["reason"]] = _limit_words(
+        f"Run did not start or complete ({note or 'unknown reason'}); no table was archived or deleted. {error}"
+    )
     if cfg is not None:
         row[_COL["mode"]], row[_COL["retention_days"]] = _mode_label(cfg), cfg.retention_days
     row[_COL["started_at_ist"]], row[_COL["finished_at_ist"]] = _ts(run_dt), _ts(now)
