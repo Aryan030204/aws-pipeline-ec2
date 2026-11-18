@@ -6,6 +6,7 @@ overall_traffic_split / product_traffic_split / overall_referrer_summary.
 """
 
 import json
+import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -243,7 +244,46 @@ def _normalize_product_traffic_source(raw_source: Any) -> str:
     return value
 
 
+PRODUCT_TRAFFIC_DATE_BATCH_ENV = "PRODUCT_TRAFFIC_DATE_BATCH"
+DEFAULT_PRODUCT_TRAFFIC_DATE_BATCH = 14
+
+
+def product_traffic_date_batch_size(env=None) -> int:
+    """Dates rebuilt per pass (PRODUCT_TRAFFIC_DATE_BATCH, default 14; 0 = all at once, the old behaviour)."""
+    raw = str((os.environ if env is None else env).get(PRODUCT_TRAFFIC_DATE_BATCH_ENV, "")).strip()
+    try:
+        return max(0, int(raw)) if raw else DEFAULT_PRODUCT_TRAFFIC_DATE_BATCH
+    except ValueError:
+        logger.warning(f"Invalid {PRODUCT_TRAFFIC_DATE_BATCH_ENV}={raw!r}; using {DEFAULT_PRODUCT_TRAFFIC_DATE_BATCH}")
+        return DEFAULT_PRODUCT_TRAFFIC_DATE_BATCH
+
+
 def update_product_traffic_split_incremental(
+    cursor,
+    connection,
+    brand_name: str,
+    target_dates: Iterable[str],
+):
+    """Rebuild product_traffic_split for `target_dates`, a bounded number of dates at a time.
+
+    Every date is independent (its rows are read, aggregated, deleted and re-inserted by that date alone), but the rows
+    for ALL dates used to be fetched into one list of dicts, re-aggregated into nested dicts and then into JSON tuples:
+    memory grew with dates x products x sources, i.e. with the length of a backfill window. Processing the dates in
+    batches (the existing stage-table + DELETE/INSERT runs once per batch) bounds it by the batch size; the result is the
+    same, and a failure part-way leaves the earlier batches rebuilt (a re-run recomputes them idempotently)."""
+    _, all_dates = _dates_in_clause(target_dates)
+    if not all_dates:
+        logger.debug(f"[{brand_name}] product_traffic_split: no dates to rebuild")
+        return
+    batch = product_traffic_date_batch_size()
+    if batch <= 0 or len(all_dates) <= batch:
+        _update_product_traffic_split_for_dates(cursor, connection, brand_name, all_dates)
+        return
+    for lo in range(0, len(all_dates), batch):
+        _update_product_traffic_split_for_dates(cursor, connection, brand_name, all_dates[lo:lo + batch])
+
+
+def _update_product_traffic_split_for_dates(
     cursor,
     connection,
     brand_name: str,

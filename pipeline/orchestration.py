@@ -13,7 +13,7 @@ import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
 import mysql.connector
@@ -44,6 +44,7 @@ from pipeline.notifications import (
     trigger_cache_pipeline,
     trigger_utm_pipeline,
 )
+from pipeline import mem_probe
 from pipeline.metrics_logging import log_pipeline_run_metrics_async
 from pipeline.shopify_orders import (
     fetch_orders,
@@ -57,6 +58,12 @@ from pipeline.shopify_orders import (
     get_affected_dates_new_orders,
     get_affected_dates_updates,
     get_rto_affected_dates_updates,
+    collect_product_variant_window_units,
+    merge_product_variant_units,
+    order_window_fetch_bounds,
+    order_window_replace,
+    order_window_span_hours,
+    split_order_window,
 )
 from pipeline.summary_incremental import (
     execute_summary_queries_incremental,
@@ -333,6 +340,294 @@ def _empty_brand_metrics(brand_index: int, brand_name: str, success: bool = True
     }
 
 
+class _WindowResult(NamedTuple):
+    complete: bool  # False: the Shopify fetch ended early; nothing of this window was loaded
+    loaded: bool  # False: the SQL load failed (and was only logged)
+    orders: int
+    affected_dates: Set[str]
+    rto_affected_dates: Set[str]
+    product_units: Any  # (pair_window_qty, product_window_qty) or None
+
+
+class _OrderStreamTotals(NamedTuple):
+    orders: int
+    affected_dates: Set[str]
+    rto_affected_dates: Set[str]
+
+
+_NO_RESULT = _WindowResult(True, True, 0, set(), set(), None)
+
+
+def _fetch_and_load_window(
+    process: Dict[str, str],
+    window,
+    replace_window,
+    *,
+    brand_index: int,
+    brand_name: str,
+    tz,
+    api_base_url: str,
+    access_token: str,
+    app_id_mapping: Dict,
+    cursor,
+    connection,
+    label: str,
+) -> _WindowResult:
+    """Fetch ONE sub-window, load it, run its per-order side effects, and return only small aggregates.
+
+    The whole list of orders (and the transform frame) are locals of this call: they are released when it returns,
+    BEFORE the next sub-window is fetched, so a run's memory is bounded by one window, not by the whole date range."""
+    min_str, max_str = order_window_fetch_bounds(window, tz)
+    status: Dict[str, Any] = {}
+    # A backfill replaces its whole window, so it must never be fed a partial fetch: strict mode raises (and this
+    # brand's run fails, nothing deleted) instead of returning what it managed to get.
+    orders_list = fetch_orders(
+        api_base_url,
+        access_token,
+        min_str,
+        max_str,
+        process["date_field"],
+        strict=aws_background.is_backfill_active_for(brand_index),
+        status=status,
+    )
+    if status.get("complete") is False:
+        # The incremental watermark is MAX(created_at / updated_at) of the table, so the pages of an incomplete window
+        # must not be loaded: they could move it past orders that were never fetched. Dropping them keeps the watermark
+        # at the end of the last complete window, and the next run retries from there.
+        return _WindowResult(False, True, 0, set(), set(), None)
+
+    if not orders_list:
+        logger.info(f"No new {process['type']} orders to process for {brand_name} ({label})")
+        return _NO_RESULT
+
+    existing_ids = set()
+    original_count = len(orders_list)
+    filtered = (
+        [o for o in orders_list if str(o.get("id")) not in existing_ids]
+        if existing_ids
+        else orders_list
+    )
+    if not filtered:
+        logger.info(
+            f"Fetched {original_count} orders, all duplicates. Nothing to insert."
+        )
+        return _NO_RESULT
+
+    logger.info(
+        f"Fetched {original_count}, removed {original_count - len(filtered)} duplicates. "
+        f"Processing {len(filtered)} orders ({label})."
+    )
+    orders_in_window = len(filtered)
+    affected_dates: Set[str] = set()
+    rto_affected_dates: Set[str] = set()
+    product_units = None
+
+    # Track affected dates for NEW orders before load
+    if process["type"] == "NEW":
+        new_dates = get_affected_dates_new_orders(filtered, tz)
+        if new_dates:
+            affected_dates.update(new_dates)
+            rto_new_dates = get_rto_affected_dates_updates(filtered, tz)
+            if rto_new_dates:
+                rto_affected_dates.update(rto_new_dates)
+            logger.info(
+                f"📅 Affected dates for {process['type']}: "
+                f"{len(new_dates)} date(s) ({min(new_dates)}..{max(new_dates)})"
+            )
+
+    df = transform_orders_to_df_optimized(filtered, app_id_mapping, tz)
+    rows_in_window = len(df)
+
+    # Load immediately for this window
+    batch_size = int(os.environ.get("BATCH_SIZE", 1000))
+    loaded = load_data_to_sql_optimized(
+        df,
+        brand_index,
+        brand_name,
+        process["table"],
+        batch_size,
+        replace_window=replace_window,
+    )
+
+    if process["type"] == "NEW":
+        discount_fact_dates = upsert_dashboard_order_discount_fact_from_orders(
+            filtered, cursor, connection, brand_name, tz
+        )
+        if discount_fact_dates:
+            affected_dates.update(discount_fact_dates)
+
+    # Upsert returns_fact from the same filtered snapshots
+    changed_return_dates = upsert_returns_fact_from_orders(
+        brand_index, filtered, cursor=cursor, connection=connection
+    )
+
+    if process["type"] == "NEW" and aws_background.INVENTORY_PIPELINE_SWITCH:
+        # Aggregated per window, merged across windows by the caller and applied ONCE (the update is additive).
+        product_units = collect_product_variant_window_units(filtered, tz)
+
+    # UPDATED orders: build affected dates from updated_at + returns_fact deltas.
+    if process["type"] == "UPDATED":
+        upd_dates = get_affected_dates_updates(
+            filtered,
+            tz,
+            extra_event_dates=changed_return_dates,
+        )
+        rto_upd_dates = get_rto_affected_dates_updates(filtered, tz)
+        if rto_upd_dates:
+            rto_affected_dates.update(rto_upd_dates)
+        if upd_dates:
+            affected_dates.update(upd_dates)
+            logger.info(
+                f"📅 Affected dates for {process['type']}: "
+                f"{len(upd_dates)} date(s) ({min(upd_dates)}..{max(upd_dates)})"
+            )
+        else:
+            logger.info(
+                "✔️ UPDATED orders produced no new/changed affected dates"
+            )
+        if rto_upd_dates:
+            logger.info(
+                f"[{brand_name}] RTO affected created_date(s) from UPDATED orders: "
+                f"{len(rto_upd_dates)} ({min(rto_upd_dates)}..{max(rto_upd_dates)})"
+            )
+
+    mem_probe.log_mem(
+        f"order_window_{process['type'].lower()}", brand_index, orders=orders_in_window, rows=rows_in_window
+    )
+    return _WindowResult(
+        True, loaded is not False, orders_in_window, affected_dates, rto_affected_dates, product_units
+    )
+
+
+def _process_order_stream(
+    process: Dict[str, str],
+    *,
+    brand_index: int,
+    brand_name: str,
+    tz,
+    api_base_url: str,
+    access_token: str,
+    shop_name: str,
+    app_id_mapping: Dict,
+    cursor,
+    connection,
+    errors: List[str],
+) -> Optional[_OrderStreamTotals]:
+    """Process one order stream (NEW -> shopify_orders, UPDATED -> shopify_orders_update) for a brand.
+
+    The overall fetch window is the same as ever (the BACKFILL_* window, or `watermark + 1s .. now`), but it is walked in
+    ascending sub-windows of ORDER_FETCH_WINDOW_HOURS (default 24h; a shorter window, i.e. a normal 10-minute tick,
+    stays ONE request). Each sub-window is fetched, loaded (a backfill replaces exactly that sub-window in the same
+    transaction as its insert) and released before the next one, so memory is bounded by one window.
+
+    Returns None when the stream has nothing to do (no watermark / no backfill window), else the aggregates."""
+    timestamp_col = "created_at" if process["type"] == "NEW" else "updated_at"
+    last_order = get_last_order(brand_index, process["table"], cursor=cursor)
+    backfill = aws_background.is_backfill_active_for(brand_index)
+
+    if backfill:
+        # Use the configured backfill window in the brand's store timezone.
+        start_dt, end_dt = aws_background.get_backfill_window_for_brand(brand_index)
+        if not start_dt or not end_dt:
+            logger.warning(
+                f"🛑 Missing localized backfill window for {brand_name}. Skipping."
+            )
+            return None
+        logger.info(
+            f"🔁 BACKFILL MODE: {process['type']} from {start_dt} to {end_dt} "
+            f"({tz.key})"
+        )
+        window_start, window_end = start_dt, end_dt
+    else:
+        if not last_order:
+            logger.warning(
+                f"🛑 No initial data in '{process['table']}' for {brand_name}. Skipping."
+            )
+            return None
+        last_ts = last_order[timestamp_col]
+        if last_ts is None:
+            logger.warning(
+                f"🛑 Last {timestamp_col} watermark is missing for {brand_name}. Skipping."
+            )
+            return None
+        # Advance by one second because the Shopify start boundary is inclusive.
+        next_ts = last_ts + timedelta(seconds=1)
+        window_start = next_ts.replace(tzinfo=tz) if next_ts.tzinfo is None else next_ts.astimezone(tz)
+        window_end = datetime.now(tz)
+        logger.info(f"Fetching orders after: {last_ts} (API start: {next_ts})")
+
+    tiles = split_order_window(window_start, window_end, order_window_span_hours())
+    total_windows = len(tiles)
+    if total_windows > 1:
+        logger.info(
+            f"📦 {brand_name}: {process['type']} fetch window split into {total_windows} sub-window(s) "
+            f"of up to {order_window_span_hours():g}h to bound memory"
+        )
+
+    total_orders = 0
+    affected_dates: Set[str] = set()
+    rto_affected_dates: Set[str] = set()
+    product_units = None
+
+    for number, window in enumerate(tiles, start=1):
+        replace_window = (
+            order_window_replace(window, process["table"], window_end, is_last=(number == total_windows))
+            if backfill
+            else None
+        )
+        label = f"window {number}/{total_windows}"
+        result = _fetch_and_load_window(
+            process,
+            window,
+            replace_window,
+            brand_index=brand_index,
+            brand_name=brand_name,
+            tz=tz,
+            api_base_url=api_base_url,
+            access_token=access_token,
+            app_id_mapping=app_id_mapping,
+            cursor=cursor,
+            connection=connection,
+            label=label,
+        )
+        if not result.complete:
+            message = (
+                f"{process['type']} orders: Shopify fetch incomplete at {label}; nothing was loaded for it and the "
+                "remaining windows were not fetched (the next run resumes from the last loaded order)"
+            )
+            logger.error(f"[{brand_name}] {message}")
+            errors.append(message)
+            break
+        total_orders += result.orders
+        affected_dates.update(result.affected_dates)
+        rto_affected_dates.update(result.rto_affected_dates)
+        if result.product_units is not None:
+            if product_units is None:
+                product_units = ({}, {})
+            merge_product_variant_units(product_units, result.product_units)
+        if not result.loaded:
+            # The SQL load failed (logged). Do not fetch/load LATER windows: the watermark would move past this one.
+            message = f"{process['type']} orders: load failed at {label}; later windows were not processed"
+            logger.error(f"[{brand_name}] {message}")
+            errors.append(message)
+            break
+
+    if product_units is not None:
+        upsert_products_sold_units_daily_from_orders(
+            brand_index=brand_index,
+            orders_list=[],
+            brand_name=brand_name,
+            shop_name=shop_name,
+            access_token=access_token,
+            cursor=cursor,
+            connection=connection,
+            precomputed_units=product_units,
+        )
+
+    mem_probe.log_mem(f"order_stream_{process['type'].lower()}", brand_index, orders=total_orders, windows=total_windows)
+    return _OrderStreamTotals(total_orders, affected_dates, rto_affected_dates)
+
+
 def process_single_brand(brand_index: int, job_id: Optional[str] = None) -> Dict[str, Any]:
     brand_started_at = time.monotonic()
     if brand_index not in brand_db_configs:
@@ -426,148 +721,27 @@ def process_single_brand(brand_index: int, job_id: Optional[str] = None) -> Dict
             logger.info(
                 f"\n--- Processing {process['type']} orders for {brand_name} ---"
             )
-            timestamp_col = "created_at" if process["type"] == "NEW" else "updated_at"
-            last_order = get_last_order(brand_index, process["table"], cursor=cursor)
-            existing_ids = set()
-
-            if aws_background.is_backfill_active_for(brand_index):
-                # Use the configured backfill window in the brand's store timezone.
-                start_dt, end_dt = aws_background.get_backfill_window_for_brand(brand_index)
-                if not start_dt or not end_dt:
-                    logger.warning(
-                        f"🛑 Missing localized backfill window for {brand_name}. Skipping."
-                    )
-                    continue
-                start_date = convert_to_desired_format(start_dt, tz)
-                end_date = convert_to_desired_format(end_dt, tz)
-                logger.info(
-                    f"🔁 BACKFILL MODE: {process['type']} from {start_dt} to {end_dt} "
-                    f"({tz.key})"
-                )
-            else:
-                if not last_order:
-                    logger.warning(
-                        f"🛑 No initial data in '{process['table']}' for {brand_name}. Skipping."
-                    )
-                    continue
-                last_ts = last_order[timestamp_col]
-                if last_ts is None:
-                    logger.warning(
-                        f"🛑 Last {timestamp_col} watermark is missing for {brand_name}. Skipping."
-                    )
-                    continue
-                # Advance by one second because the Shopify start boundary is inclusive.
-                next_ts = last_ts + timedelta(seconds=1)
-                start_date = convert_to_desired_format(next_ts, tz)
-                end_date = convert_to_desired_format(datetime.now(tz), tz)
-                logger.info(f"Fetching orders after: {last_ts} (API start: {next_ts})")
-
-            # A backfill replaces its whole window, so it must never be fed a partial fetch: strict mode
-            # raises (and this brand's run fails, nothing deleted) instead of returning what it managed to get.
-            orders_list = fetch_orders(
-                api_base_url,
-                access_token,
-                start_date,
-                end_date,
-                process["date_field"],
-                strict=aws_background.is_backfill_active_for(brand_index),
+            totals = _process_order_stream(
+                process,
+                brand_index=brand_index,
+                brand_name=brand_name,
+                tz=tz,
+                api_base_url=api_base_url,
+                access_token=access_token,
+                shop_name=shop_name,
+                app_id_mapping=app_id_mapping,
+                cursor=cursor,
+                connection=connection,
+                errors=errors,
             )
-
-            if not orders_list:
-                logger.info(
-                    f"No new {process['type']} orders to process for {brand_name}"
-                )
+            if totals is None:
                 continue
-
-            original_count = len(orders_list)
-            filtered = (
-                [o for o in orders_list if str(o.get("id")) not in existing_ids]
-                if existing_ids
-                else orders_list
-            )
-            if not filtered:
-                logger.info(
-                    f"Fetched {original_count} orders, all duplicates. Nothing to insert."
-                )
-                continue
-
-            logger.info(
-                f"Fetched {original_count}, removed {original_count - len(filtered)} duplicates. Processing {len(filtered)} orders."
-            )
             if process["type"] == "NEW":
-                new_orders_count = len(filtered)
+                new_orders_count = totals.orders
             else:
-                updated_orders_count = len(filtered)
-
-            # Track affected dates for NEW orders before load
-            if process["type"] == "NEW":
-                new_dates = get_affected_dates_new_orders(filtered, tz)
-                if new_dates:
-                    affected_dates.update(new_dates)
-                    rto_new_dates = get_rto_affected_dates_updates(filtered, tz)
-                    if rto_new_dates:
-                        rto_affected_dates.update(rto_new_dates)
-                    logger.info(
-                        f"📅 Affected dates for {process['type']}: "
-                        f"{len(new_dates)} date(s) ({min(new_dates)}..{max(new_dates)})"
-                    )
-
-            df = transform_orders_to_df_optimized(filtered, app_id_mapping, tz)
-
-            # Load immediately for this process type
-            batch_size = int(os.environ.get("BATCH_SIZE", 1000))
-            load_data_to_sql_optimized(
-                df, brand_index, brand_name, process["table"], batch_size
-            )
-
-            if process["type"] == "NEW":
-                discount_fact_dates = upsert_dashboard_order_discount_fact_from_orders(
-                    filtered, cursor, connection, brand_name, tz
-                )
-                if discount_fact_dates:
-                    affected_dates.update(discount_fact_dates)
-
-            # Upsert returns_fact from the same filtered snapshots
-            changed_return_dates = upsert_returns_fact_from_orders(
-                brand_index, filtered, cursor=cursor, connection=connection
-            )
-
-            if process["type"] == "NEW" and aws_background.INVENTORY_PIPELINE_SWITCH:
-                upsert_products_sold_units_daily_from_orders(
-                    brand_index=brand_index,
-                    orders_list=filtered,
-                    brand_name=brand_name,
-                    shop_name=shop_name,
-                    access_token=access_token,
-                    cursor=cursor,
-                    connection=connection,
-                )
-
-            # UPDATED orders: build affected dates from updated_at + returns_fact deltas.
-            if process["type"] == "UPDATED":
-                upd_dates = get_affected_dates_updates(
-                    filtered,
-                    tz,
-                    extra_event_dates=changed_return_dates,
-                )
-                rto_upd_dates = get_rto_affected_dates_updates(filtered, tz)
-                if rto_upd_dates:
-                    rto_affected_dates.update(rto_upd_dates)
-                if upd_dates:
-                    affected_dates.update(upd_dates)
-                    logger.info(
-                        f"📅 Affected dates for {process['type']}: "
-                        f"{len(upd_dates)} date(s) ({min(upd_dates)}..{max(upd_dates)})"
-                    )
-                else:
-                    logger.info(
-                        "✔️ UPDATED orders produced no new/changed affected dates"
-                    )
-                if rto_upd_dates:
-                    logger.info(
-                        f"[{brand_name}] RTO affected created_date(s) from UPDATED orders: "
-                        f"{len(rto_upd_dates)} ({min(rto_upd_dates)}..{max(rto_upd_dates)})"
-                    )
+                updated_orders_count = totals.orders
+            affected_dates.update(totals.affected_dates)
+            rto_affected_dates.update(totals.rto_affected_dates)
 
         if aws_background.DISCOUNT_DASHBOARD_BACKFILL:
             logger.info(f"🔁 Starting discount dashboard backfill for {brand_name}")
@@ -761,6 +935,28 @@ def _group_brands_by_cron(cron_map: Dict[int, str]) -> Dict[str, List[int]]:
     return {cron_value: sorted(indices) for cron_value, indices in groups.items()}
 
 
+DEFAULT_MAX_CONCURRENT_BRANDS = 3
+DEFAULT_BACKFILL_MAX_CONCURRENT_BRANDS = 1
+
+
+def resolve_brand_concurrency(n_brands: int, backfill_active: bool, env=None) -> Tuple[int, str]:
+    """(worker threads, name of the env var that decided it). Normal runs use MAX_CONCURRENT_BRANDS (default 3).
+    A backfill run uses BACKFILL_MAX_CONCURRENT_BRANDS (default 1): each brand thread holds its own sub-window of orders
+    plus an insert chunk, so peak memory is roughly (threads x per-thread peak), and a backfill is a one-shot job where
+    throughput matters less. Always between 1 and the number of brands."""
+    source = os.environ if env is None else env
+    if backfill_active:
+        name, default = "BACKFILL_MAX_CONCURRENT_BRANDS", DEFAULT_BACKFILL_MAX_CONCURRENT_BRANDS
+    else:
+        name, default = "MAX_CONCURRENT_BRANDS", DEFAULT_MAX_CONCURRENT_BRANDS
+    try:
+        wanted = int(str(source.get(name, default)).strip())
+    except ValueError:
+        logger.warning(f"Invalid {name}={source.get(name)!r}; using {default}")
+        wanted = default
+    return max(1, min(n_brands, wanted)), name
+
+
 def _execute_pipeline_run(target_indices: List[int], run_id: Optional[str] = None) -> None:
     """
     The actual ETL run: preflight migrations, per-brand ThreadPoolExecutor,
@@ -835,11 +1031,12 @@ def _execute_pipeline_run(target_indices: List[int], run_id: Optional[str] = Non
         # heavy (multi-table JOINs, summary rebuilds, session upserts); running
         # all brands at once drives EBSByteBalance% to 0. Override with env
         # MAX_CONCURRENT_BRANDS when scaling up the RDS instance.
-        max_concurrent_brands = int(os.environ.get("MAX_CONCURRENT_BRANDS", "3"))
-        max_workers = max(1, min(len(target_indices), max_concurrent_brands))
+        backfill_run = bool(aws_background.BACKFILL_MODE)
+        max_workers, concurrency_env = resolve_brand_concurrency(len(target_indices), backfill_run)
         logger.info(
             f"Processing {len(target_indices)} brands with {max_workers} parallel workers"
-            f" (MAX_CONCURRENT_BRANDS={max_concurrent_brands})"
+            f" ({concurrency_env}={os.environ.get(concurrency_env, 'default')}"
+            f"{', backfill mode' if backfill_run else ''})"
         )
 
         brand_run_metrics: List[Dict[str, Any]] = []

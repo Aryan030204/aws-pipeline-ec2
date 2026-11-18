@@ -337,7 +337,7 @@ class StrictFetchTests(unittest.TestCase):
 
 class OrchestrationWiringTests(unittest.TestCase):
     def test_backfill_runs_fetch_in_strict_mode_and_normal_ticks_do_not(self):
-        src = inspect.getsource(orchestration.process_single_brand)
+        src = inspect.getsource(orchestration._fetch_and_load_window)  # the per-sub-window fetch lives here now
         self.assertIn("strict=aws_background.is_backfill_active_for(brand_index)", src)
 
     def test_the_old_whole_date_delete_is_gone(self):

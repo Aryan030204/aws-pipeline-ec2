@@ -78,6 +78,11 @@ Other important flags:
 | `BRANDS_CRON_MAP` | Optional per-brand cron override, JSON `{"<brand_index>": "<minute-list>"}`, e.g. `{"3":"15,45","4":"15,45","1":"0,30","2":"0,30"}` runs brands 3/4 at :15/:45 past the hour and 1/2 at :00/:30. Any active brand **not** a key here (including every brand, if this is unset/empty) keeps running on the legacy every-10-min schedule - opt-in per brand. Read once at startup; changing it needs a restart. |
 | `BACKFILL_MODE` | `true` = process a specific historical date window instead of "since last run". **Runs once, immediately, whenever the container starts (restart/rebuild)** and then stays idle until restarted or triggered; no recurring ticks (needs `SELF_RUN=true`) |
 | `BACKFILL_BRAND_INDICES` | Restrict a backfill run to specific brands |
+| `ORDER_FETCH_WINDOW_HOURS` | `24`. Order fetches (normal ticks, catch-up after downtime, backfills) are walked in ascending sub-windows of this many hours, each fetched, loaded and **released** before the next, so memory is bounded by one window instead of the whole date range. A window shorter than this (every normal 10-minute tick) is still one request. `0` = one unbounded window (the pre-fix behaviour). Lower it (e.g. `6`) for brands with very many orders per day |
+| `ORDERS_INSERT_MAX_PARAMS` | `20000`. Cap on bound parameters per multi-row INSERT when loading orders (rows per chunk = this / number of columns, never above `BATCH_SIZE` or 2000): about 230 rows for the 86-column orders frame, instead of the old 1000-row (86,000-parameter) statements |
+| `PRODUCT_TRAFFIC_DATE_BATCH` | `14`. Dates rebuilt per pass when refreshing `product_traffic_split` (each date is independent). The rows of all dates used to be fetched into memory at once, so a long backfill window grew memory with dates x products x sources (about +130 MB for 30 dates at 2,000 rows/date in the synthetic benchmark); batching bounds it. `0` = all dates at once (the old behaviour) |
+| `BACKFILL_MAX_CONCURRENT_BRANDS` | `1`. Brand threads while `BACKFILL_MODE=true` (each thread holds its own sub-window plus an insert chunk, so peak memory is roughly threads x per-thread peak). Normal runs keep `MAX_CONCURRENT_BRANDS` (default `3`) |
+| `MEM_PROBE` | `false`. `true` logs one numbers-only line per order sub-window / stream (`MEM_PROBE stage=... brand_index=... rss_mb=... hwm_mb=... threads=... orders=...`) from `/proc/self/status`; `MEM_PROBE_TRACEMALLOC=true` adds the Python heap (slower, diagnosis only) |
 | `ALERTS_WEBHOOK_URL` | Where QStash-forwarded sales/web-vitals alerts get delivered |
 | `UNMAPPED_PAYMENT_BRANDS` | Comma-separated brand names/tags that use the **unmapped** payment rule (default `editeveryday`): an order with no gateway name at all is reported in `unmapped_orders`/`unmapped_sales`, not as COD. **Every other brand keeps the original rule: a blank gateway name counts as COD** (so brands whose COD orders reach Shopify without a gateway name, such as BBB, still report COD). Names are compared ignoring case and punctuation; set it to an empty string to turn the unmapped rule off everywhere. Defined once in `pipeline/payment_mode.py`; applies to `order_summary`, `hour_wise_sales`, `overall_summary`, the city-wise tables and the discount dashboard's `payment_mode` |
 | `PIPELINE_METRICS_SHEET_SWITCH` | `true` (default) = log each run's per-brand metrics to Google Sheets (see below); `false` disables it entirely |
@@ -90,11 +95,32 @@ Other important flags:
 With `BACKFILL_MODE=true` the pipeline replaces `shopify_orders` / `shopify_orders_update` for the window `BACKFILL_START_IST` .. `BACKFILL_END_IST` (both **inclusive**, interpreted in each brand's store timezone):
 
 - Shopify is asked for orders whose `created_at` (new orders) / `updated_at` (updated orders) lies in that **exact time range**, and the same range - and only that range - is deleted before the re-fetched rows are inserted. Rows outside the range, even on the same date, are never touched.
-- The delete and the insert are **one transaction**: if the insert fails the window is left as it was, and the backfill aborts for that brand.
-- The Shopify fetch is **strict** in backfill mode: an HTTP error or exception mid-pagination aborts the brand's run instead of replacing the window with a partial list. (Normal 10-minute ticks keep the old tolerant behaviour.)
-- Nothing is deleted if the fetch returns no orders.
+- Each **sub-window** (see below) is replaced by its own transaction: the exact range of that sub-window is deleted and its re-fetched rows inserted together, or not at all. A failure part-way leaves the earlier sub-windows replaced and the later ones untouched; re-running the same backfill is idempotent.
+- The Shopify fetch is **strict** in backfill mode: an HTTP error or exception mid-pagination aborts the brand's run instead of replacing a window with a partial list. In **every** mode (normal ticks included) the pages of an incomplete fetch are no longer loaded - see "Memory and large order windows".
+- Nothing is deleted for a sub-window whose fetch returns no orders (so stale rows in a day Shopify now reports empty are left alone).
 - **A date without a time means midnight.** `BACKFILL_END_IST=2026-11-12` means `2026-11-12 00:00:00`, so orders *on* Nov 12 are not in the window (a startup warning says so). To include a whole day use `2026-11-12T23:59:59`. To backfill whole days use `START=<first day>` (or `T00:00:00`) and `END=<last day>T23:59:59`.
 - **Backfill mode is a single run.** The pipeline starts the backfill immediately every time the container starts (restart or rebuild), instead of waiting for the next `:00/:10/...` tick, and registers no recurring ticks (they would only repeat the same window and ingest nothing new). `BACKFILL_BRAND_INDICES` still selects the brands. With `SELF_RUN=false` nothing starts by itself (use `POST /trigger`). When the backfill has finished set `BACKFILL_MODE=false` and restart to resume the regular 10-minute schedule - until then no new orders are ingested, and **every restart re-runs the backfill**.
+
+### Memory and large order windows
+
+The order path used to fetch the **whole** window into one list (and a DataFrame, and insert chunks) before releasing anything, so a long backfill - or a catch-up after downtime - needed memory proportional to its size, and up to three brand threads multiplied it. Now (`pipeline/orchestration.py` `_process_order_stream`):
+
+- The overall window is unchanged (`BACKFILL_START_IST..END`, or `last order + 1s .. now`), but it is walked in ascending half-open sub-windows of `ORDER_FETCH_WINDOW_HOURS` (default 24h). Adjacent sub-windows share a boundary, so there is no gap and no overlap; Shopify is asked for `[start, next_start - 1s]` (its bounds are inclusive and whole-second) and a backfill deletes `col >= start AND col < next_start` (the last sub-window keeps the original inclusive end). Boundaries are computed on absolute instants, so DST changes cannot skip or repeat an hour.
+- One sub-window is fetched, transformed, loaded and released before the next is fetched. Date sets and counts are aggregated across sub-windows; `products_sold_units_daily` (an **additive** update) is aggregated across them and applied **once** at the end of the stream.
+- **An incomplete Shopify fetch is never loaded.** The incremental watermark is just `MAX(created_at / updated_at)` of the table, so loading the pages of an incomplete window could move it past orders that were never fetched. Earlier complete sub-windows stay loaded, the stream stops (and the brand's run reports the error), and the next run resumes at `watermark + 1s`, retrying the failed window and everything after it. A failed SQL load stops the stream the same way.
+- Inserts use `to_sql(method="multi")` chunks capped by *parameter count* (`ORDERS_INSERT_MAX_PARAMS`), not just rows.
+- `product_traffic_split` (rebuilt for every date of the window after the orders) is rebuilt `PRODUCT_TRAFFIC_DATE_BATCH` dates at a time, each batch in its own stage-table pass and transaction, instead of fetching every date at once.
+- During `BACKFILL_MODE` brands run with `BACKFILL_MAX_CONCURRENT_BRANDS` (default 1) threads; normal runs keep `MAX_CONCURRENT_BRANDS`.
+
+A single sub-window is still held in memory, so for a brand with a very large number of orders per day lower `ORDER_FETCH_WINDOW_HOURS`. Monitor with `MEM_PROBE=true` or directly:
+
+```bash
+docker exec aws-pipeline sh -c 'grep -E "VmRSS|VmHWM|Threads" /proc/1/status'
+docker exec aws-pipeline sh -c 'cat /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory.events'
+docker stats --no-stream aws-pipeline
+```
+
+`scripts/memory_benchmark.py` compares the old (whole-window list) and new (bounded sub-window) paths on synthetic orders in fresh subprocesses and reports peak RSS. `MALLOC_ARENA_MAX=2` (an environment variable, not set by default) is the only allocator knob worth an A/B test if `VmHWM` still ratchets after these changes; the pipeline does not call `malloc_trim`.
 
 No secrets or real credentials are ever meant to live in source control — see `.env.local`/`.env` locally, and the deployment's own secret store in production.
 

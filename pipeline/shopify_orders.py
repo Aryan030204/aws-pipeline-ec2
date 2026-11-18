@@ -14,7 +14,7 @@ import re
 import threading
 import time
 import traceback
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
@@ -63,10 +63,18 @@ async def fetch_orders_async(
     end_date: str,
     date_filter_field: str,
     strict: bool = False,
+    status: Optional[Dict[str, Any]] = None,
 ) -> List[Dict]:
     """strict=False (the normal incremental tick): any failure ends the fetch and the orders collected so far are
-    returned (long-standing behaviour). strict=True (backfill windows): any failure raises OrderFetchIncomplete, because
-    a backfill replaces the whole window and must not replace it with a partial list."""
+    returned. strict=True (backfill windows): any failure raises OrderFetchIncomplete, because a backfill replaces the
+    whole window and must not replace it with a partial list.
+
+    `status` (optional, caller-owned dict): set to {"complete": False} when a NON-strict fetch ended early. The caller
+    must then not load the returned partial list (see pipeline/orchestration.py _process_order_stream): the incremental
+    watermark is MAX(created_at / updated_at) of the table, so loading the pages of an incomplete window could move it
+    past orders that were never fetched."""
+    if status is not None:
+        status["complete"] = True
     headers = {"X-Shopify-Access-Token": access_token}
     order_list: List[Dict] = []
 
@@ -111,6 +119,8 @@ async def fetch_orders_async(
 
                     if response.status != 200:
                         logger.error(f"Failed to fetch data: {response.status}")
+                        if status is not None:
+                            status["complete"] = False
                         if strict:
                             raise OrderFetchIncomplete(
                                 f"Shopify returned HTTP {response.status} after {len(order_list)} order(s)"
@@ -138,6 +148,8 @@ async def fetch_orders_async(
                 raise
             except Exception as e:
                 logger.error(f"Error fetching orders: {e}")
+                if status is not None:
+                    status["complete"] = False
                 if strict:
                     raise OrderFetchIncomplete(
                         f"order fetch failed after {len(order_list)} order(s): {e}"
@@ -154,6 +166,7 @@ def fetch_orders(
     end_date: str,
     date_filter_field: str,
     strict: bool = False,
+    status: Optional[Dict[str, Any]] = None,
 ) -> List[Dict]:
     with timed(f"Shopify fetch ({date_filter_field} window)"):
         loop = asyncio.new_event_loop()
@@ -161,7 +174,8 @@ def fetch_orders(
         try:
             return loop.run_until_complete(
                 fetch_orders_async(
-                    api_base_url, access_token, start_date, end_date, date_filter_field, strict=strict
+                    api_base_url, access_token, start_date, end_date, date_filter_field, strict=strict,
+                    **({"status": status} if status is not None else {}),
                 )
             )
         finally:
@@ -1290,6 +1304,7 @@ def upsert_products_sold_units_daily_from_orders(
     access_token: str,
     cursor=None,
     connection=None,
+    precomputed_units=None,
 ):
     """
     Maintain products_sold_units_daily from fetched orders.
@@ -1297,8 +1312,13 @@ def upsert_products_sold_units_daily_from_orders(
     Rules:
     - First time product_id: fetch 7d/30d/90d sold units via ShopifyQL and upsert.
     - Existing product_id: update sold units using new-order deltas from this run.
+
+    `precomputed_units`: the (pair_window_qty, product_window_qty) a caller already aggregated over ALL orders of the
+    run (see collect_product_variant_window_units / merge_product_variant_units). The update is ADDITIVE for existing
+    products and replaces deltas with a ShopifyQL baseline for new ones, so a run that fetched its orders in several
+    sub-windows must aggregate the units across them and call this ONCE, never once per sub-window.
     """
-    if not orders_list:
+    if not orders_list and precomputed_units is None:
         return
 
     if cursor is None or connection is None:
@@ -1311,15 +1331,19 @@ def upsert_products_sold_units_daily_from_orders(
                 access_token,
                 cursor=cursor,
                 connection=connection,
+                precomputed_units=precomputed_units,
             )
 
     try:
         _ensure_products_sold_units_daily(cursor, connection)
         tz = aws_background.get_brand_timezone(brand_index)
 
-        pair_window_qty, product_window_qty = _collect_product_variant_window_units(
-            orders_list, tz
-        )
+        if precomputed_units is not None:
+            pair_window_qty, product_window_qty = precomputed_units
+        else:
+            pair_window_qty, product_window_qty = _collect_product_variant_window_units(
+                orders_list, tz
+            )
         if not pair_window_qty:
             logger.info(
                 f"[{brand_name}] No valid product/variant quantities found for products_sold_units_daily update"
@@ -1447,6 +1471,22 @@ def upsert_products_sold_units_daily_from_orders(
             f"❌ [{brand_name}] Error updating products_sold_units_daily: {e}"
         )
         traceback.print_exc()
+
+
+def collect_product_variant_window_units(orders_list: List[Dict], tz: ZoneInfo):
+    """Public alias of _collect_product_variant_window_units (the per-batch aggregation step)."""
+    return _collect_product_variant_window_units(orders_list, tz)
+
+
+def merge_product_variant_units(into, other):
+    """Add `other` ((pair_window_qty, product_window_qty)) into `into` in place and return `into`. The units are plain
+    per-window sums, so summing per-sub-window results equals one pass over all of the orders."""
+    for target, source in zip(into, other):
+        for key, windows in source.items():
+            acc = target.setdefault(key, {"7d": 0, "30d": 0, "90d": 0})
+            for name, qty in windows.items():
+                acc[name] = acc.get(name, 0) + qty
+    return into
 
 
 # ---------------------------
@@ -1621,6 +1661,114 @@ def get_affected_dates_updates(
     return dates
 
 
+# ---------------------------
+# Bounded order windows (memory) + insert chunk sizing
+# ---------------------------
+ORDER_WINDOW_SPAN_ENV = "ORDER_FETCH_WINDOW_HOURS"
+DEFAULT_ORDER_WINDOW_SPAN_HOURS = 24.0
+INSERT_MAX_PARAMS_ENV = "ORDERS_INSERT_MAX_PARAMS"
+DEFAULT_INSERT_MAX_PARAMS = 20000  # well under MySQL's 65,535 placeholder limit
+MAX_INSERT_ROWS = 2000  # the long-standing upper bound on rows per chunk
+
+
+class OrderWindow(NamedTuple):
+    """One half-open tile [start, end_exclusive) of a fetch window: tz-aware datetimes in the brand's timezone, bounds on
+    absolute instants (see split_order_window)."""
+
+    start: datetime
+    end_exclusive: datetime
+
+
+def order_window_span_hours(env=None) -> float:
+    """ORDER_FETCH_WINDOW_HOURS (default 24). 0 or a negative value = unbounded = one window (the old behaviour);
+    an unparseable value falls back to the default."""
+    raw = (os.environ if env is None else env).get(ORDER_WINDOW_SPAN_ENV, "")
+    try:
+        return float(raw) if str(raw).strip() else DEFAULT_ORDER_WINDOW_SPAN_HOURS
+    except ValueError:
+        logger.warning(f"Invalid {ORDER_WINDOW_SPAN_ENV}={raw!r}; using {DEFAULT_ORDER_WINDOW_SPAN_HOURS}")
+        return DEFAULT_ORDER_WINDOW_SPAN_HOURS
+
+
+def split_order_window(start: datetime, end: datetime, span_hours: float) -> List[OrderWindow]:
+    """Tile the INCLUSIVE fetch window [start, end] into consecutive half-open tiles [s_k, s_k+1).
+
+    The original inclusive `end` is represented as the exclusive bound `end + 1s` (Shopify filters and the stored
+    created_at / updated_at are whole seconds). Tiles share their boundaries by construction (tile k's end_exclusive is
+    tile k+1's start), so there is no gap and no overlap; the first tile starts at `start` and the last ends at
+    `end + 1s`. The arithmetic is done on absolute (UTC) instants and the boundaries are converted back to the input
+    timezone: wall-clock arithmetic would skip or repeat an hour across a DST change (a boundary in the repeated
+    fall-back hour would be formatted with the wrong offset and leave a 1-hour gap). A window not longer than the span,
+    a span <= 0, or an inverted window (start > end, which the old code simply sent to Shopify) is returned as ONE
+    tile, identical to the single request made before windows existed."""
+    one_second = timedelta(seconds=1)
+    aware = start.tzinfo is not None and end.tzinfo is not None
+    if aware:
+        zone = start.tzinfo
+        start_i, end_i = start.astimezone(timezone.utc), end.astimezone(timezone.utc) + one_second
+    else:  # naive datetimes: plain arithmetic (callers in this repo always pass tz-aware values)
+        zone, start_i, end_i = None, start, end + one_second
+    back = (lambda moment: moment.astimezone(zone)) if aware else (lambda moment: moment)
+    if span_hours is None or span_hours <= 0 or end_i <= start_i:
+        return [OrderWindow(start, back(end_i))]
+    span = timedelta(hours=span_hours)
+    tiles: List[OrderWindow] = []
+    cursor = start_i
+    while cursor < end_i:
+        nxt = min(cursor + span, end_i)
+        tiles.append(OrderWindow(back(cursor), back(nxt)))
+        cursor = nxt
+    tiles[0] = OrderWindow(start, tiles[0].end_exclusive)  # the caller's own start object, exactly
+    return tiles
+
+
+def _minus_one_second(moment: datetime) -> datetime:
+    """moment - 1s as an absolute instant (correct inside a DST fold), back in the same timezone."""
+    if moment.tzinfo is None:
+        return moment - timedelta(seconds=1)
+    return (moment.astimezone(timezone.utc) - timedelta(seconds=1)).astimezone(moment.tzinfo)
+
+
+def order_window_fetch_bounds(window: OrderWindow, tz: ZoneInfo) -> Tuple[str, str]:
+    """The (created_at_min, created_at_max) strings for a tile. Shopify's bounds are inclusive, so the max is the last
+    whole second inside the half-open tile; consecutive tiles therefore differ by exactly one second."""
+    return (
+        convert_to_desired_format(window.start, tz),
+        convert_to_desired_format(_minus_one_second(window.end_exclusive), tz),
+    )
+
+
+def order_window_replace(
+    window: OrderWindow, table_name: str, overall_end: datetime, is_last: bool
+) -> "BackfillReplaceWindow":
+    """The delete range for one sub-window of a backfill: [start, end_exclusive), except the LAST tile, which keeps the
+    original inclusive `col <= overall_end` so the union of all sub-window deletes is exactly BACKFILL_START..END."""
+    column = "created_at" if table_name == "shopify_orders" else "updated_at"
+    if is_last:
+        return BackfillReplaceWindow(column, window.start.replace(tzinfo=None), overall_end.replace(tzinfo=None), True)
+    return BackfillReplaceWindow(column, window.start.replace(tzinfo=None), window.end_exclusive.replace(tzinfo=None), False)
+
+
+def insert_max_params(env=None) -> int:
+    raw = (os.environ if env is None else env).get(INSERT_MAX_PARAMS_ENV, "")
+    try:
+        value = int(str(raw).strip()) if str(raw).strip() else DEFAULT_INSERT_MAX_PARAMS
+    except ValueError:
+        logger.warning(f"Invalid {INSERT_MAX_PARAMS_ENV}={raw!r}; using {DEFAULT_INSERT_MAX_PARAMS}")
+        return DEFAULT_INSERT_MAX_PARAMS
+    return max(1, min(value, 65535))
+
+
+def compute_insert_chunk_rows(n_columns: int, batch_size: int, max_params: Optional[int] = None) -> int:
+    """Rows per `to_sql(method="multi")` chunk. Every row of a multi-values INSERT carries one bind parameter per
+    column, so the statement (and its compile-time memory) grows with rows x columns: cap the PARAMETER count rather than
+    only the rows. Never above BATCH_SIZE or the old 2000-row ceiling, never below 1 row; a frame smaller than the cap
+    is a single chunk."""
+    limit = insert_max_params() if max_params is None else max_params
+    by_params = max(1, int(limit) // max(1, int(n_columns)))
+    return max(1, min(int(batch_size), MAX_INSERT_ROWS, by_params))
+
+
 class BackfillReplaceWindow(NamedTuple):
     """The EXACT range a backfill re-fetches from Shopify, as store wall-clock datetimes (inclusive both ends),
     and the column that range is matched against."""
@@ -1628,6 +1776,10 @@ class BackfillReplaceWindow(NamedTuple):
     column: str
     start: datetime
     end: datetime
+    # True (the default, and what BACKFILL_START_IST..BACKFILL_END_IST always meant): `col <= end`. False: `col < end`,
+    # used for every sub-window of a split backfill except the last, so adjacent sub-windows share a boundary with no
+    # gap and no overlap even for a value that falls between two whole seconds.
+    end_inclusive: bool = True
 
 
 def backfill_replace_window(brand_index: int, table_name: str) -> Optional[BackfillReplaceWindow]:
@@ -1654,11 +1806,15 @@ def backfill_replace_window(brand_index: int, table_name: str) -> Optional[Backf
 
 def delete_backfill_window(conn, table_name: str, window: BackfillReplaceWindow) -> int:
     """DELETE the rows inside the re-fetched range, on an open connection/transaction. Returns the rows removed."""
+    end_operator = "<=" if window.end_inclusive else "<"
     statement = text(
-        f"DELETE FROM {table_name} WHERE {window.column} >= :window_start AND {window.column} <= :window_end"
+        f"DELETE FROM {table_name} WHERE {window.column} >= :window_start AND {window.column} {end_operator} :window_end"
     ).bindparams(bindparam("window_start", type_=DateTime), bindparam("window_end", type_=DateTime))
     result = conn.execute(statement, {"window_start": window.start, "window_end": window.end})
     return int(result.rowcount or 0)
+
+
+_UNSET = object()
 
 
 def load_data_to_sql_optimized(
@@ -1667,11 +1823,18 @@ def load_data_to_sql_optimized(
     brand_name: str,
     table_name: str,
     batch_size: int = 1000,
-):
+    replace_window=_UNSET,
+) -> bool:
+    """Loads `df` (see the module notes on the backfill replace). Returns True when the rows are in the table (or there
+    was nothing to load), False when the load failed and was only logged (a backfill raises instead).
+
+    `replace_window`: the range to delete in the same transaction as the insert. Left out, it is derived from the
+    BACKFILL_* env exactly as before (`backfill_replace_window`); the sub-window loop passes each sub-window's own
+    range (or None = no delete)."""
     engine = sqlalchemy_engines.get(brand_index)
     if not engine:
         logger.error(f"No SQLAlchemy engine for brand {brand_index}")
-        return
+        return False
 
     metadata = MetaData()
     columns = [
@@ -1753,17 +1916,17 @@ def load_data_to_sql_optimized(
         metadata.create_all(engine, checkfirst=True)
     except SQLAlchemyError as e:
         logger.error(f"❌ Error creating table '{table_name}': {e}")
-        return
+        return False
 
-    window = backfill_replace_window(brand_index, table_name)
+    window = backfill_replace_window(brand_index, table_name) if replace_window is _UNSET else replace_window
 
     # Nothing to insert = nothing is deleted either: a window is only ever replaced by rows that are in hand.
     if df.empty:
         logger.info(f"DataFrame empty for {table_name}; nothing to load (no rows deleted).")
-        return
+        return True
 
     try:
-        optimal_batch = max(500, min(batch_size, 2000))
+        optimal_batch = compute_insert_chunk_rows(len(df.columns), batch_size)
         with timed(f"Insert {len(df)} rows into {table_name} (batch={optimal_batch})"):
             # ONE transaction: the window delete and the insert commit together or not at all, so a failed
             # insert can never leave the window emptied.
@@ -1785,9 +1948,11 @@ def load_data_to_sql_optimized(
                 )
 
         logger.info(f"✅ [{brand_name}] Loaded {len(df)} rows to {table_name}")
+        return True
     except Exception as e:
         logger.error(f"❌ Error loading data to '{table_name}': {e}")
         traceback.print_exc()
         if window is not None:
             # The transaction rolled back (the window is untouched). A backfill must not carry on as if it loaded.
             raise
+        return False
