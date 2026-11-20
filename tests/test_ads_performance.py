@@ -95,22 +95,43 @@ class MetaFetchTests(unittest.TestCase):
         self.assertEqual((row["platform_purchases"], row["platform_purchase_value"]), (Decimal("3"), Decimal("450")))
 
     def test_metadata_failure_is_not_fatal(self):
-        with patch("requests.get", return_value=_response({"error": {"message": "nope"}}, 400)):
+        with patch("requests.post", return_value=_response({"error": {"message": "nope"}}, 400)):
             self.assertEqual(ap.fetch_meta_ad_metadata("tok", ["a1"]), {})
 
     def test_metadata_reads_campaign_status_and_destination(self):
-        payload = {
-            "a1": {
-                "effective_status": "ACTIVE",
-                "campaign": {"effective_status": "PAUSED", "objective": "OUTCOME_SALES"},
-                "creative": {"object_story_spec": {"link_data": {"link": "https://b.com/products/deal-5"}}},
-            }
+        import json
+
+        ad = {
+            "effective_status": "ACTIVE",
+            "campaign": {"effective_status": "PAUSED", "objective": "OUTCOME_SALES"},
+            "creative": {"object_story_spec": {"link_data": {"link": "https://b.com/products/deal-5"}}},
         }
-        with patch("requests.get", return_value=_response(payload)) as get:
+        batch_reply = [{"code": 200, "body": json.dumps(ad)}]
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = batch_reply
+        with patch("requests.post", return_value=resp) as post:
             meta = ap.fetch_meta_ad_metadata("tok", ["a1", "a1"])
-        self.assertEqual(get.call_args.kwargs["params"]["ids"], "a1")
+        sent = json.loads(post.call_args.kwargs["data"]["batch"])
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(sent[0]["relative_url"].startswith("a1?fields="))
+        self.assertNotIn("ids", post.call_args.kwargs["data"])
         self.assertEqual(meta["a1"]["campaign_status"], "PAUSED")
         self.assertEqual(meta["a1"]["landing_url"], "https://b.com/products/deal-5")
+
+    def test_metadata_skips_ads_that_failed_inside_the_batch(self):
+        import json
+
+        ok = {"creative": {"link_url": "https://b.com/pages/sale"}}
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = [
+            {"code": 400, "body": json.dumps({"error": {"message": "Unsupported get request"}})},
+            {"code": 200, "body": json.dumps(ok)},
+            None,
+        ]
+        with patch("requests.post", return_value=resp):
+            meta = ap.fetch_meta_ad_metadata("tok", ["a1", "a2", "a3"])
+        self.assertEqual(list(meta), ["a2"])
+        self.assertEqual(meta["a2"]["landing_url"], "https://b.com/pages/sale")
 
 
 class MetaInsightsChunkingTests(unittest.TestCase):

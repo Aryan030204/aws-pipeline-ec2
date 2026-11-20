@@ -314,24 +314,42 @@ def _fetch_meta_ad_insights_range(access_token: str, ad_account_id: str, start: 
 
 def fetch_meta_ad_metadata(access_token: str, ad_ids: Iterable[str]) -> Dict[str, Dict]:
     """{ad_id: {"landing_url", "campaign_status", "campaign_type"}} via the
-    Graph API's ?ids= batch read. Best-effort: a failed batch is logged and
-    those ads just have no landing page / status."""
+    Graph API batch endpoint (POST / with up to 50 GET /<ad_id> requests).
+    The older ?ids= multi-read is rejected from Graph API v26.0 on.
+    Best-effort: a failed batch or ad is logged and those ads just have no
+    landing page / status."""
+    import requests
+
     ids = sorted({a for a in ad_ids if a})
     meta: Dict[str, Dict] = {}
     url = f"{pw.META_GRAPH_URL}/{pw.META_API_VERSION}/"
+    failed_ads = 0
     for i in range(0, len(ids), META_IDS_BATCH):
         batch = ids[i : i + META_IDS_BATCH]
+        requests_spec = [{"method": "GET", "relative_url": f"{ad_id}?fields={META_AD_FIELDS}"} for ad_id in batch]
         try:
-            payload = _meta_get(
+            response = requests.post(
                 url,
-                {"ids": ",".join(batch), "fields": META_AD_FIELDS, "access_token": access_token},
-                "Meta ad metadata",
+                data={"batch": json.dumps(requests_spec), "include_headers": "false", "access_token": access_token},
+                timeout=pw.AD_API_TIMEOUT_S,
             )
-        except pw.AdSpendSyncError as e:
-            logger.warning("Meta ad metadata batch failed (%s ads): %s", len(batch), e)
+            payload = response.json()
+        except (requests.RequestException, ValueError) as e:
+            logger.warning("Meta ad metadata batch failed (%s ads): %s", len(batch), e.__class__.__name__)
             continue
-        for ad_id, ad in payload.items():
-            if not isinstance(ad, dict):
+        if response.status_code >= 400 or not isinstance(payload, list):
+            message = pw._api_error_message(payload) if isinstance(payload, dict) else ""
+            logger.warning("Meta ad metadata batch failed (%s ads): %s", len(batch), message or response.status_code)
+            continue
+        for ad_id, item in zip(batch, payload):
+            try:
+                ad = json.loads((item or {}).get("body") or "{}")
+            except ValueError:
+                ad = {}
+            if not isinstance(item, dict) or item.get("code") != 200 or not isinstance(ad, dict) or ad.get("error"):
+                failed_ads += 1
+                if failed_ads <= 3:
+                    logger.warning("Meta ad metadata failed for ad %s: %s", ad_id, pw._api_error_message(ad) or (item or {}).get("code"))
                 continue
             campaign = ad.get("campaign") or {}
             meta[str(ad_id)] = {
